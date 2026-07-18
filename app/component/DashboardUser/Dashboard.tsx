@@ -17,6 +17,8 @@ import {
   ChevronRight,
 } from "lucide-react";
 import StaxLogo from "../Login/StaxLogo";
+import { useNavigate } from "react-router";
+import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตรง
 
 interface Transaction {
   id: string;
@@ -79,11 +81,11 @@ interface DashboardProps {
 }
 
 export default function Dashboard({ userEmail }: DashboardProps) {
+  const navigate = useNavigate();
+  const { logout, user } = useAuth();
   const [activeTab, setActiveTab] = useState("stax");
   const location = useLocation();
 
-  // อ่านอีเมลที่ส่งมาจากหน้า Login ผ่าน navigate state ก่อน
-  // ถ้าไม่มี (เช่นเปิดหน้านี้ตรงๆ) ใช้ prop ที่ส่งเข้ามา หรือค่า default
   const emailFromLogin = (location.state as { email?: string } | null)
     ?.email;
   const resolvedEmail = userEmail || emailFromLogin || "investor@stax.com";
@@ -92,6 +94,11 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const emailPrefix = resolvedEmail.split("@")[0] || "ผู้ใช้งาน";
   const displayName =
     emailPrefix.charAt(0).toUpperCase() + emailPrefix.slice(1);
+
+  const handleLogout = () => {
+    logout(); // เคลียร์สถานะ login (+ localStorage) ใน AuthProvider
+    navigate("/login", { replace: true }); // เด้งกลับไปหน้า Login
+  };
 
   return (
     <div className="min-h-screen w-full bg-gray-50 flex">
@@ -198,6 +205,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             </button>
             <button
               type="button"
+              onClick={handleLogout}
               className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-red-600 transition px-2"
             >
               <LogOut className="w-4 h-4" />

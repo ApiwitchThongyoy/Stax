@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { Mail, Lock,Eye, EyeOff, LayoutDashboard, FileBarChart } from "lucide-react";
-import { Link, useNavigate } from "react-router";
+import { Link } from "react-router";
+import { useNavigate, useLocation } from "react-router";
+import { useAuth } from "../../lib/auth";
 import StaxLogo from "./StaxLogo"
 
 export default function StaxLoginPage() {
@@ -9,6 +11,8 @@ export default function StaxLoginPage() {
   const [remember, setRemember] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
+  const { login } = useAuth();
 
   return (
     <div className="min-h-screen w-full flex items-center justify-center bg-gray-50 relative overflow-hidden p-4">
@@ -117,9 +121,13 @@ export default function StaxLoginPage() {
             <button
               type="button"
               onClick={() => {
-                // TODO: ใส่ logic ตรวจสอบอีเมล/รหัสผ่าน + เรียก API login จริงตรงนี้ก่อน
-                // ถ้า login สำเร็จค่อย navigate พร้อมส่งอีเมลไปหน้า Dashboard
-                navigate("/dashboard", { state: { email } });
+              // TODO: ตรวจสอบ email/password จริงกับ API ก่อน ถ้าผิดให้โชว์ error แล้ว return ออกไปเลย
+
+                login(email); // บันทึกสถานะ login ไว้ใน AuthProvider (+ localStorage)
+
+                // เด้งกลับไป path ที่ผู้ใช้ตั้งใจจะเข้าตั้งแต่แรก (ถ้ามี) ไม่งั้นไป dashboard
+                const from = (location.state as { from?: string } | null)?.from || "/dashboard";
+                navigate(from, { replace: true });
               }}
               className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition"
             >
