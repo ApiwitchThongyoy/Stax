@@ -1,87 +1,147 @@
+import { useState } from "react";
+import { Mail, Lock,Eye, EyeOff, LayoutDashboard, FileBarChart } from "lucide-react";
+import StaxLogo from "./StaxLogo"
 
-export function Welcome() {
+export default function StaxLoginPage() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [remember, setRemember] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+
   return (
-    <main className="flex items-center justify-center pt-16 pb-4">
-      <div className="flex-1 flex flex-col items-center gap-16 min-h-0">
-        <header className="flex flex-col items-center gap-9">
-          <div className="w-[500px] max-w-[100vw] p-4">
-            <img
-              src={logoLight}
-              alt="React Router"
-              className="block w-full dark:hidden"
-            />
-            <img
-              src={logoDark}
-              alt="React Router"
-              className="hidden w-full dark:block"
-            />
-          </div>
-        </header>
-        <div className="max-w-[300px] w-full space-y-6 px-4">
-          <nav className="rounded-3xl border border-gray-200 p-6 dark:border-gray-700 space-y-4">
-            <p className="leading-6 text-gray-700 dark:text-gray-200 text-center">
-              What&apos;s next?
+    <div className="min-h-screen w-full flex items-center justify-center bg-gray-50 relative overflow-hidden p-4">
+      {/* Background decorative dots */}
+      <div
+        className="absolute inset-0 opacity-40"
+        style={{
+          backgroundImage:
+            "radial-gradient(circle, #d1d5db 1px, transparent 1px)",
+          backgroundSize: "22px 22px",
+        }}
+      />
+
+      {/* Soft gradient blobs */}
+      <div className="absolute -left-24 top-1/3 w-72 h-72 bg-emerald-100 rounded-full blur-3xl opacity-60" />
+      <div className="absolute -right-24 bottom-1/4 w-72 h-72 bg-blue-100 rounded-full blur-3xl opacity-60" />
+
+      {/* Decorative floating cards */}
+      <div className="hidden md:flex absolute left-[12%] top-[38%] items-center gap-3 bg-white rounded-xl shadow-md px-4 py-3 w-48">
+        <div className="w-9 h-9 rounded-lg bg-emerald-50 flex items-center justify-center shrink-0">
+          <FileBarChart className="w-4 h-4 text-emerald-500" />
+        </div>
+        <div className="h-2 bg-gray-200 rounded w-full" />
+      </div>
+      <div className="hidden md:flex absolute left-[10%] top-[46%] items-center gap-3 bg-white rounded-xl shadow-md px-4 py-3 w-48">
+        <div className="w-9 h-9 rounded-lg bg-blue-50 flex items-center justify-center shrink-0">
+          <LayoutDashboard className="w-4 h-4 text-blue-500" />
+        </div>
+        <div className="h-2 bg-gray-200 rounded w-full" />
+      </div>
+
+      {/* Main card */}
+      <div className="relative z-10 w-full max-w-3xl bg-white rounded-2xl shadow-xl overflow-hidden grid md:grid-cols-2">
+        {/* Left panel */}
+        <div className="bg-linear-to-br from-blue-900 to-blue-950 flex flex-col items-center justify-center text-center px-8 py-12">
+          <StaxLogo
+            width="220px"
+            transparent
+            textColor="#ffffff"
+            subTextColor="#bfdbfe"
+            dividerColor="rgba(255,255,255,0.25)"
+          />
+        </div>
+
+        {/* Right panel - form */}
+        <div className="flex flex-col justify-center px-8 py-10 sm:px-10">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">
+              อีเมลผู้ใช้งาน
+            </label>
+            <div className="relative mb-5">
+              <Mail className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="name@company.com"
+                className="w-full pl-9 pr-3 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+              />
+            </div>
+
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-sm font-medium text-gray-700">
+                รหัสผ่าน
+              </label>
+              <button
+                type="button"
+                className="text-sm text-blue-800 hover:underline cursor-pointer"
+              >
+                ลืมรหัสผ่าน?
+              </button>
+            </div>
+            <div className="relative mb-4">
+                <Lock className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type={showPassword ? "text" : "password"}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full pl-9 pr-9 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 transition"
+                  aria-label={showPassword ? "ซ่อนรหัสผ่าน" : "แสดงรหัสผ่าน"}
+                >
+                  {showPassword ? (
+                    <EyeOff className="w-4 h-4 cursor-pointer" />
+                  ) : (
+                    <Eye className="w-4 h-4 cursor-pointer" />
+                  )}
+                </button>
+              </div>
+
+            <label className="flex items-center gap-2 mb-6 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={remember}
+                onChange={(e) => setRemember(e.target.checked)}
+                className="w-4 h-4 rounded border-gray-300 text-blue-900 focus:ring-blue-900/30"
+              />
+              <span className="text-sm text-gray-600">จดจำฉันในระบบ</span>
+            </label>
+
+            <button
+              type="button"
+              className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition cursor-pointer"
+            >
+              เข้าสู่ระบบ
+              <span aria-hidden="true">›</span>
+            </button>
+
+            <p className="text-center text-sm text-gray-500 mt-6">
+              ยังไม่มีบัญชี?{" "}
+              <button
+                type="button"
+                className="text-blue-800 font-medium hover:underline cursor-pointer"
+              >
+                สมัครสมาชิกที่นี่
+              </button>
             </p>
-            <ul>
-              {resources.map(({ href, text, icon }) => (
-                <li key={href}>
-                  <a
-                    className="group flex items-center gap-3 self-stretch p-3 leading-normal text-blue-700 hover:underline dark:text-blue-500"
-                    href={href}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {icon}
-                    {text}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          </nav>
+          </div>
         </div>
       </div>
-    </main>
+
+      {/* Footer */}
+      <div className="absolute bottom-4 left-0 right-0 text-center text-xs text-gray-400 space-y-1">
+        <p>© 2024 STAX Financial Management. All Rights Reserved.</p>
+        <p>
+          <button className="hover:underline">Privacy Policy</button>
+          {"  ·  "}
+          <button className="hover:underline">Terms of Service</button>
+        </p>
+      </div>
+    </div>
   );
 }
-
-const resources = [
-  {
-    href: "https://reactrouter.com/docs",
-    text: "React Router Docs",
-    icon: (
-      <svg
-        xmlns="http://www.w3.org/2000/svg"
-        width="24"
-        height="20"
-        viewBox="0 0 20 20"
-        fill="none"
-        className="stroke-gray-600 group-hover:stroke-current dark:stroke-gray-300"
-      >
-        <path
-          d="M9.99981 10.0751V9.99992M17.4688 17.4688C15.889 19.0485 11.2645 16.9853 7.13958 12.8604C3.01467 8.73546 0.951405 4.11091 2.53116 2.53116C4.11091 0.951405 8.73546 3.01467 12.8604 7.13958C16.9853 11.2645 19.0485 15.889 17.4688 17.4688ZM2.53132 17.4688C0.951566 15.8891 3.01483 11.2645 7.13974 7.13963C11.2647 3.01471 15.8892 0.951453 17.469 2.53121C19.0487 4.11096 16.9854 8.73551 12.8605 12.8604C8.73562 16.9853 4.11107 19.0486 2.53132 17.4688Z"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-      </svg>
-    ),
-  },
-  {
-    href: "https://rmx.as/discord",
-    text: "Join Discord",
-    icon: (
-      <svg
-        xmlns="http://www.w3.org/2000/svg"
-        width="24"
-        height="20"
-        viewBox="0 0 24 20"
-        fill="none"
-        className="stroke-gray-600 group-hover:stroke-current dark:stroke-gray-300"
-      >
-        <path
-          d="M15.0686 1.25995L14.5477 1.17423L14.2913 1.63578C14.1754 1.84439 14.0545 2.08275 13.9422 2.31963C12.6461 2.16488 11.3406 2.16505 10.0445 2.32014C9.92822 2.08178 9.80478 1.84975 9.67412 1.62413L9.41449 1.17584L8.90333 1.25995C7.33547 1.51794 5.80717 1.99419 4.37748 2.66939L4.19 2.75793L4.07461 2.93019C1.23864 7.16437 0.46302 11.3053 0.838165 15.3924L0.868838 15.7266L1.13844 15.9264C2.81818 17.1714 4.68053 18.1233 6.68582 18.719L7.18892 18.8684L7.50166 18.4469C7.96179 17.8268 8.36504 17.1824 8.709 16.4944L8.71099 16.4904C10.8645 17.0471 13.128 17.0485 15.2821 16.4947C15.6261 17.1826 16.0293 17.8269 16.4892 18.4469L16.805 18.8725L17.3116 18.717C19.3056 18.105 21.1876 17.1751 22.8559 15.9238L23.1224 15.724L23.1528 15.3923C23.5873 10.6524 22.3579 6.53306 19.8947 2.90714L19.7759 2.73227L19.5833 2.64518C18.1437 1.99439 16.6386 1.51826 15.0686 1.25995ZM16.6074 10.7755L16.6074 10.7756C16.5934 11.6409 16.0212 12.1444 15.4783 12.1444C14.9297 12.1444 14.3493 11.6173 14.3493 10.7877C14.3493 9.94885 14.9378 9.41192 15.4783 9.41192C16.0471 9.41192 16.6209 9.93851 16.6074 10.7755ZM8.49373 12.1444C7.94513 12.1444 7.36471 11.6173 7.36471 10.7877C7.36471 9.94885 7.95323 9.41192 8.49373 9.41192C9.06038 9.41192 9.63892 9.93712 9.6417 10.7815C9.62517 11.6239 9.05462 12.1444 8.49373 12.1444Z"
-          strokeWidth="1.5"
-        />
-      </svg>
-    ),
-  },
-];
