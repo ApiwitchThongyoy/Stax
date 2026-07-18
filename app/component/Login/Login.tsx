@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Mail, Lock,Eye, EyeOff, LayoutDashboard, FileBarChart } from "lucide-react";
-import { Link } from "react-router";
+import { Link, useNavigate } from "react-router";
 import StaxLogo from "./StaxLogo"
 
 export default function StaxLoginPage() {
@@ -8,6 +8,7 @@ export default function StaxLoginPage() {
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const navigate = useNavigate();
 
   return (
     <div className="min-h-screen w-full flex items-center justify-center bg-gray-50 relative overflow-hidden p-4">
@@ -115,7 +116,12 @@ export default function StaxLoginPage() {
 
             <button
               type="button"
-              className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition cursor-pointer"
+              onClick={() => {
+                // TODO: ใส่ logic ตรวจสอบอีเมล/รหัสผ่าน + เรียก API login จริงตรงนี้ก่อน
+                // ถ้า login สำเร็จค่อย navigate พร้อมส่งอีเมลไปหน้า Dashboard
+                navigate("/dashboard", { state: { email } });
+              }}
+              className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition"
             >
               เข้าสู่ระบบ
               <span aria-hidden="true">›</span>
