@@ -124,7 +124,7 @@ export default function Register() {
                   if (errorMessage) setErrorMessage("");
                 }}
                 placeholder="example@stax.com"
-                className="w-full pl-9 pr-28 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                className="w-full pl-9 pr-28 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
               />
               <button
                 type="button"
@@ -152,7 +152,7 @@ export default function Register() {
                 if (errorMessage) setErrorMessage("");
               }}
               placeholder="••••••••"
-              className="w-full pl-9 pr-9 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+              className="w-full pl-9 pr-9 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
           />
           <button
             type="button"
@@ -174,7 +174,7 @@ export default function Register() {
                   if (errorMessage) setErrorMessage("");
                 }}
                 placeholder="••••••••"
-                className="w-full pl-9 pr-9 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                className="w-full pl-9 pr-9 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
           />
           <button
             type="button"

@@ -88,7 +88,7 @@ export default function StaxLoginPage() {
                   if (errorMessage) setErrorMessage("");
                 }}
                 placeholder="name@company.com"
-                className="w-full pl-9 pr-3 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                className="w-full pl-9 pr-3 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
               />
             </div>
 
@@ -113,7 +113,7 @@ export default function StaxLoginPage() {
                     if (errorMessage) setErrorMessage("");
                   }}
                   placeholder="••••••••"
-                  className="w-full pl-9 pr-9 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                  className="w-full pl-9 pr-9 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
                 />
                 <button
                   type="button"
@@ -170,7 +170,7 @@ export default function StaxLoginPage() {
 
       {/* Footer */}
       <div className="absolute bottom-4 left-0 right-0 text-center text-xs text-gray-400 space-y-1">
-        <p>© 2026 STAX Financial Management. All Rights Reserved.</p>
+        <p>© 2024 STAX Financial Management. All Rights Reserved.</p>
         <p>
           <button className="hover:underline">Privacy Policy</button>
           {"  ·  "}
