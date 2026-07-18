@@ -422,7 +422,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
 
           {/* Footer */}
           <div className="text-center text-xs text-gray-400 pt-4 space-y-1">
-            <p>© 2024 STAX Financial Management. All Rights Reserved.</p>
+            <p>© 2026 STAX Financial Management. All Rights Reserved.</p>
             <p>
               <button className="hover:underline">ความเป็นส่วนตัว</button>
               {"  ·  "}
