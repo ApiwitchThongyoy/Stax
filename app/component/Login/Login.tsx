@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Mail, Lock,Eye, EyeOff, LayoutDashboard, FileBarChart } from "lucide-react";
+import { Mail, Lock,Eye, EyeOff, LayoutDashboard, FileBarChart, AlertCircle } from "lucide-react";
 import { Link } from "react-router";
 import { useNavigate, useLocation } from "react-router";
 import { useAuth } from "../../lib/auth";
@@ -10,9 +10,24 @@ export default function StaxLoginPage() {
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
   const navigate = useNavigate();
   const location = useLocation();
   const { login } = useAuth();
+
+  const handleLogin = () => {
+    const result = login(email, password);
+
+    if (!result.success) {
+      setErrorMessage(result.error || "เข้าสู่ระบบไม่สำเร็จ");
+      return;
+    }
+
+    setErrorMessage("");
+    // เด้งกลับไป path ที่ผู้ใช้ตั้งใจจะเข้าตั้งแต่แรก (ถ้ามี) ไม่งั้นไป dashboard
+    const from = (location.state as { from?: string } | null)?.from || "/dashboard";
+    navigate(from, { replace: true, state: { email } });
+  };
 
   return (
     <div className="min-h-screen w-full flex items-center justify-center bg-gray-50 relative overflow-hidden p-4">
@@ -68,7 +83,10 @@ export default function StaxLoginPage() {
               <input
                 type="email"
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  if (errorMessage) setErrorMessage("");
+                }}
                 placeholder="name@company.com"
                 className="w-full pl-9 pr-3 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
               />
@@ -90,7 +108,10 @@ export default function StaxLoginPage() {
                 <input
                   type={showPassword ? "text" : "password"}
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    if (errorMessage) setErrorMessage("");
+                  }}
                   placeholder="••••••••"
                   className="w-full pl-9 pr-9 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
                 />
@@ -108,6 +129,13 @@ export default function StaxLoginPage() {
                 </button>
               </div>
 
+            {errorMessage && (
+              <div className="flex items-center gap-2 mb-4 px-3 py-2.5 rounded-lg bg-red-50 text-red-600 text-sm">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{errorMessage}</span>
+              </div>
+            )}
+
             <label className="flex items-center gap-2 mb-6 cursor-pointer select-none">
               <input
                 type="checkbox"
@@ -120,15 +148,7 @@ export default function StaxLoginPage() {
 
             <button
               type="button"
-              onClick={() => {
-              // TODO: ตรวจสอบ email/password จริงกับ API ก่อน ถ้าผิดให้โชว์ error แล้ว return ออกไปเลย
-
-                login(email); // บันทึกสถานะ login ไว้ใน AuthProvider (+ localStorage)
-
-                // เด้งกลับไป path ที่ผู้ใช้ตั้งใจจะเข้าตั้งแต่แรก (ถ้ามี) ไม่งั้นไป dashboard
-                const from = (location.state as { from?: string } | null)?.from || "/dashboard";
-                navigate(from, { replace: true });
-              }}
+              onClick={handleLogin}
               className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition"
             >
               เข้าสู่ระบบ

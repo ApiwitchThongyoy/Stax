@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from "react";
-import { Mail, Lock, ShieldCheck,Eye, EyeOff } from "lucide-react";
+import { Mail, Lock, ShieldCheck,Eye, EyeOff, AlertCircle } from "lucide-react";
 import { Link,useNavigate } from "react-router"
 import StaxLogo from "../Login/StaxLogo";
+import { useAuth } from "../../lib/auth";
 
 const OTP_COOLDOWN_SECONDS = 60;
 
@@ -14,7 +15,9 @@ export default function Register() {
   const [otpCooldown, setOtpCooldown] = useState(0);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
   const navigate = useNavigate();
+  const { register } = useAuth();
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -42,6 +45,41 @@ export default function Register() {
         return prev - 1;
       });
     }, 1000);
+  };
+
+  const handleRegister = () => {
+    if (!isValidEmail) {
+      setErrorMessage("กรุณากรอกอีเมลให้ถูกต้อง");
+      return;
+    }
+    if (!password || !confirmPassword) {
+      setErrorMessage("กรุณากรอกรหัสผ่านให้ครบถ้วน");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setErrorMessage("รหัสผ่านและยืนยันรหัสผ่านไม่ตรงกัน");
+      return;
+    }
+    if (!notRobot) {
+      setErrorMessage("กรุณายืนยันว่าคุณไม่ใช่โปรแกรมอัตโนมัติ");
+      return;
+    }
+    if (!agreeTerms) {
+      setErrorMessage("กรุณายอมรับข้อตกลงและนโยบายความเป็นส่วนตัว");
+      return;
+    }
+
+    // TODO: ใส่ logic เรียก API ลงทะเบียนจริงตรงนี้ก่อน
+    // ตอนนี้ mock ไว้ก่อนด้วยการเก็บลง localStorage ผ่าน useAuth().register
+    const result = register(email, password);
+
+    if (!result.success) {
+      setErrorMessage(result.error || "ลงทะเบียนไม่สำเร็จ");
+      return;
+    }
+
+    setErrorMessage("");
+    navigate("/login");
   };
 
   return (
@@ -81,7 +119,10 @@ export default function Register() {
               <input
                 type="email"
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  if (errorMessage) setErrorMessage("");
+                }}
                 placeholder="example@stax.com"
                 className="w-full pl-9 pr-28 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
               />
@@ -106,7 +147,10 @@ export default function Register() {
             <input
               type={showPassword ? "text" : "password"}
               value={password}
-              onChange={(e) => setPassword(e.target.value)}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                if (errorMessage) setErrorMessage("");
+              }}
               placeholder="••••••••"
               className="w-full pl-9 pr-9 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
           />
@@ -125,7 +169,10 @@ export default function Register() {
               <input
                 type={showConfirmPassword ? "text" : "password"}
                 value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
+                onChange={(e) => {
+                  setConfirmPassword(e.target.value);
+                  if (errorMessage) setErrorMessage("");
+                }}
                 placeholder="••••••••"
                 className="w-full pl-9 pr-9 py-2.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
           />
@@ -144,7 +191,10 @@ export default function Register() {
               <input
                 type="checkbox"
                 checked={notRobot}
-                onChange={(e) => setNotRobot(e.target.checked)}
+                onChange={(e) => {
+                  setNotRobot(e.target.checked);
+                  if (errorMessage) setErrorMessage("");
+                }}
                 className="w-4 h-4 rounded border-gray-300 text-blue-900 focus:ring-blue-900/30"
               />
               <span className="text-sm text-gray-600">
@@ -162,7 +212,10 @@ export default function Register() {
             <input
               type="checkbox"
               checked={agreeTerms}
-              onChange={(e) => setAgreeTerms(e.target.checked)}
+              onChange={(e) => {
+                setAgreeTerms(e.target.checked);
+                if (errorMessage) setErrorMessage("");
+              }}
               className="w-4 h-4 mt-0.5 rounded border-gray-300 text-blue-900 focus:ring-blue-900/30 shrink-0"
             />
             <span className="text-sm text-gray-600 leading-relaxed">
@@ -177,14 +230,17 @@ export default function Register() {
             </span>
           </label>
 
+          {errorMessage && (
+            <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg bg-red-50 text-red-600 text-sm">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{errorMessage}</span>
+            </div>
+          )}
+
           {/* Submit */}
           <button
             type="button"
-            onClick={() => {
-            // TODO: ใส่ logic ตรวจสอบฟอร์ม + เรียก API ลงทะเบียนจริงตรงนี้ก่อน
-            // ถ้าสำเร็จค่อย navigate ไปหน้า login
-              navigate("/login");
-            }}
+            onClick={handleRegister}
               className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition cursor-pointer"
           >
             ลงทะเบียนใช้งาน

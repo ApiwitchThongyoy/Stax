@@ -115,22 +115,22 @@ const StaxLogo: React.FC<StaxLogoProps> = ({
         </svg>
       </div>
 
-      {/* Brand Text Section */}
-      <div
-        style={{
-          textTransform: "uppercase",
-          color: brandColor,
-          fontSize: "24px",
-          fontWeight: 800,
-          letterSpacing: "1px",
-          marginBottom: "2px",
-        }}
-      >
-        STAX
-      </div>
-
+      {/* Brand Text Section — ซ่อนทั้งหมดตอน compact เพราะข้างๆ โลโก้ในหัว sidebar
+          มีคำว่า "STAX Admin" อยู่แล้ว ไม่ต้องขึ้นคำว่า STAX ซ้ำใต้ไอคอนอีก */}
       {!compact && (
         <>
+          <div
+            style={{
+              textTransform: "uppercase",
+              color: brandColor,
+              fontSize: "24px",
+              fontWeight: 800,
+              letterSpacing: "1px",
+              marginBottom: "2px",
+            }}
+          >
+            STAX
+          </div>
           <div
             style={{
               color: subColor,
