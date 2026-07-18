@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Mail, Lock,Eye, EyeOff, LayoutDashboard, FileBarChart } from "lucide-react";
+import { Link } from "react-router";
 import StaxLogo from "./StaxLogo"
 
 export default function StaxLoginPage() {
@@ -122,12 +123,12 @@ export default function StaxLoginPage() {
 
             <p className="text-center text-sm text-gray-500 mt-6">
               ยังไม่มีบัญชี?{" "}
-              <button
-                type="button"
-                className="text-blue-800 font-medium hover:underline cursor-pointer"
+              <Link
+                to="/register"
+                className="text-blue-800 font-medium hover:underline"
               >
                 สมัครสมาชิกที่นี่
-              </button>
+              </Link>
             </p>
           </div>
         </div>
