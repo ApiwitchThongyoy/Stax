@@ -98,6 +98,20 @@ function toDisplayDate(ddmmyyyy: string): string {
   return `${y}-${m}-${d}`;
 }
 
+// แปลงข้อความยอดเงินที่ format ไว้แล้ว (เช่น "$1,240.50", "฿5,000.00") กลับเป็นตัวเลข
+function parseAmountString(value: string | null): number {
+  if (!value) return 0;
+  const cleaned = value.replace(/[^0-9.-]/g, "");
+  const num = parseFloat(cleaned);
+  return Number.isNaN(num) ? 0 : num;
+}
+
+// แปลงข้อความอัตราแลกเปลี่ยน (เช่น "35.42", "-") กลับเป็นตัวเลข ถ้าอ่านไม่ได้ให้ถือว่าอัตรา 1 (เช่น THB)
+function parseRateString(rate: string): number {
+  const num = parseFloat(rate);
+  return Number.isNaN(num) ? 1 : num;
+}
+
 interface DashboardProps {
   userEmail?: string;
 }
@@ -159,6 +173,27 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const toggleSortOrder = () => {
     setSortOrder((prev) => (prev === "newest" ? "oldest" : "newest"));
   };
+
+  // คำนวณ "กำไร/ขาดทุนจากอัตราแลกเปลี่ยนรวม" แบบเรียลไทม์จากรายการทั้งหมดในตาราง
+  // (เงินเข้า - เงินออก) ของแต่ละรายการ คูณด้วยอัตราแลกเปลี่ยน ณ ตอนนั้น แล้วรวมทุกรายการเป็นยอดสุทธิ (THB)
+  // ค่านี้จะอัปเดตทันทีทุกครั้งที่ transactions เปลี่ยน ไม่ว่าจะเพิ่มเองหรือ import จากไฟล์ PDF
+  const fxGainLoss = transactions.reduce((sum, t) => {
+    const income = parseAmountString(t.income);
+    const expense = parseAmountString(t.expense);
+    const rate = parseRateString(t.rate);
+    return sum + (income - expense) * rate;
+  }, 0);
+
+  const totalInflowTHB = transactions.reduce((sum, t) => {
+    const income = parseAmountString(t.income);
+    const rate = parseRateString(t.rate);
+    return sum + income * rate;
+  }, 0);
+
+  const fxGainLossPercent =
+    totalInflowTHB > 0 ? (fxGainLoss / totalInflowTHB) * 100 : 0;
+
+  const isGain = fxGainLoss >= 0;
 
   return (
     <div className="min-h-screen w-full bg-gray-50 flex">
@@ -288,17 +323,40 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             <div className="bg-white rounded-xl border border-gray-100 p-4">
               <div className="flex items-center justify-between mb-3">
                 <span className="text-xs text-gray-400">
-                  กราไฟแนวโน้มรายได้เดือนนี้
+                  กำไร/ขาดทุนจากอัตราแลกเปลี่ยนรวม
                 </span>
-                <span className="text-xs font-medium text-emerald-500">
-                  +4.2%
+                <span
+                  className={`text-xs font-medium px-1.5 py-0.5 rounded ${
+                    isGain
+                      ? "bg-emerald-50 text-emerald-500"
+                      : "bg-red-50 text-red-500"
+                  }`}
+                >
+                  {isGain ? "กำไร" : "ขาดทุน"}
+                  {totalInflowTHB > 0 &&
+                    ` ${isGain ? "+" : ""}${fxGainLossPercent.toFixed(1)}%`}
                 </span>
               </div>
-              <p className="text-xl font-semibold text-gray-800">
-                +$12,450.00
+              <p
+                className={`text-xl font-semibold ${
+                  isGain ? "text-gray-800" : "text-red-600"
+                }`}
+              >
+                {isGain ? "+" : "-"}฿
+                {Math.abs(fxGainLoss).toLocaleString(undefined, {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}
               </p>
-              <div className="h-1.5 bg-emerald-50 rounded-full mt-3 overflow-hidden">
-                <div className="h-full w-2/3 bg-emerald-400 rounded-full" />
+              <div className="h-1.5 bg-gray-100 rounded-full mt-3 overflow-hidden">
+                <div
+                  className={`h-full rounded-full ${
+                    isGain ? "bg-emerald-400" : "bg-red-400"
+                  }`}
+                  style={{
+                    width: `${Math.min(Math.abs(fxGainLossPercent), 100)}%`,
+                  }}
+                />
               </div>
             </div>
 
