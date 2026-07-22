@@ -12,13 +12,15 @@ import {
   Plus,
   Pencil,
   Trash2,
-  UploadCloud,
-  Sparkles,
   ChevronRight,
+  ChevronUp,
+  ArrowUpDown,
 } from "lucide-react";
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
 import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตรง
+import PdfStatementUploader from "./PdfStatementUploader";
+import type { ExtractedTransaction } from "../../lib/pdfStatementParser";
 
 interface Transaction {
   id: string;
@@ -30,7 +32,7 @@ interface Transaction {
   rate: string;
 }
 
-const transactions: Transaction[] = [
+const initialTransactions: Transaction[] = [
   {
     id: "1",
     date: "2024-05-12",
@@ -76,6 +78,26 @@ const navItems = [
   { label: "ผู้ใช้งาน", icon: Users, active: false },
 ];
 
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  USD: "$",
+  THB: "฿",
+  HKD: "HK$",
+  CNH: "¥",
+};
+
+function formatMoney(amount: number, currency: string): string {
+  const symbol = CURRENCY_SYMBOLS[currency] ?? `${currency} `;
+  return `${symbol}${Math.abs(amount).toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function toDisplayDate(ddmmyyyy: string): string {
+  const [d, m, y] = ddmmyyyy.split("/");
+  return `${y}-${m}-${d}`;
+}
+
 interface DashboardProps {
   userEmail?: string;
 }
@@ -84,6 +106,9 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const navigate = useNavigate();
   const { logout, user } = useAuth();
   const [activeTab, setActiveTab] = useState("stax");
+  const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions);
+  const [sortOrder, setSortOrder] = useState<"newest" | "oldest">("newest");
+  const [showAllTransactions, setShowAllTransactions] = useState(false);
   const location = useLocation();
 
   const emailFromLogin = (location.state as { email?: string } | null)
@@ -100,6 +125,41 @@ export default function Dashboard({ userEmail }: DashboardProps) {
     navigate("/login", { replace: true }); // เด้งกลับไปหน้า Login
   };
 
+  const handleImportFromPdf = (imported: ExtractedTransaction[]) => {
+    const mapped: Transaction[] = imported.map((t) => ({
+      id: t.id,
+      date: toDisplayDate(t.date),
+      description: t.description,
+      subLabel: t.subLabel,
+      income: t.amount >= 0 ? formatMoney(t.amount, t.currency) : null,
+      expense: t.amount < 0 ? formatMoney(t.amount, t.currency) : null,
+      rate: t.rate ?? "-",
+    }));
+
+    // รายการใหม่ล่าสุดอยู่บนสุด
+    setTransactions((prev) =>
+      [...mapped, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1))
+    );
+  };
+
+  const sortedTransactions = [...transactions].sort((a, b) =>
+    sortOrder === "newest"
+      ? a.date < b.date
+        ? 1
+        : -1
+      : a.date > b.date
+      ? 1
+      : -1
+  );
+
+  const visibleTransactions = showAllTransactions
+    ? sortedTransactions
+    : sortedTransactions.slice(0, 5);
+
+  const toggleSortOrder = () => {
+    setSortOrder((prev) => (prev === "newest" ? "oldest" : "newest"));
+  };
+
   return (
     <div className="min-h-screen w-full bg-gray-50 flex">
       {/* Sidebar */}
@@ -110,9 +170,8 @@ export default function Dashboard({ userEmail }: DashboardProps) {
           </div>
           <div>
             <p className="text-sm font-semibold text-gray-800 leading-none">
-              STAX Admin
+              STAX
             </p>
-            <p className="text-[11px] text-gray-400 mt-0.5">องค์กร</p>
           </div>
         </div>
 
@@ -222,9 +281,6 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             <h1 className="text-xl font-semibold mb-1.5">
               ยินดีต้อนรับกลับเข้าสู่ระบบ, {displayName}
             </h1>
-            <p className="text-sm text-blue-200">
-              เชื่อได้ว่าการควบคุมและกำกับดูแลบัญชีการเงินคลังโรงเรือน 3
-            </p>
           </div>
 
           {/* Stat cards */}
@@ -284,13 +340,28 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                 <h2 className="text-sm font-semibold text-gray-800">
                   สมุดบัญชีเงินทุน
                 </h2>
-                <button
-                  type="button"
-                  className="flex items-center gap-1.5 bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium px-3 py-2 rounded-lg transition"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  เพิ่มรายการใหม่
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={toggleSortOrder}
+                    className="flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
+                    title={
+                      sortOrder === "newest"
+                        ? "กำลังเรียง: ล่าสุด → เก่าสุด"
+                        : "กำลังเรียง: เก่าสุด → ล่าสุด"
+                    }
+                  >
+                    <ArrowUpDown className="w-3.5 h-3.5" />
+                    {sortOrder === "newest" ? "ล่าสุดก่อน" : "เก่าสุดก่อน"}
+                  </button>
+                  <button
+                    type="button"
+                    className="flex items-center gap-1.5 bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium px-3 py-2 rounded-lg transition"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    เพิ่มรายการใหม่
+                  </button>
+                </div>
               </div>
 
               <div className="overflow-x-auto">
@@ -308,7 +379,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                     </tr>
                   </thead>
                   <tbody>
-                    {transactions.map((t) => (
+                    {visibleTransactions.map((t) => (
                       <tr
                         key={t.id}
                         className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 transition"
@@ -359,48 +430,27 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                 </table>
               </div>
 
-              <div className="px-5 py-3.5 text-center border-t border-gray-100">
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-1 text-xs text-blue-800 font-medium hover:underline"
-                >
-                  ดูรายการบัญชีทั้งหมด
-                  <ChevronRight className="w-3.5 h-3.5" />
-                </button>
-              </div>
+              {sortedTransactions.length > 5 && (
+                <div className="px-5 py-3.5 text-center border-t border-gray-100">
+                  <button
+                    type="button"
+                    onClick={() => setShowAllTransactions((prev) => !prev)}
+                    className="inline-flex items-center gap-1 text-xs text-blue-800 font-medium hover:underline"
+                  >
+                    {showAllTransactions ? "ย่อรายการ" : "ดูรายการบัญชีทั้งหมด"}
+                    {showAllTransactions ? (
+                      <ChevronUp className="w-3.5 h-3.5" />
+                    ) : (
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    )}
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Right column */}
             <div className="space-y-4">
-              <div className="bg-white rounded-xl border border-gray-100 p-5">
-                <div className="flex items-center gap-1.5 mb-4">
-                  <Sparkles className="w-4 h-4 text-blue-800" />
-                  <h3 className="text-sm font-semibold text-gray-800">
-                    ระบบวิเคราะห์เอกสารอัจฉริยะ AI
-                  </h3>
-                </div>
-
-                <label className="block border-2 border-dashed border-blue-100 rounded-xl px-4 py-6 text-center bg-blue-50/40 cursor-pointer hover:bg-blue-50 transition">
-                  <input type="file" accept="application/pdf" className="hidden" />
-                  <UploadCloud className="w-6 h-6 text-blue-800 mx-auto mb-2" />
-                  <p className="text-sm font-medium text-blue-900">
-                    ลากและวางไฟล์ PDF ที่นี่
-                  </p>
-                  <p className="text-xs text-gray-400 mt-1">
-                    หรือกดเพื่อเลือกไฟล์จากเครื่อง
-                  </p>
-                </label>
-
-                <div className="mt-4">
-                  <div className="flex items-center justify-between text-xs text-gray-400 mb-1.5">
-                    <span>กำลังประมวลผล...</span>
-                    <span>72%</span>
-                  </div>
-                  <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                    <div className="h-full w-[72%] bg-blue-800 rounded-full" />
-                  </div>
-                </div>
-              </div>
+              <PdfStatementUploader onImport={handleImportFromPdf} />
 
               <div className="bg-emerald-50 rounded-xl p-5">
                 <p className="text-xs text-emerald-700 font-medium mb-1.5">
@@ -422,7 +472,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
 
           {/* Footer */}
           <div className="text-center text-xs text-gray-400 pt-4 space-y-1">
-            <p>© 2026 STAX Financial Management. All Rights Reserved.</p>
+            <p>© 2024 STAX Financial Management. All Rights Reserved.</p>
             <p>
               <button className="hover:underline">ความเป็นส่วนตัว</button>
               {"  ·  "}
