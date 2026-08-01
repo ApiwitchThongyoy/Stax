@@ -170,7 +170,7 @@ export default function StaxLoginPage() {
 
       {/* Footer */}
       <div className="absolute bottom-4 left-0 right-0 text-center text-xs text-gray-400 space-y-1">
-        <p>© 2024 STAX Financial Management. All Rights Reserved.</p>
+        <p>© 2026 STAX Financial Management. All Rights Reserved.</p>
         <p>
           <button className="hover:underline">Privacy Policy</button>
           {"  ·  "}

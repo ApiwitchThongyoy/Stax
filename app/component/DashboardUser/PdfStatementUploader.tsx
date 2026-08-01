@@ -1,6 +1,11 @@
 import { useRef, useState, type DragEvent } from "react";
 import { UploadCloud, Sparkles, FileWarning, CheckCircle2, X } from "lucide-react";
-import { parsePdfStatement, type ExtractedTransaction } from "../../lib/pdfStatementParser";
+import {
+  parsePdfStatement,
+  loadCostBasis,
+  saveCostBasis,
+  type ExtractedTransaction,
+} from "../../lib/pdfStatementParser";
 
 type Status = "idle" | "processing" | "error";
 
@@ -52,7 +57,11 @@ export default function PdfStatementUploader({ onImport }: PdfStatementUploaderP
     setErrorMessage("");
 
     try {
-      const transactions = await parsePdfStatement(file);
+      const existingCostBasis = loadCostBasis();
+      const { transactions, updatedCostBasis } = await parsePdfStatement(
+        file,
+        existingCostBasis
+      );
       if (transactions.length === 0) {
         setStatus("error");
         setErrorMessage(
@@ -60,6 +69,8 @@ export default function PdfStatementUploader({ onImport }: PdfStatementUploaderP
         );
         return;
       }
+      // บันทึกต้นทุนเฉลี่ยสะสมล่าสุดไว้ ใช้ต่อตอน import ไฟล์เดือนถัดไป
+      saveCostBasis(updatedCostBasis);
       setExtracted(transactions);
       setStatus("idle");
       setIsReviewOpen(true);

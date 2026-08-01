@@ -22,6 +22,8 @@ import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตร�
 import PdfStatementUploader from "./PdfStatementUploader";
 import type { ExtractedTransaction } from "../../lib/pdfStatementParser";
 
+type TransactionCategory = "income" | "expense" | "equity" | "asset";
+
 interface Transaction {
   id: string;
   date: string;
@@ -30,46 +32,12 @@ interface Transaction {
   income: string | null;
   expense: string | null;
   rate: string;
+  category: TransactionCategory;
+  pnlAmount: number; // ส่วนที่นับเป็นกำไร/ขาดทุนจริงตามหลักบัญชี (0 ถ้าไม่ใช่รายการกำไรขาดทุน) หน่วยสกุลเงินเดิม
 }
 
-const initialTransactions: Transaction[] = [
-  {
-    id: "1",
-    date: "2024-05-12",
-    description: "เงินทุนร่วมลงทุน",
-    subLabel: "(Venture Capital)",
-    income: "$50,000.00",
-    expense: null,
-    rate: "35.42",
-  },
-  {
-    id: "2",
-    date: "2024-05-14",
-    description: "ค่าโฮสติ้งคลาวด์",
-    subLabel: "AWS Cloud",
-    income: null,
-    expense: "$1,240.50",
-    rate: "35.38",
-  },
-  {
-    id: "3",
-    date: "2024-05-15",
-    description: "รายรับค่าธรรมเนียม",
-    subLabel: "SWIFT โอนเข้าบัญชี",
-    income: "$45.00",
-    expense: null,
-    rate: "35.40",
-  },
-  {
-    id: "4",
-    date: "2024-05-18",
-    description: "ค่าใบอนุญาตซอฟต์แวร์",
-    subLabel: "SaaS",
-    income: null,
-    expense: "$8,920.00",
-    rate: "35.45",
-  },
-];
+// ไม่มีข้อมูลตัวอย่างแล้ว — สมุดบัญชีเริ่มต้นว่างเปล่า รอผู้ใช้ import ไฟล์ statement จริง
+const initialTransactions: Transaction[] = [];
 
 const navItems = [
   { label: "แดชบอร์ด", icon: LayoutDashboard, active: true },
@@ -96,14 +64,6 @@ function formatMoney(amount: number, currency: string): string {
 function toDisplayDate(ddmmyyyy: string): string {
   const [d, m, y] = ddmmyyyy.split("/");
   return `${y}-${m}-${d}`;
-}
-
-// แปลงข้อความยอดเงินที่ format ไว้แล้ว (เช่น "$1,240.50", "฿5,000.00") กลับเป็นตัวเลข
-function parseAmountString(value: string | null): number {
-  if (!value) return 0;
-  const cleaned = value.replace(/[^0-9.-]/g, "");
-  const num = parseFloat(cleaned);
-  return Number.isNaN(num) ? 0 : num;
 }
 
 // แปลงข้อความอัตราแลกเปลี่ยน (เช่น "35.42", "-") กลับเป็นตัวเลข ถ้าอ่านไม่ได้ให้ถือว่าอัตรา 1 (เช่น THB)
@@ -148,6 +108,8 @@ export default function Dashboard({ userEmail }: DashboardProps) {
       income: t.amount >= 0 ? formatMoney(t.amount, t.currency) : null,
       expense: t.amount < 0 ? formatMoney(t.amount, t.currency) : null,
       rate: t.rate ?? "-",
+      category: t.category,
+      pnlAmount: t.pnlAmount,
     }));
 
     // รายการใหม่ล่าสุดอยู่บนสุด
@@ -174,24 +136,23 @@ export default function Dashboard({ userEmail }: DashboardProps) {
     setSortOrder((prev) => (prev === "newest" ? "oldest" : "newest"));
   };
 
-  // คำนวณ "กำไร/ขาดทุนจากอัตราแลกเปลี่ยนรวม" แบบเรียลไทม์จากรายการทั้งหมดในตาราง
-  // (เงินเข้า - เงินออก) ของแต่ละรายการ คูณด้วยอัตราแลกเปลี่ยน ณ ตอนนั้น แล้วรวมทุกรายการเป็นยอดสุทธิ (THB)
+  // คำนวณ "กำไร/ขาดทุนสุทธิ" แบบเรียลไทม์ตามหลักบัญชี:
+  // นับเฉพาะรายการที่เป็น "กำไร/ขาดทุนจริง" (pnlAmount) เช่น เงินปันผล ดอกเบี้ย กำไรจากการขายหุ้น ค่าธรรมเนียม ภาษี
+  // ไม่นับเงินฝาก/ถอน (equity) และเงินต้นที่ใช้ซื้อ-ขายหุ้น (asset) เพราะไม่ใช่กำไรขาดทุน
   // ค่านี้จะอัปเดตทันทีทุกครั้งที่ transactions เปลี่ยน ไม่ว่าจะเพิ่มเองหรือ import จากไฟล์ PDF
   const fxGainLoss = transactions.reduce((sum, t) => {
-    const income = parseAmountString(t.income);
-    const expense = parseAmountString(t.expense);
     const rate = parseRateString(t.rate);
-    return sum + (income - expense) * rate;
+    return sum + t.pnlAmount * rate;
   }, 0);
 
-  const totalInflowTHB = transactions.reduce((sum, t) => {
-    const income = parseAmountString(t.income);
+  const totalIncomeTHB = transactions.reduce((sum, t) => {
+    if (t.pnlAmount <= 0) return sum;
     const rate = parseRateString(t.rate);
-    return sum + income * rate;
+    return sum + t.pnlAmount * rate;
   }, 0);
 
   const fxGainLossPercent =
-    totalInflowTHB > 0 ? (fxGainLoss / totalInflowTHB) * 100 : 0;
+    totalIncomeTHB > 0 ? (fxGainLoss / totalIncomeTHB) * 100 : 0;
 
   const isGain = fxGainLoss >= 0;
 
@@ -316,6 +277,9 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             <h1 className="text-xl font-semibold mb-1.5">
               ยินดีต้อนรับกลับเข้าสู่ระบบ, {displayName}
             </h1>
+            <p className="text-sm text-blue-200">
+              เชื่อได้ว่าการควบคุมและกำกับดูแลบัญชีการเงินคลังโรงเรือน 3
+            </p>
           </div>
 
           {/* Stat cards */}
@@ -323,7 +287,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             <div className="bg-white rounded-xl border border-gray-100 p-4">
               <div className="flex items-center justify-between mb-3">
                 <span className="text-xs text-gray-400">
-                  กำไร/ขาดทุนจากอัตราแลกเปลี่ยนรวม
+                  กำไร/ขาดทุนสุทธิ (แปลงเป็นบาท)
                 </span>
                 <span
                   className={`text-xs font-medium px-1.5 py-0.5 rounded ${
@@ -333,7 +297,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                   }`}
                 >
                   {isGain ? "กำไร" : "ขาดทุน"}
-                  {totalInflowTHB > 0 &&
+                  {totalIncomeTHB > 0 &&
                     ` ${isGain ? "+" : ""}${fxGainLossPercent.toFixed(1)}%`}
                 </span>
               </div>
@@ -422,7 +386,18 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                 </div>
               </div>
 
-              <div className="overflow-x-auto">
+              {sortedTransactions.length === 0 ? (
+                <div className="px-5 py-12 text-center">
+                  <BookOpen className="w-8 h-8 text-gray-300 mx-auto mb-3" />
+                  <p className="text-sm font-medium text-gray-600">
+                    ยังไม่มีรายการในสมุดบัญชี
+                  </p>
+                  <p className="text-xs text-gray-400 mt-1">
+                    ลากไฟล์ PDF statement มาที่ช่องด้านขวา หรือกด "เพิ่มรายการใหม่" เพื่อเริ่มต้น
+                  </p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-left text-xs text-gray-400 border-b border-gray-100">
@@ -486,7 +461,8 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                     ))}
                   </tbody>
                 </table>
-              </div>
+                </div>
+              )}
 
               {sortedTransactions.length > 5 && (
                 <div className="px-5 py-3.5 text-center border-t border-gray-100">
@@ -530,7 +506,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
 
           {/* Footer */}
           <div className="text-center text-xs text-gray-400 pt-4 space-y-1">
-            <p>© 2024 STAX Financial Management. All Rights Reserved.</p>
+            <p>© 2026 STAX Financial Management. All Rights Reserved.</p>
             <p>
               <button className="hover:underline">ความเป็นส่วนตัว</button>
               {"  ·  "}
