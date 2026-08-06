@@ -1,5 +1,6 @@
 import { useRef, useState, type DragEvent } from "react";
 import { UploadCloud, Sparkles, FileWarning, CheckCircle2, X } from "lucide-react";
+import { saveDocument } from "../../lib/Documentstorage";
 import {
   parsePdfStatement,
   loadCostBasis,
@@ -11,6 +12,7 @@ type Status = "idle" | "processing" | "error";
 
 interface PdfStatementUploaderProps {
   onImport: (transactions: ExtractedTransaction[]) => void;
+  onDocumentSaved?: () => void;
 }
 
 function SkeletonRow() {
@@ -28,13 +30,14 @@ function SkeletonRow() {
   );
 }
 
-export default function PdfStatementUploader({ onImport }: PdfStatementUploaderProps) {
+export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfStatementUploaderProps) {
   const [status, setStatus] = useState<Status>("idle");
   const [isDragActive, setIsDragActive] = useState(false);
   const [fileName, setFileName] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [extracted, setExtracted] = useState<ExtractedTransaction[]>([]);
   const [isReviewOpen, setIsReviewOpen] = useState(false);
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const resetToIdle = () => {
@@ -43,6 +46,7 @@ export default function PdfStatementUploader({ onImport }: PdfStatementUploaderP
     setErrorMessage("");
     setExtracted([]);
     setIsReviewOpen(false);
+    setPendingFile(null);
   };
 
   const processFile = async (file: File) => {
@@ -53,6 +57,7 @@ export default function PdfStatementUploader({ onImport }: PdfStatementUploaderP
     }
 
     setFileName(file.name);
+    setPendingFile(file);
     setStatus("processing");
     setErrorMessage("");
 
@@ -96,6 +101,16 @@ export default function PdfStatementUploader({ onImport }: PdfStatementUploaderP
   const handleConfirmImport = () => {
     const selected = extracted.filter((t) => t.included);
     onImport(selected);
+
+    // เก็บไฟล์ PDF ต้นฉบับไว้ใน IndexedDB ของเบราว์เซอร์ (ดูย้อนหลัง/ดาวน์โหลดได้ในเครื่องนี้)
+    if (pendingFile) {
+      saveDocument(pendingFile)
+        .then(() => onDocumentSaved?.())
+        .catch(() => {
+          // การบันทึกไฟล์ล้มเหลวไม่ควรบล็อกการนำเข้าข้อมูลธุรกรรม จึงแค่เงียบไว้
+        });
+    }
+
     resetToIdle();
   };
 

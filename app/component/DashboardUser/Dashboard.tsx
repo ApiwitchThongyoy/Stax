@@ -15,62 +15,30 @@ import {
   ChevronRight,
   ChevronUp,
   ArrowUpDown,
+  CalendarDays,
 } from "lucide-react";
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
 import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตรง
 import PdfStatementUploader from "./PdfStatementUploader";
+import StoredDocumentsList from "./Storeddocumentslist";
+import DailyCalendarExport from "./Dailycalendarexport";
+import CapitalLedgerPage from "../Ledger/CapitalLedgerPage";
 import type { ExtractedTransaction } from "../../lib/pdfStatementParser";
-
-type TransactionCategory = "income" | "expense" | "equity" | "asset";
-
-interface Transaction {
-  id: string;
-  date: string;
-  description: string;
-  subLabel?: string;
-  income: string | null;
-  expense: string | null;
-  rate: string;
-  category: TransactionCategory;
-  pnlAmount: number; // ส่วนที่นับเป็นกำไร/ขาดทุนจริงตามหลักบัญชี (0 ถ้าไม่ใช่รายการกำไรขาดทุน) หน่วยสกุลเงินเดิม
-}
+import type { Transaction } from "../../lib/Financeutils";
+import { formatMoney, toDisplayDate, parseRateString } from "../../lib/Financeutils";
 
 // ไม่มีข้อมูลตัวอย่างแล้ว — สมุดบัญชีเริ่มต้นว่างเปล่า รอผู้ใช้ import ไฟล์ statement จริง
 const initialTransactions: Transaction[] = [];
 
-const navItems = [
-  { label: "แดชบอร์ด", icon: LayoutDashboard, active: true },
-  { label: "สมุดบัญชี", icon: BookOpen, active: false },
-  { label: "อัตราแลกเปลี่ยน AI", icon: TrendingUp, active: false },
-  { label: "ผู้ใช้งาน", icon: Users, active: false },
+type NavId = "dashboard" | "ledger" | "fx" | "users";
+
+const navItems: { id: NavId; label: string; icon: typeof LayoutDashboard }[] = [
+  { id: "dashboard", label: "แดชบอร์ด", icon: LayoutDashboard },
+  { id: "ledger", label: "สมุดบัญชี", icon: BookOpen },
+  { id: "fx", label: "อัตราแลกเปลี่ยน AI", icon: TrendingUp },
+  { id: "users", label: "ปฏิทิน", icon: CalendarDays },
 ];
-
-const CURRENCY_SYMBOLS: Record<string, string> = {
-  USD: "$",
-  THB: "฿",
-  HKD: "HK$",
-  CNH: "¥",
-};
-
-function formatMoney(amount: number, currency: string): string {
-  const symbol = CURRENCY_SYMBOLS[currency] ?? `${currency} `;
-  return `${symbol}${Math.abs(amount).toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
-
-function toDisplayDate(ddmmyyyy: string): string {
-  const [d, m, y] = ddmmyyyy.split("/");
-  return `${y}-${m}-${d}`;
-}
-
-// แปลงข้อความอัตราแลกเปลี่ยน (เช่น "35.42", "-") กลับเป็นตัวเลข ถ้าอ่านไม่ได้ให้ถือว่าอัตรา 1 (เช่น THB)
-function parseRateString(rate: string): number {
-  const num = parseFloat(rate);
-  return Number.isNaN(num) ? 1 : num;
-}
 
 interface DashboardProps {
   userEmail?: string;
@@ -80,7 +48,9 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const navigate = useNavigate();
   const { logout, user } = useAuth();
   const [activeTab, setActiveTab] = useState("stax");
+  const [activeNav, setActiveNav] = useState<NavId>("dashboard");
   const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions);
+  const [docsRefreshKey, setDocsRefreshKey] = useState(0);
   const [sortOrder, setSortOrder] = useState<"newest" | "oldest">("newest");
   const [showAllTransactions, setShowAllTransactions] = useState(false);
   const location = useLocation();
@@ -110,6 +80,8 @@ export default function Dashboard({ userEmail }: DashboardProps) {
       rate: t.rate ?? "-",
       category: t.category,
       pnlAmount: t.pnlAmount,
+      amount: t.amount,
+      currency: t.currency,
     }));
 
     // รายการใหม่ล่าสุดอยู่บนสุด
@@ -174,10 +146,11 @@ export default function Dashboard({ userEmail }: DashboardProps) {
         <nav className="flex-1 px-3 py-4 space-y-1">
           {navItems.map((item) => (
             <button
-              key={item.label}
+              key={item.id}
               type="button"
+              onClick={() => setActiveNav(item.id)}
               className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition ${
-                item.active
+                activeNav === item.id
                   ? "bg-blue-900 text-white"
                   : "text-gray-600 hover:bg-gray-50"
               }`}
@@ -271,238 +244,250 @@ export default function Dashboard({ userEmail }: DashboardProps) {
 
         {/* Scrollable body */}
         <main className="flex-1 overflow-y-auto p-6 space-y-6">
-          {/* Welcome banner */}
-          <div className="bg-linear-to-br from-blue-900 to-blue-950 rounded-2xl px-6 py-5 text-white">
-            <p className="text-xs text-blue-300 mb-1">เซสชั่นนี้ของคุณ</p>
-            <h1 className="text-xl font-semibold mb-1.5">
-              ยินดีต้อนรับกลับเข้าสู่ระบบ, {displayName}
-            </h1>
-            <p className="text-sm text-blue-200">
-              เชื่อได้ว่าการควบคุมและกำกับดูแลบัญชีการเงินคลังโรงเรือน 3
-            </p>
-          </div>
-
-          {/* Stat cards */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div className="bg-white rounded-xl border border-gray-100 p-4">
-              <div className="flex items-center justify-between mb-3">
-                <span className="text-xs text-gray-400">
-                  กำไร/ขาดทุนสุทธิ (แปลงเป็นบาท)
-                </span>
-                <span
-                  className={`text-xs font-medium px-1.5 py-0.5 rounded ${
-                    isGain
-                      ? "bg-emerald-50 text-emerald-500"
-                      : "bg-red-50 text-red-500"
-                  }`}
-                >
-                  {isGain ? "กำไร" : "ขาดทุน"}
-                  {totalIncomeTHB > 0 &&
-                    ` ${isGain ? "+" : ""}${fxGainLossPercent.toFixed(1)}%`}
-                </span>
+          {activeNav === "users" ? (
+            <DailyCalendarExport transactions={transactions} />
+          ) : activeNav === "ledger" ? (
+            <CapitalLedgerPage />
+          ) : (
+            <>
+              {/* Welcome banner */}
+              <div className="bg-linear-to-br from-blue-900 to-blue-950 rounded-2xl px-6 py-5 text-white">
+                <p className="text-xs text-blue-300 mb-1">เซสชั่นนี้ของคุณ</p>
+                <h1 className="text-xl font-semibold mb-1.5">
+                  ยินดีต้อนรับกลับเข้าสู่ระบบ, {displayName}
+                </h1>
+                <p className="text-sm text-blue-200">
+                  เชื่อได้ว่าการควบคุมและกำกับดูแลบัญชีการเงินคลังโรงเรือน 3
+                </p>
               </div>
-              <p
-                className={`text-xl font-semibold ${
-                  isGain ? "text-gray-800" : "text-red-600"
-                }`}
-              >
-                {isGain ? "+" : "-"}฿
-                {Math.abs(fxGainLoss).toLocaleString(undefined, {
-                  minimumFractionDigits: 2,
-                  maximumFractionDigits: 2,
-                })}
-              </p>
-              <div className="h-1.5 bg-gray-100 rounded-full mt-3 overflow-hidden">
-                <div
-                  className={`h-full rounded-full ${
-                    isGain ? "bg-emerald-400" : "bg-red-400"
-                  }`}
-                  style={{
-                    width: `${Math.min(Math.abs(fxGainLossPercent), 100)}%`,
-                  }}
-                />
-              </div>
-            </div>
 
-            <div className="bg-white rounded-xl border border-gray-100 p-4">
-              <div className="flex items-center justify-between mb-3">
-                <span className="text-xs text-gray-400">
-                  อัตราแลกเปลี่ยนแบบเรียลไทม์ (USD/THB)
-                </span>
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-500 font-medium">
-                  Live BOT API
-                </span>
-              </div>
-              <p className="text-xl font-semibold text-gray-800">35.42</p>
-              <p className="text-[11px] text-gray-400 mt-3">
-                อัปเดตล่าสุด 2 นาทีที่แล้ว
-              </p>
-            </div>
-
-            <div className="bg-white rounded-xl border border-gray-100 p-4">
-              <div className="flex items-center justify-between mb-3">
-                <span className="text-xs text-gray-400">
-                  ประมาณการภาษีที่ต้องชำระ
-                </span>
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 font-medium">
-                  ใกล้ครบกำหนด
-                </span>
-              </div>
-              <p className="text-xl font-semibold text-gray-800">
-                $4,120.35
-              </p>
-            </div>
-          </div>
-
-          {/* Table + right column */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Transaction table */}
-            <div className="lg:col-span-2 bg-white rounded-xl border border-gray-100 overflow-hidden">
-              <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
-                <h2 className="text-sm font-semibold text-gray-800">
-                  สมุดบัญชีเงินทุน
-                </h2>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={toggleSortOrder}
-                    className="flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
-                    title={
-                      sortOrder === "newest"
-                        ? "กำลังเรียง: ล่าสุด → เก่าสุด"
-                        : "กำลังเรียง: เก่าสุด → ล่าสุด"
-                    }
+              {/* Stat cards */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div className="bg-white rounded-xl border border-gray-100 p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-xs text-gray-400">
+                      กำไร/ขาดทุนสุทธิ (แปลงเป็นบาท)
+                    </span>
+                    <span
+                      className={`text-xs font-medium px-1.5 py-0.5 rounded ${
+                        isGain
+                          ? "bg-emerald-50 text-emerald-500"
+                          : "bg-red-50 text-red-500"
+                      }`}
+                    >
+                      {isGain ? "กำไร" : "ขาดทุน"}
+                      {totalIncomeTHB > 0 &&
+                        ` ${isGain ? "+" : ""}${fxGainLossPercent.toFixed(1)}%`}
+                    </span>
+                  </div>
+                  <p
+                    className={`text-xl font-semibold ${
+                      isGain ? "text-gray-800" : "text-red-600"
+                    }`}
                   >
-                    <ArrowUpDown className="w-3.5 h-3.5" />
-                    {sortOrder === "newest" ? "ล่าสุดก่อน" : "เก่าสุดก่อน"}
-                  </button>
-                  <button
-                    type="button"
-                    className="flex items-center gap-1.5 bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium px-3 py-2 rounded-lg transition"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    เพิ่มรายการใหม่
-                  </button>
-                </div>
-              </div>
-
-              {sortedTransactions.length === 0 ? (
-                <div className="px-5 py-12 text-center">
-                  <BookOpen className="w-8 h-8 text-gray-300 mx-auto mb-3" />
-                  <p className="text-sm font-medium text-gray-600">
-                    ยังไม่มีรายการในสมุดบัญชี
+                    {isGain ? "+" : "-"}฿
+                    {Math.abs(fxGainLoss).toLocaleString(undefined, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}
                   </p>
-                  <p className="text-xs text-gray-400 mt-1">
-                    ลากไฟล์ PDF statement มาที่ช่องด้านขวา หรือกด "เพิ่มรายการใหม่" เพื่อเริ่มต้น
+                  <div className="h-1.5 bg-gray-100 rounded-full mt-3 overflow-hidden">
+                    <div
+                      className={`h-full rounded-full ${
+                        isGain ? "bg-emerald-400" : "bg-red-400"
+                      }`}
+                      style={{
+                        width: `${Math.min(Math.abs(fxGainLossPercent), 100)}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-xl border border-gray-100 p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-xs text-gray-400">
+                      อัตราแลกเปลี่ยนแบบเรียลไทม์ (USD/THB)
+                    </span>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-500 font-medium">
+                      Live BOT API
+                    </span>
+                  </div>
+                  <p className="text-xl font-semibold text-gray-800">35.42</p>
+                  <p className="text-[11px] text-gray-400 mt-3">
+                    อัปเดตล่าสุด 2 นาทีที่แล้ว
                   </p>
                 </div>
-              ) : (
-                <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-left text-xs text-gray-400 border-b border-gray-100">
-                      <th className="px-5 py-3 font-medium">วันที่</th>
-                      <th className="px-5 py-3 font-medium">รายการ</th>
-                      <th className="px-5 py-3 font-medium">เงินเข้า</th>
-                      <th className="px-5 py-3 font-medium">เงินออก</th>
-                      <th className="px-5 py-3 font-medium">อัตรา</th>
-                      <th className="px-5 py-3 font-medium text-right">
-                        จัดการ
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleTransactions.map((t) => (
-                      <tr
-                        key={t.id}
-                        className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 transition"
+
+                <div className="bg-white rounded-xl border border-gray-100 p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-xs text-gray-400">
+                      ประมาณการภาษีที่ต้องชำระ
+                    </span>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 font-medium">
+                      ใกล้ครบกำหนด
+                    </span>
+                  </div>
+                  <p className="text-xl font-semibold text-gray-800">
+                    $4,120.35
+                  </p>
+                </div>
+              </div>
+
+              {/* Table + right column */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* Transaction table */}
+                <div className="lg:col-span-2 bg-white rounded-xl border border-gray-100 overflow-hidden">
+                  <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+                    <h2 className="text-sm font-semibold text-gray-800">
+                      สมุดบัญชีเงินทุน
+                    </h2>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={toggleSortOrder}
+                        className="flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
+                        title={
+                          sortOrder === "newest"
+                            ? "กำลังเรียง: ล่าสุด → เก่าสุด"
+                            : "กำลังเรียง: เก่าสุด → ล่าสุด"
+                        }
                       >
-                        <td className="px-5 py-3.5 text-gray-500 whitespace-nowrap">
-                          {t.date}
-                        </td>
-                        <td className="px-5 py-3.5">
-                          <p className="text-gray-800 font-medium">
-                            {t.description}
-                          </p>
-                          {t.subLabel && (
-                            <p className="text-xs text-gray-400">
-                              {t.subLabel}
-                            </p>
-                          )}
-                        </td>
-                        <td className="px-5 py-3.5 text-emerald-600 font-medium whitespace-nowrap">
-                          {t.income || "-"}
-                        </td>
-                        <td className="px-5 py-3.5 text-red-500 font-medium whitespace-nowrap">
-                          {t.expense || "-"}
-                        </td>
-                        <td className="px-5 py-3.5 text-gray-500">
-                          {t.rate}
-                        </td>
-                        <td className="px-5 py-3.5">
-                          <div className="flex items-center justify-end gap-2">
-                            <button
-                              type="button"
-                              className="text-gray-400 hover:text-blue-800 transition"
-                              aria-label="แก้ไขรายการ"
-                            >
-                              <Pencil className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              className="text-gray-400 hover:text-red-600 transition"
-                              aria-label="ลบรายการ"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                        <ArrowUpDown className="w-3.5 h-3.5" />
+                        {sortOrder === "newest" ? "ล่าสุดก่อน" : "เก่าสุดก่อน"}
+                      </button>
+                      <button
+                        type="button"
+                        className="flex items-center gap-1.5 bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium px-3 py-2 rounded-lg transition"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        เพิ่มรายการใหม่
+                      </button>
+                    </div>
+                  </div>
+
+                  {sortedTransactions.length === 0 ? (
+                    <div className="px-5 py-12 text-center">
+                      <BookOpen className="w-8 h-8 text-gray-300 mx-auto mb-3" />
+                      <p className="text-sm font-medium text-gray-600">
+                        ยังไม่มีรายการในสมุดบัญชี
+                      </p>
+                      <p className="text-xs text-gray-400 mt-1">
+                        ลากไฟล์ PDF statement มาที่ช่องด้านขวา หรือกด "เพิ่มรายการใหม่" เพื่อเริ่มต้น
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left text-xs text-gray-400 border-b border-gray-100">
+                          <th className="px-5 py-3 font-medium">วันที่</th>
+                          <th className="px-5 py-3 font-medium">รายการ</th>
+                          <th className="px-5 py-3 font-medium">เงินเข้า</th>
+                          <th className="px-5 py-3 font-medium">เงินออก</th>
+                          <th className="px-5 py-3 font-medium">อัตรา</th>
+                          <th className="px-5 py-3 font-medium text-right">
+                            จัดการ
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {visibleTransactions.map((t) => (
+                          <tr
+                            key={t.id}
+                            className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 transition"
+                          >
+                            <td className="px-5 py-3.5 text-gray-500 whitespace-nowrap">
+                              {t.date}
+                            </td>
+                            <td className="px-5 py-3.5">
+                              <p className="text-gray-800 font-medium">
+                                {t.description}
+                              </p>
+                              {t.subLabel && (
+                                <p className="text-xs text-gray-400">
+                                  {t.subLabel}
+                                </p>
+                              )}
+                            </td>
+                            <td className="px-5 py-3.5 text-emerald-600 font-medium whitespace-nowrap">
+                              {t.income || "-"}
+                            </td>
+                            <td className="px-5 py-3.5 text-red-500 font-medium whitespace-nowrap">
+                              {t.expense || "-"}
+                            </td>
+                            <td className="px-5 py-3.5 text-gray-500">
+                              {t.rate}
+                            </td>
+                            <td className="px-5 py-3.5">
+                              <div className="flex items-center justify-end gap-2">
+                                <button
+                                  type="button"
+                                  className="text-gray-400 hover:text-blue-800 transition"
+                                  aria-label="แก้ไขรายการ"
+                                >
+                                  <Pencil className="w-3.5 h-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="text-gray-400 hover:text-red-600 transition"
+                                  aria-label="ลบรายการ"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    </div>
+                  )}
+
+                  {sortedTransactions.length > 5 && (
+                    <div className="px-5 py-3.5 text-center border-t border-gray-100">
+                      <button
+                        type="button"
+                        onClick={() => setShowAllTransactions((prev) => !prev)}
+                        className="inline-flex items-center gap-1 text-xs text-blue-800 font-medium hover:underline"
+                      >
+                        {showAllTransactions ? "ย่อรายการ" : "ดูรายการบัญชีทั้งหมด"}
+                        {showAllTransactions ? (
+                          <ChevronUp className="w-3.5 h-3.5" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    </div>
+                  )}
                 </div>
-              )}
 
-              {sortedTransactions.length > 5 && (
-                <div className="px-5 py-3.5 text-center border-t border-gray-100">
-                  <button
-                    type="button"
-                    onClick={() => setShowAllTransactions((prev) => !prev)}
-                    className="inline-flex items-center gap-1 text-xs text-blue-800 font-medium hover:underline"
-                  >
-                    {showAllTransactions ? "ย่อรายการ" : "ดูรายการบัญชีทั้งหมด"}
-                    {showAllTransactions ? (
-                      <ChevronUp className="w-3.5 h-3.5" />
-                    ) : (
-                      <ChevronRight className="w-3.5 h-3.5" />
-                    )}
-                  </button>
+                {/* Right column */}
+                <div className="space-y-4">
+                  <PdfStatementUploader
+                    onImport={handleImportFromPdf}
+                    onDocumentSaved={() => setDocsRefreshKey((k) => k + 1)}
+                  />
+                  <StoredDocumentsList refreshTrigger={docsRefreshKey} />
+
+                  <div className="bg-emerald-50 rounded-xl p-5">
+                    <p className="text-xs text-emerald-700 font-medium mb-1.5">
+                      ข้อเสนอแนะจาก AI
+                    </p>
+                    <p className="text-sm text-emerald-900 leading-relaxed">
+                      รายจ่ายด้านซอฟต์แวร์เดือนนี้สูงกว่าค่าเฉลี่ย 18%
+                      แนะนำให้ตรวจสอบใบสมัครที่ไม่ได้ใช้งาน
+                    </p>
+                    <button
+                      type="button"
+                      className="text-xs text-emerald-700 font-medium hover:underline mt-2"
+                    >
+                      ดูรายละเอียด
+                    </button>
+                  </div>
                 </div>
-              )}
-            </div>
-
-            {/* Right column */}
-            <div className="space-y-4">
-              <PdfStatementUploader onImport={handleImportFromPdf} />
-
-              <div className="bg-emerald-50 rounded-xl p-5">
-                <p className="text-xs text-emerald-700 font-medium mb-1.5">
-                  ข้อเสนอแนะจาก AI
-                </p>
-                <p className="text-sm text-emerald-900 leading-relaxed">
-                  รายจ่ายด้านซอฟต์แวร์เดือนนี้สูงกว่าค่าเฉลี่ย 18%
-                  แนะนำให้ตรวจสอบใบสมัครที่ไม่ได้ใช้งาน
-                </p>
-                <button
-                  type="button"
-                  className="text-xs text-emerald-700 font-medium hover:underline mt-2"
-                >
-                  ดูรายละเอียด
-                </button>
               </div>
-            </div>
-          </div>
+            </>
+          )}
 
           {/* Footer */}
           <div className="text-center text-xs text-gray-400 pt-4 space-y-1">

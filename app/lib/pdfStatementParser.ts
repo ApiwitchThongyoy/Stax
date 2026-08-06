@@ -190,6 +190,111 @@ interface RawTradeEvent {
   currency: string;
 }
 
+// ตัดอักขระที่ไม่ใช่ตัวอักษร/ตัวเลขออก แล้วแปลงเป็นตัวพิมพ์ใหญ่ทั้งหมด เพื่อเทียบชื่อกองทุนแบบไม่สนช่องว่าง/สัญลักษณ์พิเศษ (®, -, ฯลฯ)
+function normalizeName(s: string): string {
+  return s.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// ---------- หา "ชื่อเต็มของแต่ละสัญลักษณ์หุ้น" จากตาราง Portfolio Summary และ Trade Records ----------
+// ใช้จับคู่คำอธิบายในตาราง DIVIDENDS (ที่มีแต่ชื่อเต็ม ไม่มีสัญลักษณ์) กลับไปหาสัญลักษณ์หุ้น (ticker)
+// เพื่อแยกเงินปันผลตามสัญลักษณ์ได้ (income:dividends:<symbol> แบบที่อาจารย์สอน)
+function buildSymbolNameMap(fullText: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  const tickerLine = /^[A-Z][A-Z.]{0,9}$/;
+
+  // จาก Portfolio Summary: ticker 1 บรรทัด แล้วชื่อ (อาจขึ้นหลายบรรทัด) ก่อนแถวตัวเลขปิดท้าย
+  const portfolioStart = fullText.indexOf("PORTFOLIO SUMMARY");
+  if (portfolioStart !== -1) {
+    const portfolioEnd = fullText.indexOf("DEPOSIT & WITHDRAWAL RECORDS", portfolioStart);
+    const block = fullText.slice(portfolioStart, portfolioEnd === -1 ? undefined : portfolioEnd);
+    const lines = block.split("\n").map((l) => l.trim()).filter(Boolean);
+    const numericEndPattern =
+      /(?:^|\s)[\d.]+\s+\d+\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s+-?[\d,]+\.\d{2}\s+[A-Z]{3}\s+\S+$/;
+
+    let currentSymbol: string | null = null;
+    let nameParts: string[] = [];
+
+    for (const line of lines) {
+      if (tickerLine.test(line)) {
+        currentSymbol = line;
+        nameParts = [];
+        continue;
+      }
+      if (numericEndPattern.test(line)) {
+        const nameInSameLine = line.replace(numericEndPattern, "").trim();
+        if (nameInSameLine) nameParts.push(nameInSameLine);
+        if (currentSymbol && nameParts.length > 0) {
+          map[currentSymbol] = nameParts.join(" ");
+        }
+        currentSymbol = null;
+        nameParts = [];
+        continue;
+      }
+      if (currentSymbol) nameParts.push(line);
+    }
+  }
+
+  // จาก Trade Records: ticker 1 บรรทัด แล้วชื่อ+รายละเอียดซื้อขายอยู่บรรทัดถัดไปบรรทัดเดียว (เติมเฉพาะสัญลักษณ์ที่ยังไม่มีชื่อ)
+  const tradeStart = fullText.indexOf("TRADE RECORDS");
+  if (tradeStart !== -1) {
+    const tradeEnd = fullText.indexOf("PORTFOLIO SUMMARY", tradeStart);
+    const block = fullText.slice(tradeStart, tradeEnd === -1 ? undefined : tradeEnd);
+    const lines = block.split("\n").map((l) => l.trim()).filter(Boolean);
+    const tradeDetailPattern =
+      /^(.+?)\s+\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}:\d{2},GMT[+-]\d{2}\s+\d{2}\/\d{2}\/\d{4}\s+(BUY|SELL)/;
+
+    for (let i = 0; i < lines.length; i++) {
+      if (!tickerLine.test(lines[i])) continue;
+      const detailMatch = lines[i + 1]?.match(tradeDetailPattern);
+      if (detailMatch && !map[lines[i]]) {
+        map[lines[i]] = detailMatch[1].trim();
+      }
+    }
+  }
+
+  return map;
+}
+
+// เทียบคำอธิบายเงินปันผล (ชื่อเต็มกองทุน + "Cash Div on...") กับชื่อที่รู้จักในตาราง แล้วคืนสัญลักษณ์ที่ตรงที่สุด
+// เลือกชื่อที่ยาวที่สุดที่ตรงกัน เพื่อกันจับผิดจากชื่อสั้นๆ ที่บังเอิญเป็นคำย่อยของอีกชื่อหนึ่ง
+//
+// หมายเหตุสำคัญ: บางเดือนคำอธิบายในตาราง DIVIDENDS ใช้ชื่อกองทุนแบบย่อ (เช่น "...Equity Premium Inc ETF")
+// ซึ่งต่างจากชื่อเต็มที่เจอใน Portfolio Summary/Trade Records (เช่น "...Equity Premium Income ETF")
+// ทำให้เทียบแบบ "ชื่อเต็มต้องอยู่ในคำอธิบาย" (substring) ไม่เจอเลย จึงต้องมี fallback ชั้นที่ 2:
+// เทียบแค่ 2-3 คำแรกของชื่อ (ซึ่งมักไม่ถูกย่อ) แทนที่จะเทียบทั้งชื่อ
+function matchSymbolForDividend(
+  description: string,
+  symbolNameMap: Record<string, string>
+): string | null {
+  const normDesc = normalizeName(description);
+  let bestSymbol: string | null = null;
+  let bestLen = 0;
+
+  // ชั้นที่ 1: เทียบชื่อเต็ม
+  for (const [symbol, name] of Object.entries(symbolNameMap)) {
+    const normName = normalizeName(name);
+    if (normName.length < 3) continue;
+    if (normDesc.includes(normName) && normName.length > bestLen) {
+      bestLen = normName.length;
+      bestSymbol = symbol;
+    }
+  }
+  if (bestSymbol) return bestSymbol;
+
+  // ชั้นที่ 2 (fallback): เทียบแค่ 2-3 คำแรกของชื่อ เผื่อคำท้ายๆ ถูกย่อในคำอธิบายเงินปันผล
+  for (const [symbol, name] of Object.entries(symbolNameMap)) {
+    const prefixWords = name.split(/\s+/).slice(0, 3).join(" ");
+    const normPrefix = normalizeName(prefixWords);
+    if (normPrefix.length < 6) continue;
+    if (normDesc.startsWith(normPrefix) && normPrefix.length > bestLen) {
+      bestLen = normPrefix.length;
+      bestSymbol = symbol;
+    }
+  }
+
+  return bestSymbol;
+}
+
 // ---------- Step 4: ดึงรายการแต่ละประเภทจากแถวที่จัดเรียงแล้ว ----------
 export function parseStatementRows(
   rows: string[],
@@ -198,6 +303,7 @@ export function parseStatementRows(
   const fullText = rows.join("\n");
   const baseRates = extractBaseRates(fullText);
   const portfolioSummary = parsePortfolioSummary(fullText);
+  const symbolNameMap = buildSymbolNameMap(fullText);
   const results: ExtractedTransaction[] = [];
 
   // ทำสำเนาไว้แก้ไข ไม่แตะของเดิมที่ผู้เรียกส่งเข้ามาโดยตรง
@@ -280,6 +386,10 @@ export function parseStatementRows(
   // จึงใช้วิธี "สะสมทุกบรรทัดไว้ก่อน จนกว่าจะเจอแถวตัวเลขปิดท้าย (สกุลเงิน + 3 ยอดเงิน)" ซึ่งเป็นจุดจบของแต่ละรายการเสมอ
   // แล้วค่อยดึงวันที่ตัวแรกที่เจอในข้อความที่สะสมมาเป็น Posting Date (ถูกต้องเสมอ เพราะวันที่นี้ขึ้นก่อนวันที่อื่นๆ
   // ที่แทรกอยู่ในคำอธิบาย เช่น "Rec .../Pay ...") วิธีนี้ทนต่อการขึ้นบรรทัดใหม่ได้ไม่ว่าจะกี่บรรทัดก็ตาม
+  //
+  // สำคัญ: ใช้ยอด "Gross Amount" (ก่อนหักภาษี) เป็นรายได้เงินปันผล แล้วแยกภาษีหัก ณ ที่จ่ายทั้งหมด
+  // ไปรวมเป็นค่าใช้จ่าย 1 บรรทัดต่างหาก (เหมือนที่อาจารย์สอน: income เต็มจำนวน + expenses:tax:withholding แยกกัน)
+  // แทนที่จะใช้ยอด "Net Amount" ที่หักภาษีไปแล้วแบบเดิม ซึ่งซ่อนตัวเลขภาษีที่จ่ายจริงไป
   const dividendBlock = sectionSlice("DIVIDENDS", ["INTEREST WHT", "INTEREST", "NOTES"]);
   if (dividendBlock) {
     const dividendEndRowPattern =
@@ -292,6 +402,10 @@ export function parseStatementRows(
 
     let buffer: string[] = [];
     let headerSeen = false;
+    let dividendWhtTotal = 0;
+    let dividendWhtCurrency = "USD";
+    let lastDividendDate = "";
+
     for (const line of dividendLines) {
       if (!headerSeen) {
         if (/Posting Date/i.test(line)) headerSeen = true;
@@ -299,7 +413,7 @@ export function parseStatementRows(
       }
       const endMatch = line.match(dividendEndRowPattern);
       if (endMatch) {
-        const [, currency, , , netAmt] = endMatch;
+        const [, currency, grossAmt, whtAmt] = endMatch;
         const combinedText = buffer.join(" ");
         const dateMatch = combinedText.match(/(\d{2}\/\d{2}\/\d{4})/);
 
@@ -309,19 +423,38 @@ export function parseStatementRows(
             .replace(date, "")
             .replace(/\s+/g, " ")
             .trim();
-          const net = toNumber(netAmt);
+          const gross = toNumber(grossAmt);
+          const wht = toNumber(whtAmt);
+
+          dividendWhtTotal += wht;
+          dividendWhtCurrency = currency;
+          lastDividendDate = date;
+
+          // จับคู่ชื่อกองทุนในคำอธิบายกับสัญลักษณ์หุ้นที่รู้จัก (จาก Portfolio Summary / Trade Records)
+          // เพื่อแยกเงินปันผลตามสัญลักษณ์ (เหมือน income:dividends:<symbol> ที่อาจารย์สอน)
+          const matchedSymbol = matchSymbolForDividend(description, symbolNameMap);
+          const section = matchedSymbol
+            ? `เงินปันผล:${matchedSymbol.toLowerCase()}`
+            : "เงินปันผล:ไม่ทราบสัญลักษณ์";
+
+          // ใส่ตัวย่อ (ticker) นำหน้าคำอธิบาย เหมือนกับที่แถวซื้อ/ขายหุ้นทำอยู่แล้ว (เช่น "GOOG ALPHABET INC")
+          const descriptionWithSymbol = matchedSymbol
+            ? `${matchedSymbol} - ${description}`
+            : description;
 
           results.push({
             id: nextId(),
             date,
-            description,
-            subLabel: "เงินปันผล",
+            description: descriptionWithSymbol,
+            subLabel: matchedSymbol
+              ? `เงินปันผล (ยอดก่อนหักภาษี) · ${matchedSymbol}`
+              : "เงินปันผล (ยอดก่อนหักภาษี)",
             currency,
-            amount: net,
+            amount: gross,
             category: "income",
-            pnlAmount: net,
+            pnlAmount: gross,
             rate: baseRates[currency] ?? "-",
-            section: "เงินปันผล",
+            section,
             included: true,
           });
         }
@@ -329,6 +462,23 @@ export function parseStatementRows(
       } else {
         buffer.push(line);
       }
+    }
+
+    // ภาษีหัก ณ ที่จ่ายจากเงินปันผลทั้งเดือน รวมเป็นค่าใช้จ่าย 1 บรรทัด (แยกจากภาษีหัก ณ ที่จ่ายดอกเบี้ยด้านล่าง)
+    if (dividendWhtTotal !== 0) {
+      results.push({
+        id: nextId(),
+        date: lastDividendDate,
+        description: "ภาษีหัก ณ ที่จ่าย - เงินปันผล (รวมทั้งเดือน)",
+        subLabel: "ภาษีหัก ณ ที่จ่ายเงินปันผล",
+        currency: dividendWhtCurrency,
+        amount: dividendWhtTotal,
+        category: "expense",
+        pnlAmount: dividendWhtTotal,
+        rate: baseRates[dividendWhtCurrency] ?? "-",
+        section: "ภาษีหัก ณ ที่จ่าย (ปันผล)",
+        included: true,
+      });
     }
   }
 
@@ -452,16 +602,50 @@ export function parseStatementRows(
       id: nextId(),
       date: ev.date,
       description: ev.description,
-      subLabel: `${ev.side === "BUY" ? "ซื้อ" : "ขาย"} ${ev.qtyStr} หุ้น @ ${ev.price} ${ev.currency}${pnlNote}`,
+      subLabel: `${ev.side === "BUY" ? "ซื้อ" : "ขาย"} ${ev.qtyStr} หุ้น @ ${ev.price} ${ev.currency}`,
       currency: ev.currency,
       amount: ev.side === "BUY" ? -Math.abs(ev.net) : Math.abs(ev.net),
       // เงินต้น/เงินที่ใช้ซื้อ-ขาย ถือเป็นการแลกเปลี่ยนสินทรัพย์ (asset) ไม่ใช่กำไรขาดทุนทั้งก้อน
       category: "asset",
-      pnlAmount, // มีค่าเฉพาะฝั่ง SELL ที่คำนวณกำไร/ขาดทุนจากต้นทุนสะสมได้เท่านั้น
+      pnlAmount: 0, // เงินสดที่ได้/จ่ายไป ไม่ใช่กำไรขาดทุน — กำไรขาดทุนจริงแยกเป็นอีกบรรทัดต่างหากด้านล่าง (ถ้ามี)
       rate: baseRates[ev.currency] ?? "-",
       section: ev.side === "BUY" ? "ซื้อหุ้น" : "ขายหุ้น",
       included: true,
     });
+
+    // ขาย: แยก "กำไร/ขาดทุนจากการขาย" ออกมาเป็นบรรทัดของตัวเองต่างหาก (เหมือน income:capital_gains ของอาจารย์)
+    // แทนที่จะซ่อนไว้ในยอดเงินสดของแถวข้างบน — ผู้ใช้จะได้เห็นตัวเลขกำไร/ขาดทุนจริงชัดเจนในสมุดบัญชี
+    if (ev.side === "SELL") {
+      if (pnlNote) {
+        results.push({
+          id: nextId(),
+          date: ev.date,
+          description: `กำไร/ขาดทุนจากการขาย ${ev.description}`,
+          subLabel: `ไม่พบต้นทุนเฉลี่ยของ ${ev.symbol} จึงไม่นับกำไร/ขาดทุนส่วนนี้`,
+          currency: ev.currency,
+          amount: 0,
+          category: "income",
+          pnlAmount: 0,
+          rate: baseRates[ev.currency] ?? "-",
+          section: "กำไรจากการขายหุ้น",
+          included: false, // ไม่ติ๊กไว้ เพราะเป็นรายการที่คำนวณไม่ได้จริง ไม่ควรถูกนับ
+        });
+      } else {
+        results.push({
+          id: nextId(),
+          date: ev.date,
+          description: `กำไร/ขาดทุนจากการขาย ${ev.description}`,
+          subLabel: `ต้นทุนเฉลี่ย ${ev.symbol} ที่ใช้คำนวณ`,
+          currency: ev.currency,
+          amount: pnlAmount,
+          category: "income", // เป็น income เสมอ แม้ค่าจะติดลบ (ขาดทุน) ตามหลัก capital_gains ของอาจารย์
+          pnlAmount,
+          rate: baseRates[ev.currency] ?? "-",
+          section: "กำไรจากการขายหุ้น",
+          included: true,
+        });
+      }
+    }
   }
 
   // Pass 3: "เติมข้อมูล" (self-heal) — สัญลักษณ์ไหนที่มีอยู่ใน Portfolio Summary ของไฟล์นี้ แต่เรายังไม่เคย
