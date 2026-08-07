@@ -3,40 +3,41 @@ import { useLocation } from "react-router";
 import {
   LayoutDashboard,
   BookOpen,
-  TrendingUp,
+  Archive,
   Users,
   Settings,
   HelpCircle,
   Bell,
   LogOut,
-  Plus,
   Pencil,
   Trash2,
   ChevronRight,
   ChevronUp,
   ArrowUpDown,
   CalendarDays,
+  X,
 } from "lucide-react";
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
 import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตรง
 import PdfStatementUploader from "./PdfStatementUploader";
 import StoredDocumentsList from "./Storeddocumentslist";
+import StatementArchivePage from "./StatementArchivePage";
 import DailyCalendarExport from "./Dailycalendarexport";
 import CapitalLedgerPage from "../Ledger/CapitalLedgerPage";
 import type { ExtractedTransaction } from "../../lib/pdfStatementParser";
-import type { Transaction } from "../../lib/Financeutils";
+import type { Transaction, TransactionCategory } from "../../lib/Financeutils";
 import { formatMoney, toDisplayDate, parseRateString } from "../../lib/Financeutils";
 
 // ไม่มีข้อมูลตัวอย่างแล้ว — สมุดบัญชีเริ่มต้นว่างเปล่า รอผู้ใช้ import ไฟล์ statement จริง
 const initialTransactions: Transaction[] = [];
 
-type NavId = "dashboard" | "ledger" | "fx" | "users";
+type NavId = "dashboard" | "ledger" | "archive" | "users";
 
 const navItems: { id: NavId; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "dashboard", label: "แดชบอร์ด", icon: LayoutDashboard },
   { id: "ledger", label: "สมุดบัญชี", icon: BookOpen },
-  { id: "fx", label: "อัตราแลกเปลี่ยน AI", icon: TrendingUp },
+  { id: "archive", label: "คลัง Statement", icon: Archive },
   { id: "users", label: "ปฏิทิน", icon: CalendarDays },
 ];
 
@@ -88,6 +89,87 @@ export default function Dashboard({ userEmail }: DashboardProps) {
     setTransactions((prev) =>
       [...mapped, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1))
     );
+  };
+
+  // ----- แก้ไข / ลบ รายการในสมุดบัญชี -----
+  const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
+  const [editForm, setEditForm] = useState({
+    date: "",
+    description: "",
+    subLabel: "",
+    amount: "",
+    direction: "in" as "in" | "out",
+    currency: "THB",
+    rate: "1",
+    countsAsPnl: false,
+  });
+  const [editFormError, setEditFormError] = useState("");
+
+  const openEditModal = (t: Transaction) => {
+    setEditingTransaction(t);
+    setEditForm({
+      date: t.date,
+      description: t.description,
+      subLabel: t.subLabel ?? "",
+      amount: String(Math.abs(t.amount)),
+      direction: t.amount >= 0 ? "in" : "out",
+      currency: t.currency,
+      rate: t.rate,
+      countsAsPnl: t.category === "income" || t.category === "expense",
+    });
+    setEditFormError("");
+  };
+
+  const closeEditModal = () => {
+    setEditingTransaction(null);
+    setEditFormError("");
+  };
+
+  const handleSaveEdit = () => {
+    if (!editingTransaction) return;
+    if (!editForm.date) {
+      setEditFormError("กรุณาเลือกวันที่");
+      return;
+    }
+    if (!editForm.description.trim()) {
+      setEditFormError("กรุณากรอกชื่อรายการ");
+      return;
+    }
+    const amountNum = parseFloat(editForm.amount);
+    if (!editForm.amount || Number.isNaN(amountNum) || amountNum <= 0) {
+      setEditFormError("กรุณากรอกจำนวนเงินให้ถูกต้อง (มากกว่า 0)");
+      return;
+    }
+
+    const signedAmount = editForm.direction === "in" ? amountNum : -amountNum;
+    const category: TransactionCategory = editForm.countsAsPnl
+      ? signedAmount >= 0
+        ? "income"
+        : "expense"
+      : "equity";
+
+    const updated: Transaction = {
+      ...editingTransaction,
+      date: editForm.date,
+      description: editForm.description.trim(),
+      subLabel: editForm.subLabel.trim() || undefined,
+      income: signedAmount >= 0 ? formatMoney(signedAmount, editForm.currency) : null,
+      expense: signedAmount < 0 ? formatMoney(signedAmount, editForm.currency) : null,
+      rate: editForm.rate.trim() || "1",
+      category,
+      pnlAmount: editForm.countsAsPnl ? signedAmount : 0,
+      amount: signedAmount,
+      currency: editForm.currency,
+    };
+
+    setTransactions((prev) =>
+      prev.map((t) => (t.id === editingTransaction.id ? updated : t))
+    );
+    closeEditModal();
+  };
+
+  const handleDeleteTransaction = (id: string) => {
+    setTransactions((prev) => prev.filter((t) => t.id !== id));
   };
 
   const sortedTransactions = [...transactions].sort((a, b) =>
@@ -198,8 +280,6 @@ export default function Dashboard({ userEmail }: DashboardProps) {
           <div className="flex items-center gap-6">
             {[
               { id: "stax", label: "STAX" },
-              { id: "insights", label: "สังเคราะห์" },
-              { id: "guide", label: "คู่มือ" },
             ].map((tab) => (
               <button
                 key={tab.id}
@@ -246,6 +326,8 @@ export default function Dashboard({ userEmail }: DashboardProps) {
         <main className="flex-1 overflow-y-auto p-6 space-y-6">
           {activeNav === "users" ? (
             <DailyCalendarExport transactions={transactions} />
+          ) : activeNav === "archive" ? (
+            <StatementArchivePage />
           ) : activeNav === "ledger" ? (
             <CapitalLedgerPage />
           ) : (
@@ -256,9 +338,6 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                 <h1 className="text-xl font-semibold mb-1.5">
                   ยินดีต้อนรับกลับเข้าสู่ระบบ, {displayName}
                 </h1>
-                <p className="text-sm text-blue-200">
-                  เชื่อได้ว่าการควบคุมและกำกับดูแลบัญชีการเงินคลังโรงเรือน 3
-                </p>
               </div>
 
               {/* Stat cards */}
@@ -341,28 +420,19 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                     <h2 className="text-sm font-semibold text-gray-800">
                       สมุดบัญชีเงินทุน
                     </h2>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={toggleSortOrder}
-                        className="flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
-                        title={
-                          sortOrder === "newest"
-                            ? "กำลังเรียง: ล่าสุด → เก่าสุด"
-                            : "กำลังเรียง: เก่าสุด → ล่าสุด"
-                        }
-                      >
-                        <ArrowUpDown className="w-3.5 h-3.5" />
-                        {sortOrder === "newest" ? "ล่าสุดก่อน" : "เก่าสุดก่อน"}
-                      </button>
-                      <button
-                        type="button"
-                        className="flex items-center gap-1.5 bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium px-3 py-2 rounded-lg transition"
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                        เพิ่มรายการใหม่
-                      </button>
-                    </div>
+                    <button
+                      type="button"
+                      onClick={toggleSortOrder}
+                      className="flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
+                      title={
+                        sortOrder === "newest"
+                          ? "กำลังเรียง: ล่าสุด → เก่าสุด"
+                          : "กำลังเรียง: เก่าสุด → ล่าสุด"
+                      }
+                    >
+                      <ArrowUpDown className="w-3.5 h-3.5" />
+                      {sortOrder === "newest" ? "ล่าสุดก่อน" : "เก่าสุดก่อน"}
+                    </button>
                   </div>
 
                   {sortedTransactions.length === 0 ? (
@@ -372,7 +442,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                         ยังไม่มีรายการในสมุดบัญชี
                       </p>
                       <p className="text-xs text-gray-400 mt-1">
-                        ลากไฟล์ PDF statement มาที่ช่องด้านขวา หรือกด "เพิ่มรายการใหม่" เพื่อเริ่มต้น
+                        ลากไฟล์ PDF statement มาที่ช่องด้านขวาเพื่อเริ่มต้น
                       </p>
                     </div>
                   ) : (
@@ -422,6 +492,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                               <div className="flex items-center justify-end gap-2">
                                 <button
                                   type="button"
+                                  onClick={() => openEditModal(t)}
                                   className="text-gray-400 hover:text-blue-800 transition"
                                   aria-label="แก้ไขรายการ"
                                 >
@@ -429,6 +500,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                                 </button>
                                 <button
                                   type="button"
+                                  onClick={() => handleDeleteTransaction(t.id)}
                                   className="text-gray-400 hover:text-red-600 transition"
                                   aria-label="ลบรายการ"
                                 >
@@ -467,7 +539,10 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                     onImport={handleImportFromPdf}
                     onDocumentSaved={() => setDocsRefreshKey((k) => k + 1)}
                   />
-                  <StoredDocumentsList refreshTrigger={docsRefreshKey} />
+                  <StoredDocumentsList
+                    refreshTrigger={docsRefreshKey}
+                    onViewAll={() => setActiveNav("archive")}
+                  />
 
                   <div className="bg-emerald-50 rounded-xl p-5">
                     <p className="text-xs text-emerald-700 font-medium mb-1.5">
@@ -505,14 +580,193 @@ export default function Dashboard({ userEmail }: DashboardProps) {
         </main>
       </div>
 
-      {/* Floating action button (mobile) */}
-      <button
-        type="button"
-        className="md:hidden fixed bottom-5 right-5 w-12 h-12 rounded-full bg-blue-900 text-white flex items-center justify-center shadow-lg"
-        aria-label="เพิ่มรายการใหม่"
-      >
-        <Plus className="w-5 h-5" />
-      </button>
+      {/* Edit transaction modal */}
+      {editingTransaction && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/40 backdrop-blur-sm"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeEditModal();
+          }}
+        >
+          <div className="w-full max-w-md bg-white rounded-2xl shadow-xl overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+              <h3 className="text-sm font-semibold text-gray-800">แก้ไขรายการ</h3>
+              <button
+                type="button"
+                onClick={closeEditModal}
+                className="text-gray-400 hover:text-gray-600 transition p-1"
+                aria-label="ปิดหน้าต่าง"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="px-5 py-4 space-y-4">
+              {/* Date */}
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                  วันที่
+                </label>
+                <input
+                  type="date"
+                  value={editForm.date}
+                  onChange={(e) => setEditForm((f) => ({ ...f, date: e.target.value }))}
+                  className="w-full px-3 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                />
+              </div>
+
+              {/* Description */}
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                  ชื่อรายการ
+                </label>
+                <input
+                  type="text"
+                  value={editForm.description}
+                  onChange={(e) =>
+                    setEditForm((f) => ({ ...f, description: e.target.value }))
+                  }
+                  className="w-full px-3 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                />
+              </div>
+
+              {/* SubLabel */}
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                  รายละเอียดย่อย (ถ้ามี)
+                </label>
+                <input
+                  type="text"
+                  value={editForm.subLabel}
+                  onChange={(e) =>
+                    setEditForm((f) => ({ ...f, subLabel: e.target.value }))
+                  }
+                  className="w-full px-3 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                />
+              </div>
+
+              {/* Direction toggle */}
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                  ทิศทาง
+                </label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setEditForm((f) => ({ ...f, direction: "in" }))}
+                    className={`text-sm font-medium py-2.5 rounded-lg border transition ${
+                      editForm.direction === "in"
+                        ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                        : "border-gray-200 text-gray-500 hover:bg-gray-50"
+                    }`}
+                  >
+                    เงินเข้า
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditForm((f) => ({ ...f, direction: "out" }))}
+                    className={`text-sm font-medium py-2.5 rounded-lg border transition ${
+                      editForm.direction === "out"
+                        ? "bg-red-50 border-red-200 text-red-600"
+                        : "border-gray-200 text-gray-500 hover:bg-gray-50"
+                    }`}
+                  >
+                    เงินออก
+                  </button>
+                </div>
+              </div>
+
+              {/* Amount + currency */}
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                    จำนวนเงิน
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={editForm.amount}
+                    onChange={(e) =>
+                      setEditForm((f) => ({ ...f, amount: e.target.value }))
+                    }
+                    className="w-full px-3 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                    สกุลเงิน
+                  </label>
+                  <select
+                    value={editForm.currency}
+                    onChange={(e) =>
+                      setEditForm((f) => ({ ...f, currency: e.target.value }))
+                    }
+                    className="w-full px-3 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                  >
+                    {["THB", "USD", "HKD", "CNH"].map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* Rate */}
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                  อัตราแลกเปลี่ยน (ใส่ "1" ถ้าเป็น THB)
+                </label>
+                <input
+                  type="text"
+                  value={editForm.rate}
+                  onChange={(e) => setEditForm((f) => ({ ...f, rate: e.target.value }))}
+                  className="w-full px-3 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
+                />
+              </div>
+
+              {/* Counts as P&L */}
+              <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={editForm.countsAsPnl}
+                  onChange={(e) =>
+                    setEditForm((f) => ({ ...f, countsAsPnl: e.target.checked }))
+                  }
+                  className="w-4 h-4 rounded border-gray-300 text-blue-900 focus:ring-blue-900/30"
+                />
+                <span className="text-sm text-gray-600">
+                  นับเป็นกำไร/ขาดทุน (เช่น เงินปันผล ดอกเบี้ย ค่าธรรมเนียม) — ไม่ติ๊กถ้าเป็นแค่เงินฝาก/ถอน
+                </span>
+              </label>
+
+              {editFormError && (
+                <div className="px-3 py-2.5 rounded-lg bg-red-50 text-red-600 text-sm">
+                  {editFormError}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 px-5 py-4 border-t border-gray-100">
+              <button
+                type="button"
+                onClick={handleSaveEdit}
+                className="flex-1 bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg transition"
+              >
+                บันทึกการแก้ไข
+              </button>
+              <button
+                type="button"
+                onClick={closeEditModal}
+                className="text-sm font-medium px-4 py-2.5 rounded-lg text-gray-500 hover:bg-gray-50 transition"
+              >
+                ยกเลิก
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
