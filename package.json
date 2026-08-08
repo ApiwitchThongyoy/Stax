@@ -9,8 +9,10 @@
     "typecheck": "react-router typegen && tsc"
   },
   "dependencies": {
+    "@prisma/client": "^7.9.1",
     "@react-router/node": "8.0.0",
     "@react-router/serve": "8.0.0",
+    "dotenv": "^17.4.2",
     "isbot": "^5.1.36",
     "lucide-react": "^1.25.0",
     "pdfjs-dist": "^6.1.200",
@@ -25,6 +27,7 @@
     "@types/node": "^22",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "prisma": "^7.9.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
     "vite": "^8.0.3"

@@ -5,3 +5,9 @@
 # React Router
 /.react-router/
 /build/
+
+# Prisma / SQLite
+prisma/dev.db
+*.db
+*.db-journal
+prisma/generated/
