@@ -8,8 +8,35 @@ datasource db {
 }
 
 model User {
-  id            String   @id @default(uuid())
-  email         String   @unique
-  password_hash String
-  role          String   @default("USER")
+  id                  String                @id @default(uuid())
+  email               String                @unique
+  password_hash       String
+  role                String                @default("USER")
+  capital_transactions Capital_Transactions[]
+}
+
+enum TransactionType {
+  CASH_IN
+  CASH_OUT
+}
+
+enum SourceType {
+  MANUAL
+  AI_PARSED
+}
+
+model Capital_Transactions {
+  transaction_id   String          @id @default(uuid())
+  user_id          String
+  amount_foreign   Decimal
+  currency         String
+  transaction_date DateTime
+  fx_rate_bot      Decimal
+  amount_thb       Decimal
+  type             TransactionType
+  source_type      SourceType
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
 }
