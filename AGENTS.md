@@ -72,6 +72,7 @@ Completed:
 - Prisma 7 configured with SQLite (prisma.config.ts, prisma/schema.prisma, .env).
 - users table created via migration create_users (prisma/migrations/20260807130407_create_users).
 - Prisma Client generated under prisma/generated/prisma.
+- documents table created via migration create_documents (prisma/migrations/20260808105847_create_documents). Stores metadata + file_path for uploaded Statement PDFs (no binary in DB). FK documents.user_id -> User.id with index on user_id.
 
 Next:
 Wait for user instruction.
