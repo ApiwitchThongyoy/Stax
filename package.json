@@ -9,11 +9,14 @@
     "typecheck": "react-router typegen && tsc"
   },
   "dependencies": {
+    "@prisma/adapter-better-sqlite3": "^7.9.1",
     "@prisma/client": "^7.9.1",
     "@react-router/node": "8.0.0",
     "@react-router/serve": "8.0.0",
+    "bcryptjs": "^3.0.3",
     "dotenv": "^17.4.2",
     "isbot": "^5.1.36",
+    "jsonwebtoken": "^9.0.3",
     "lucide-react": "^1.25.0",
     "pdfjs-dist": "^6.1.200",
     "react": "^19.2.7",
@@ -25,6 +28,7 @@
   "devDependencies": {
     "@react-router/dev": "8.0.0",
     "@tailwindcss/vite": "^4.3.3",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",

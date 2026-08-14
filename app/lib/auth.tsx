@@ -4,7 +4,10 @@ const STORAGE_KEY = "stax_auth_user";
 const USERS_KEY = "stax_registered_users";
 
 interface AuthUser {
+  id: string;
   email: string;
+  role: string;
+  accessToken: string;
 }
 
 interface RegisteredUser {
@@ -25,7 +28,7 @@ interface RegisterResult {
 interface AuthContextValue {
   user: AuthUser | null;
   isAuthenticated: boolean;
-  login: (email: string, password: string) => LoginResult;
+  login: (email: string, password: string) => Promise<LoginResult>;
   logout: () => void;
   register: (email: string, password: string) => RegisterResult;
 }
@@ -59,31 +62,59 @@ function saveRegisteredUsers(users: RegisteredUser[]) {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(() => readStoredUser());
 
-  const login = useCallback((email: string, password: string): LoginResult => {
-    const trimmedEmail = email.trim();
+  const login = useCallback(
+    async (email: string, password: string): Promise<LoginResult> => {
+      const trimmedEmail = email.trim();
 
-    if (!trimmedEmail || !password) {
-      return { success: false, error: "กรุณากรอกอีเมลและรหัสผ่านให้ครบถ้วน" };
-    }
+      if (!trimmedEmail || !password) {
+        return { success: false, error: "กรุณากรอกอีเมลและรหัสผ่านให้ครบถ้วน" };
+      }
 
-    // TODO: ตรงนี้คือจุดที่ควรเรียก API login จริง (ตรวจรหัสผ่าน, รับ token ฯลฯ)
-    // ตอนนี้ mock ไว้ก่อนด้วยการเช็คกับรายชื่อผู้ใช้ที่ลงทะเบียนไว้ใน localStorage
-    const users = readRegisteredUsers();
-    const match = users.find(
-      (u) =>
-        u.email.toLowerCase() === trimmedEmail.toLowerCase() &&
-        u.password === password
-    );
+      let response: Response;
+      try {
+        response = await fetch("/api/v1/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: trimmedEmail, password }),
+        });
+      } catch {
+        return { success: false, error: "ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ กรุณาลองใหม่อีกครั้ง" };
+      }
 
-    if (!match) {
-      return { success: false, error: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" };
-    }
+      let data: {
+        success?: boolean;
+        data?: {
+          accessToken?: string;
+          user?: { id?: string; email?: string; role?: string };
+        };
+      };
+      try {
+        data = await response.json();
+      } catch {
+        data = {};
+      }
 
-    const nextUser: AuthUser = { email: match.email };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(nextUser));
-    setUser(nextUser);
-    return { success: true };
-  }, []);
+      if (response.status === 401) {
+        return { success: false, error: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" };
+      }
+
+      if (!response.ok || !data.success || !data.data?.accessToken || !data.data?.user) {
+        return { success: false, error: "เข้าสู่ระบบไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" };
+      }
+
+      const { accessToken, user: apiUser } = data.data;
+      const nextUser: AuthUser = {
+        id: apiUser.id ?? "",
+        email: apiUser.email ?? trimmedEmail,
+        role: apiUser.role ?? "USER",
+        accessToken,
+      };
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(nextUser));
+      setUser(nextUser);
+      return { success: true };
+    },
+    []
+  );
 
   const logout = useCallback(() => {
     window.localStorage.removeItem(STORAGE_KEY);

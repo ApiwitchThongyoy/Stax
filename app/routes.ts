@@ -14,4 +14,6 @@ export default [
   layout("component/Admin/Adminprotected.tsx", [
     route("admin/dashboard", "component/Admin/Admindashboard.tsx"),
   ]),
+
+  route("api/v1/auth/login", "routes/api/auth/login.ts"),
 ] satisfies RouteConfig;
