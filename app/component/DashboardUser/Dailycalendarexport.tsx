@@ -15,7 +15,7 @@ import {
   CalendarDays,
   X,
 } from "lucide-react";
-import type { Transaction } from "../../lib/Financeutils";
+import type { Transaction, TransactionCategory } from "../../lib/Financeutils";
 import { parseRateString, formatTHB } from "../../lib/Financeutils";
 
 interface DailyCalendarExportProps {
@@ -49,12 +49,43 @@ const THAI_MONTHS = [
 
 const THAI_WEEKDAYS = ["อา", "จ", "อ", "พ", "พฤ", "ศ", "ส"];
 
+const CATEGORY_LABELS: Record<TransactionCategory, string> = {
+  income: "รายได้ / กำไร",
+  expense: "รายจ่าย / ค่าธรรมเนียม",
+  equity: "เงินฝาก-ถอน",
+  asset: "ซื้อ-ขายหลักทรัพย์",
+};
+
 function pad2(n: number): string {
   return n.toString().padStart(2, "0");
 }
 
 function dateKeyOf(year: number, month0: number, day: number): string {
   return `${year}-${pad2(month0 + 1)}-${pad2(day)}`;
+}
+
+// แปลง yyyy-mm-dd เป็นวันที่ภาษาไทยอ่านง่าย เช่น "1 กรกฎาคม 2569"
+// ใช้ข้อความไทยแทนรูปแบบ ISO เพื่อกัน Excel/ชีตแปลงเป็นตัวเลขวันที่เองแล้วจอแสดง "#######"
+function formatThaiDate(dateKey: string): string {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  return `${d} ${THAI_MONTHS[m - 1]} ${y + 543}`;
+}
+
+// สร้างข้อความสรุปว่าเงินในวันนั้นมาจาก/ไปที่รายการอะไรบ้าง เช่น
+// "เงินปันผล AAPL (+$50.00); ค่าธรรมเนียมโบรกเกอร์ (-$5.00)"
+function buildSourceLabel(items: Transaction[]): string {
+  if (items.length === 0) return "-";
+  return items
+    .map((t) => {
+      const amountLabel = t.income
+        ? `+${t.income}`
+        : t.expense
+        ? `-${t.expense}`
+        : "";
+      const category = ` [${CATEGORY_LABELS[t.category]}]`;
+      return `${t.description}${amountLabel ? ` (${amountLabel})` : ""}${category}`;
+    })
+    .join("; ");
 }
 
 function escapeCsvCell(value: string | number): string {
@@ -192,13 +223,35 @@ export default function DailyCalendarExport({
 
   function buildExportRows() {
     return monthDays.map((d) => ({
-      วันที่: d.dateKey,
+      วันที่: formatThaiDate(d.dateKey),
       เงินเข้า: Number(d.income.toFixed(2)),
       เงินออก: Number(d.expense.toFixed(2)),
       ยอดสุทธิรายวัน: Number(d.netFlow.toFixed(2)),
       "กำไร/ขาดทุนรายวัน": Number(d.dailyPnl.toFixed(2)),
       กำไรสะสม: Number(d.cumulativePnl.toFixed(2)),
+      "แหล่งที่มา / รายละเอียด": buildSourceLabel(d.transactions),
     }));
+  }
+
+  // รายการแบบละเอียดทุกธุรกรรมในเดือนที่แสดง ใช้สำหรับชีตที่ 2 ของไฟล์ Excel
+  // เพื่อให้เห็นชัดว่าแต่ละบาทมาจากรายการไหน
+  function buildDetailRows() {
+    return monthDays.flatMap((d) =>
+      d.transactions.map((t) => {
+        const rate = parseRateString(t.rate);
+        return {
+          วันที่: formatThaiDate(d.dateKey),
+          รายการ: t.description,
+          รายละเอียดย่อย: t.subLabel ?? "-",
+          ประเภท: CATEGORY_LABELS[t.category],
+          "จำนวนเงิน (สกุลเดิม)": Number(t.amount.toFixed(2)),
+          สกุลเงิน: t.currency,
+          อัตราแลกเปลี่ยน: t.rate,
+          "จำนวนเงิน (บาท)": Number((t.amount * rate).toFixed(2)),
+          "กำไร/ขาดทุน (บาท)": Number((t.pnlAmount * rate).toFixed(2)),
+        };
+      })
+    );
   }
 
   function handleExportCsv() {
@@ -212,6 +265,7 @@ export default function DailyCalendarExport({
         ยอดสุทธิรายวัน: "",
         "กำไร/ขาดทุนรายวัน": "",
         กำไรสะสม: "",
+        "แหล่งที่มา / รายละเอียด": "",
       });
       const lines = [
         headers.map(escapeCsvCell).join(","),
@@ -240,22 +294,42 @@ export default function DailyCalendarExport({
     try {
       // ต้องติดตั้งไลบรารี xlsx ในโปรเจกต์: npm install xlsx
       const XLSX = await import("xlsx");
-      const rows = buildExportRows();
-      const worksheet = XLSX.utils.json_to_sheet(rows);
-      worksheet["!cols"] = [
-        { wch: 12 },
-        { wch: 14 },
-        { wch: 14 },
-        { wch: 16 },
-        { wch: 18 },
-        { wch: 14 },
+
+      // ชีตที่ 1: สรุปรายวัน
+      const summaryRows = buildExportRows();
+      const summarySheet = XLSX.utils.json_to_sheet(summaryRows);
+      summarySheet["!cols"] = [
+        { wch: 20 }, // วันที่ (ข้อความไทย)
+        { wch: 14 }, // เงินเข้า
+        { wch: 14 }, // เงินออก
+        { wch: 16 }, // ยอดสุทธิรายวัน
+        { wch: 18 }, // กำไร/ขาดทุนรายวัน
+        { wch: 14 }, // กำไรสะสม
+        { wch: 50 }, // แหล่งที่มา / รายละเอียด
       ];
-      const workbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(
-        workbook,
-        worksheet,
-        `${viewYear}-${pad2(viewMonth0 + 1)}`
+
+      // ชีตที่ 2: รายละเอียดทุกธุรกรรม เพื่อให้ตรวจสอบที่มาของเงินแต่ละบาทได้
+      const detailRows = buildDetailRows();
+      const detailSheet = XLSX.utils.json_to_sheet(
+        detailRows.length > 0
+          ? detailRows
+          : [{ หมายเหตุ: "ไม่มีธุรกรรมในเดือนนี้" }]
       );
+      detailSheet["!cols"] = [
+        { wch: 20 }, // วันที่
+        { wch: 28 }, // รายการ
+        { wch: 24 }, // รายละเอียดย่อย
+        { wch: 20 }, // ประเภท
+        { wch: 16 }, // จำนวนเงิน (สกุลเดิม)
+        { wch: 10 }, // สกุลเงิน
+        { wch: 14 }, // อัตราแลกเปลี่ยน
+        { wch: 16 }, // จำนวนเงิน (บาท)
+        { wch: 16 }, // กำไร/ขาดทุน (บาท)
+      ];
+
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, summarySheet, "สรุปรายวัน");
+      XLSX.utils.book_append_sheet(workbook, detailSheet, "รายละเอียดธุรกรรม");
       XLSX.writeFile(
         workbook,
         `รายงานรายวัน_${viewYear}-${pad2(viewMonth0 + 1)}.xlsx`
@@ -499,7 +573,8 @@ export default function DailyCalendarExport({
 
       <p className="flex items-center gap-1.5 text-[11px] text-gray-400">
         <Download className="w-3 h-3" />
-        การส่งออกจะรวมข้อมูลทั้งเดือนที่กำลังแสดงอยู่บนปฏิทิน
+        การส่งออกจะรวมข้อมูลทั้งเดือนที่กำลังแสดงอยู่บนปฏิทิน พร้อมระบุแหล่งที่มาของเงินแต่ละวัน
+        — ไฟล์ Excel จะมีชีตแยก "รายละเอียดธุรกรรม" ให้ตรวจสอบที่มาของเงินแต่ละรายการเพิ่มเติม
       </p>
     </div>
   );
