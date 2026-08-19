@@ -16,4 +16,7 @@ export default [
   ]),
 
   route("api/v1/auth/login", "routes/api/auth/login.ts"),
+
+  route("api/v1/capital-ledgers", "routes/api/capital-ledgers.ts"),
+  route("api/v1/capital-ledgers/:id", "routes/api/capital-ledgers.$id.ts"),
 ] satisfies RouteConfig;
