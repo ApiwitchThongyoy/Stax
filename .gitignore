@@ -11,3 +11,6 @@ prisma/dev.db
 *.db
 *.db-journal
 prisma/generated/
+
+*.db-shm
+*.db-wal

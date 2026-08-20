@@ -1,7 +1,9 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { eq } from "drizzle-orm";
 import type { Route } from "./+types/login";
-import { prisma } from "../../../lib/db";
+import { db } from "../../../lib/drizzle-db";
+import { users } from "~/db/schema";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ACCESS_TOKEN_EXPIRY = "1h";
@@ -65,9 +67,11 @@ export async function action({ request }: Route.ActionArgs) {
 
   let user;
   try {
-    user = await prisma.user.findUnique({
-      where: { email: normalizedEmail },
-    });
+    user = db
+      .select()
+      .from(users)
+      .where(eq(users.email, normalizedEmail))
+      .get();
   } catch (error) {
     console.error("Login: failed to query user", error);
     return Response.json(
@@ -85,7 +89,7 @@ export async function action({ request }: Route.ActionArgs) {
 
   let passwordMatches = false;
   try {
-    passwordMatches = await bcrypt.compare(password, user.password_hash);
+    passwordMatches = await bcrypt.compare(password, user.passwordHash);
   } catch (error) {
     console.error("Login: failed to compare password", error);
     return Response.json(
