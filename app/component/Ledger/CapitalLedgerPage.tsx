@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router";
 import {
   BookOpen,
   Plus,
@@ -7,14 +8,9 @@ import {
   X,
   ArrowDownCircle,
   ArrowUpCircle,
+  AlertCircle,
 } from "lucide-react";
-import {
-  loadCapitalLedger,
-  saveCapitalLedger,
-  nextCapitalEntryId,
-  type CapitalLedgerEntry,
-  type CapitalEntryType,
-} from "../../lib/capitalLedger";
+import { useAuth } from "../../lib/auth";
 
 const CURRENCY_OPTIONS = ["THB", "USD", "HKD", "CNH"];
 
@@ -25,6 +21,21 @@ const CURRENCY_SYMBOLS: Record<string, string> = {
   CNH: "¥",
 };
 
+type ApiTransactionType = "CASH_IN" | "CASH_OUT";
+type FormEntryType = "in" | "out";
+
+// รูปทรงข้อมูลจริงจาก GET /api/v1/capital-ledgers (Drizzle schema: Capital_Transactions)
+interface ApiTransaction {
+  transactionId: string;
+  amountForeign: string;
+  currency: string;
+  transactionDate: string;
+  fxRateBot: string;
+  amountThb: string;
+  type: ApiTransactionType;
+  sourceType: string;
+}
+
 function formatMoney(amount: number, currency: string): string {
   const symbol = CURRENCY_SYMBOLS[currency] ?? `${currency} `;
   return `${symbol}${amount.toLocaleString(undefined, {
@@ -33,13 +44,24 @@ function formatMoney(amount: number, currency: string): string {
   })}`;
 }
 
+function formatThb(amount: number): string {
+  return `฿${amount.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function toNumber(value: string): number {
+  const num = Number(value);
+  return Number.isNaN(num) ? 0 : num;
+}
+
 interface FormState {
   date: string;
-  type: CapitalEntryType;
+  type: FormEntryType;
   amount: string;
   currency: string;
   rate: string;
-  remarks: string;
 }
 
 function emptyForm(): FormState {
@@ -49,16 +71,78 @@ function emptyForm(): FormState {
     amount: "",
     currency: "THB",
     rate: "1",
-    remarks: "",
   };
 }
 
 export default function CapitalLedgerPage() {
-  const [entries, setEntries] = useState<CapitalLedgerEntry[]>(() => loadCapitalLedger());
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  const [entries, setEntries] = useState<ApiTransaction[]>([]);
+  const [loadState, setLoadState] = useState<"loading" | "success" | "error">("loading");
+  const [loadError, setLoadError] = useState("");
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm());
   const [formError, setFormError] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+
+  // Token หมดอายุ/ไม่ถูกต้อง → เคลียร์ session ตาม auth flow เดิม
+  // (ProtectedLayout จะเด้งกลับไปหน้า /login ให้เอง)
+  const handleUnauthorized = useCallback(() => {
+    logout();
+    navigate("/login", { replace: true });
+  }, [logout, navigate]);
+
+  const authHeaders = (): Record<string, string> => {
+    if (!user?.accessToken) {
+      handleUnauthorized();
+      return {};
+    }
+    return { Authorization: `Bearer ${user.accessToken}` };
+  };
+
+  const fetchHistory = useCallback(async () => {
+    setLoadState("loading");
+    setLoadError("");
+
+    let response: Response;
+    try {
+      response = await fetch("/api/v1/capital-ledgers", {
+        headers: authHeaders(),
+      });
+    } catch {
+      setLoadState("error");
+      setLoadError("ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ กรุณาลองใหม่อีกครั้ง");
+      return;
+    }
+
+    if (response.status === 401) {
+      handleUnauthorized();
+      return;
+    }
+
+    let data: { success?: boolean; data?: ApiTransaction[] };
+    try {
+      data = await response.json();
+    } catch {
+      data = {};
+    }
+
+    if (!response.ok || !data.success || !Array.isArray(data.data)) {
+      setLoadState("error");
+      setLoadError("ดึงประวัติธุรกรรมไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
+      return;
+    }
+
+    setEntries(data.data);
+    setLoadState("success");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handleUnauthorized, user?.accessToken]);
+
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
 
   const openAddModal = () => {
     setEditingId(null);
@@ -67,15 +151,14 @@ export default function CapitalLedgerPage() {
     setIsModalOpen(true);
   };
 
-  const openEditModal = (entry: CapitalLedgerEntry) => {
-    setEditingId(entry.id);
+  const openEditModal = (entry: ApiTransaction) => {
+    setEditingId(entry.transactionId);
     setForm({
-      date: entry.date,
-      type: entry.type,
-      amount: String(entry.amount),
+      date: entry.transactionDate.slice(0, 10),
+      type: entry.type === "CASH_OUT" ? "out" : "in",
+      amount: entry.amountForeign,
       currency: entry.currency,
-      rate: entry.rate,
-      remarks: entry.remarks,
+      rate: entry.fxRateBot,
     });
     setFormError("");
     setIsModalOpen(true);
@@ -87,12 +170,21 @@ export default function CapitalLedgerPage() {
     setFormError("");
   };
 
-  const persist = (next: CapitalLedgerEntry[]) => {
-    setEntries(next);
-    saveCapitalLedger(next);
+  const buildPayload = () => {
+    const amountNum = parseFloat(form.amount);
+    const rateNum = toNumber(form.rate.trim() || "1");
+    return {
+      amountForeign: String(amountNum),
+      currency: form.currency,
+      transactionDate: form.date,
+      fxRateBot: String(rateNum),
+      amountThb: String(amountNum * rateNum),
+      type: (form.type === "out" ? "CASH_OUT" : "CASH_IN") as ApiTransactionType,
+      sourceType: "MANUAL",
+    };
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!form.date) {
       setFormError("กรุณาเลือกวันที่");
       return;
@@ -102,41 +194,86 @@ export default function CapitalLedgerPage() {
       setFormError("กรุณากรอกจำนวนเงินให้ถูกต้อง (มากกว่า 0)");
       return;
     }
-    if (!form.remarks.trim()) {
-      setFormError("กรุณากรอกหมายเหตุ/รายละเอียดรายการ");
+
+    setIsSaving(true);
+    setFormError("");
+
+    let response: Response;
+    try {
+      response = await fetch(
+        editingId ? `/api/v1/capital-ledgers/${editingId}` : "/api/v1/capital-ledgers",
+        {
+          method: editingId ? "PUT" : "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify(buildPayload()),
+        }
+      );
+    } catch {
+      setIsSaving(false);
+      setFormError("ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ กรุณาลองใหม่อีกครั้ง");
       return;
     }
 
-    const entryData: CapitalLedgerEntry = {
-      id: editingId ?? nextCapitalEntryId(),
-      date: form.date,
-      type: form.type,
-      amount: amountNum,
-      currency: form.currency,
-      rate: form.rate.trim() || "1",
-      remarks: form.remarks.trim(),
-    };
-
-    if (editingId) {
-      persist(entries.map((e) => (e.id === editingId ? entryData : e)));
-    } else {
-      persist([entryData, ...entries]);
+    if (response.status === 401) {
+      handleUnauthorized();
+      return;
     }
+
+    let data: { success?: boolean; data?: ApiTransaction };
+    try {
+      data = await response.json();
+    } catch {
+      data = {};
+    }
+
+    if (!response.ok || !data.success || !data.data) {
+      setIsSaving(false);
+      setFormError("บันทึกรายการไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
+      return;
+    }
+
+    const saved = data.data;
+    setEntries((prev) =>
+      editingId
+        ? prev.map((e) => (e.transactionId === saved.transactionId ? saved : e))
+        : [saved, ...prev]
+    );
+    setIsSaving(false);
     closeModal();
   };
 
-  const handleDelete = (id: string) => {
-    persist(entries.filter((e) => e.id !== id));
+  const handleDelete = async (id: string) => {
+    let response: Response;
+    try {
+      response = await fetch(`/api/v1/capital-ledgers/${id}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+    } catch {
+      setLoadError("ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ กรุณาลองใหม่อีกครั้ง");
+      return;
+    }
+
+    if (response.status === 401) {
+      handleUnauthorized();
+      return;
+    }
+
+    if (response.ok) {
+      setEntries((prev) => prev.filter((e) => e.transactionId !== id));
+    }
   };
 
-  const sortedEntries = [...entries].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const sortedEntries = [...entries].sort((a, b) =>
+    a.transactionDate < b.transactionDate ? 1 : -1
+  );
 
   const totalIn = entries
-    .filter((e) => e.type === "in" && e.currency === "THB")
-    .reduce((sum, e) => sum + e.amount, 0);
+    .filter((e) => e.type === "CASH_IN")
+    .reduce((sum, e) => sum + toNumber(e.amountThb), 0);
   const totalOut = entries
-    .filter((e) => e.type === "out" && e.currency === "THB")
-    .reduce((sum, e) => sum + e.amount, 0);
+    .filter((e) => e.type === "CASH_OUT")
+    .reduce((sum, e) => sum + toNumber(e.amountThb), 0);
   const netThb = totalIn - totalOut;
 
   return (
@@ -148,7 +285,7 @@ export default function CapitalLedgerPage() {
           บันทึกเงินโอนเข้า-ออกประเทศด้วยตนเอง
         </h1>
         <p className="text-sm text-blue-200">
-          เพิ่ม แก้ไข หรือลบรายการ Cash In / Cash Out ได้อิสระ ข้อมูลจะถูกบันทึกไว้ในเครื่องนี้
+          เพิ่ม แก้ไข หรือลบรายการ Cash In / Cash Out ได้อิสระ ข้อมูลถูกบันทึกบนเซิร์ฟเวอร์ของบัญชีคุณ
         </p>
       </div>
 
@@ -198,7 +335,30 @@ export default function CapitalLedgerPage() {
           </button>
         </div>
 
-        {sortedEntries.length === 0 ? (
+        {loadState === "loading" ? (
+          <div className="px-5 py-6 space-y-3 animate-pulse">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="flex items-center gap-4">
+                <div className="h-3 bg-gray-200 rounded w-24" />
+                <div className="h-3 bg-gray-200 rounded w-20" />
+                <div className="h-3 bg-gray-200 rounded flex-1" />
+                <div className="h-3 bg-gray-200 rounded w-16" />
+              </div>
+            ))}
+          </div>
+        ) : loadState === "error" ? (
+          <div className="px-5 py-10 text-center">
+            <AlertCircle className="w-8 h-8 text-red-400 mx-auto mb-3" />
+            <p className="text-sm font-medium text-red-600">{loadError}</p>
+            <button
+              type="button"
+              onClick={fetchHistory}
+              className="mt-3 inline-flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
+            >
+              ลองใหม่อีกครั้ง
+            </button>
+          </div>
+        ) : sortedEntries.length === 0 ? (
           <div className="px-5 py-12 text-center">
             <BookOpen className="w-8 h-8 text-gray-300 mx-auto mb-3" />
             <p className="text-sm font-medium text-gray-600">
@@ -217,46 +377,46 @@ export default function CapitalLedgerPage() {
                   <th className="px-5 py-3 font-medium">ประเภท</th>
                   <th className="px-5 py-3 font-medium">จำนวนเงิน</th>
                   <th className="px-5 py-3 font-medium">อัตรา</th>
-                  <th className="px-5 py-3 font-medium">หมายเหตุ</th>
+                  <th className="px-5 py-3 font-medium">ยอดเงิน (THB)</th>
                   <th className="px-5 py-3 font-medium text-right">จัดการ</th>
                 </tr>
               </thead>
               <tbody>
                 {sortedEntries.map((e) => (
                   <tr
-                    key={e.id}
+                    key={e.transactionId}
                     className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 transition"
                   >
                     <td className="px-5 py-3.5 text-gray-500 whitespace-nowrap">
-                      {e.date}
+                      {e.transactionDate.slice(0, 10)}
                     </td>
                     <td className="px-5 py-3.5">
                       <span
                         className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full ${
-                          e.type === "in"
+                          e.type === "CASH_IN"
                             ? "bg-emerald-50 text-emerald-600"
                             : "bg-red-50 text-red-500"
                         }`}
                       >
-                        {e.type === "in" ? (
+                        {e.type === "CASH_IN" ? (
                           <ArrowDownCircle className="w-3.5 h-3.5" />
                         ) : (
                           <ArrowUpCircle className="w-3.5 h-3.5" />
                         )}
-                        {e.type === "in" ? "เงินเข้า" : "เงินออก"}
+                        {e.type === "CASH_IN" ? "เงินเข้า" : "เงินออก"}
                       </span>
                     </td>
                     <td
                       className={`px-5 py-3.5 font-medium whitespace-nowrap ${
-                        e.type === "in" ? "text-emerald-600" : "text-red-500"
+                        e.type === "CASH_IN" ? "text-emerald-600" : "text-red-500"
                       }`}
                     >
-                      {e.type === "in" ? "+" : "-"}
-                      {formatMoney(e.amount, e.currency)}
+                      {e.type === "CASH_IN" ? "+" : "-"}
+                      {formatMoney(toNumber(e.amountForeign), e.currency)}
                     </td>
-                    <td className="px-5 py-3.5 text-gray-500">{e.rate}</td>
-                    <td className="px-5 py-3.5 text-gray-600 max-w-xs truncate">
-                      {e.remarks}
+                    <td className="px-5 py-3.5 text-gray-500">{e.fxRateBot}</td>
+                    <td className="px-5 py-3.5 text-gray-600 whitespace-nowrap">
+                      {formatThb(toNumber(e.amountThb))}
                     </td>
                     <td className="px-5 py-3.5">
                       <div className="flex items-center justify-end gap-2">
@@ -270,7 +430,7 @@ export default function CapitalLedgerPage() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleDelete(e.id)}
+                          onClick={() => handleDelete(e.transactionId)}
                           className="text-gray-400 hover:text-red-600 transition"
                           aria-label="ลบรายการ"
                         >
@@ -404,20 +564,6 @@ export default function CapitalLedgerPage() {
                 />
               </div>
 
-              {/* Remarks */}
-              <div>
-                <label className="block text-xs font-medium text-gray-500 mb-1.5">
-                  หมายเหตุ / รายละเอียด
-                </label>
-                <input
-                  type="text"
-                  value={form.remarks}
-                  onChange={(e) => setForm((f) => ({ ...f, remarks: e.target.value }))}
-                  placeholder="เช่น โอนเงินไปบัญชีต่างประเทศ"
-                  className="w-full px-3 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition"
-                />
-              </div>
-
               {formError && (
                 <div className="px-3 py-2.5 rounded-lg bg-red-50 text-red-600 text-sm">
                   {formError}
@@ -429,9 +575,10 @@ export default function CapitalLedgerPage() {
               <button
                 type="button"
                 onClick={handleSave}
-                className="flex-1 bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg transition"
+                disabled={isSaving}
+                className="flex-1 bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg transition disabled:opacity-60"
               >
-                {editingId ? "บันทึกการแก้ไข" : "บันทึกรายการ"}
+                {isSaving ? "กำลังบันทึก..." : editingId ? "บันทึกการแก้ไข" : "บันทึกรายการ"}
               </button>
               <button
                 type="button"

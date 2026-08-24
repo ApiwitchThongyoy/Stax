@@ -15,8 +15,8 @@ export default function StaxLoginPage() {
   const location = useLocation();
   const { login } = useAuth();
 
-  const handleLogin = () => {
-    const result = login(email, password);
+  const handleLogin = async () => {
+    const result = await login(email, password);
 
     if (!result.success) {
       setErrorMessage(result.error || "เข้าสู่ระบบไม่สำเร็จ");

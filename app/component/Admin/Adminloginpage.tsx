@@ -3,12 +3,15 @@ import { Mail, Lock, Eye, EyeOff, ShieldCheck, Users, AlertCircle } from "lucide
 import { Link } from "react-router";
 import { useNavigate, useLocation } from "react-router";
 import StaxLogo from "../Login/StaxLogo";
+import { saveAdminSession } from "../../lib/admin-auth";
 
-// TODO: ชั่วคราวเท่านั้น — ควรย้ายการตรวจสอบสิทธิ์ไปฝั่ง backend/API จริง
-// การเช็คอีเมล/รหัสผ่านแบบฝังในโค้ดฝั่ง client แบบนี้ไม่ปลอดภัยสำหรับ production
-// เพราะใครก็เปิดดู source code แล้วอ่านค่านี้ได้ตรงๆ
-const ADMIN_EMAIL = "admin@gmail.com";
-const ADMIN_PASSWORD = "1234567890";
+interface LoginApiResponse {
+  success?: boolean;
+  data?: {
+    accessToken?: string;
+    user?: { id?: string; email?: string; role?: string };
+  };
+}
 
 export default function StaxAdminLoginPage() {
   const [email, setEmail] = useState("");
@@ -19,29 +22,53 @@ export default function StaxAdminLoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
 
-  const handleLogin = () => {
-    const trimmedEmail = email.trim().toLowerCase();
+  const handleLogin = async () => {
+    const trimmedEmail = email.trim();
 
     if (!trimmedEmail || !password) {
       setErrorMessage("กรุณากรอกอีเมลและรหัสผ่านให้ครบถ้วน");
       return;
     }
 
-    if (trimmedEmail !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
-      setErrorMessage("อีเมลหรือรหัสผ่านผู้ดูแลระบบไม่ถูกต้อง");
-      return;
+    try {
+      const response = await fetch("/api/v1/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: trimmedEmail, password }),
+      });
+
+      const data = (await response.json().catch(() => null)) as LoginApiResponse | null;
+
+      if (!response.ok || !data?.success || !data.data?.accessToken || !data.data.user) {
+        setErrorMessage("อีเมลหรือรหัสผ่านผู้ดูแลระบบไม่ถูกต้อง");
+        return;
+      }
+
+      const { accessToken, user } = data.data;
+      const adminUser = {
+        id: user.id ?? "",
+        email: user.email ?? trimmedEmail,
+        role: user.role ?? "",
+      };
+
+      // อนุญาตเฉพาะบัญชี role ADMIN — บัญชี USER ปฏิเสธการเข้าและแจ้งว่าไม่มีสิทธิ์
+      if (adminUser.role !== "ADMIN") {
+        setErrorMessage("บัญชีนี้ไม่ใช่ผู้ดูแลระบบ จึงไม่มีสิทธิ์เข้าใช้งานส่วนนี้");
+        return;
+      }
+
+      setErrorMessage("");
+
+      // เก็บ JWT/accessToken + user ที่ backend คืนมาไว้ใน session (หายเมื่อปิดแท็บ)
+      // ใช้ให้ AdminProtectedRoute ตรวจสิทธิ์ก่อนปล่อยเข้า /admin/dashboard
+      saveAdminSession({ accessToken, user: adminUser });
+
+      // เด้งกลับไป path ที่ตั้งใจจะเข้าตั้งแต่แรก (ถ้ามี) ไม่งั้นไป admin dashboard
+      const from = (location.state as { from?: string } | null)?.from || "/admin/dashboard";
+      navigate(from, { replace: true, state: { email: adminUser.email } });
+    } catch {
+      setErrorMessage("ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ กรุณาลองใหม่อีกครั้ง");
     }
-
-    setErrorMessage("");
-
-    // เก็บสถานะว่า login แอดมินสำเร็จไว้ใน session (หายเมื่อปิดแท็บ/เบราว์เซอร์)
-    // ใช้ให้ AdminProtectedRoute เช็คก่อนปล่อยเข้า /admin/dashboard
-    // TODO: เมื่อมี backend จริง ให้เก็บ token ที่ได้จาก API แทนค่า boolean นี้
-    sessionStorage.setItem("stax_admin_session", "true");
-
-    // เด้งกลับไป path ที่ตั้งใจจะเข้าตั้งแต่แรก (ถ้ามี) ไม่งั้นไป admin dashboard
-    const from = (location.state as { from?: string } | null)?.from || "/admin/dashboard";
-    navigate(from, { replace: true, state: { email: trimmedEmail } });
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {

@@ -22,6 +22,19 @@ import {
   ChevronRight,
   ChevronUp,
 } from "lucide-react";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  PieChart,
+  Pie,
+  Cell,
+  Legend,
+} from "recharts";
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
 
@@ -70,7 +83,7 @@ interface AccessLogEntry {
 // ----- Mock data (แทนที่ด้วยข้อมูลจริงจาก API เมื่อเชื่อมต่อ) -----
 
 const adminNavItems: { id: AdminSection; label: string; icon: typeof LayoutDashboard }[] = [
-  { id: "overview", label: "แดชบอร์ด", icon: LayoutDashboard },
+  { id: "overview", label: "แดชบอร์ดผู้ดูแลระบบ", icon: LayoutDashboard },
   { id: "users", label: "จัดการผู้ใช้งาน", icon: Users },
   { id: "audit", label: "ตรวจสอบเอกสาร & กิจกรรม", icon: FileSearch },
 ];
@@ -179,6 +192,30 @@ const mockAccessLog: AccessLogEntry[] = [
   { id: "log-5", user: "สุรชัย เพชรรัตน์", action: "เข้าสู่ระบบ", ipAddress: "184.22.6.19", device: "Chrome · Android", timestamp: "2026-07-31 17:31" },
 ];
 
+// ปริมาณไฟล์ที่อัปโหลดรายวัน ย้อนหลัง 7 วัน (แทนที่ด้วยข้อมูลจริงจาก API เมื่อเชื่อมต่อ)
+interface DailyUploadStat {
+  day: string; // ป้ายกำกับแกน X แบบสั้น
+  date: string; // yyyy-mm-dd เต็ม ใช้โชว์ใน tooltip
+  files: number;
+  sizeMb: number;
+}
+
+const mockDailyUploads: DailyUploadStat[] = [
+  { day: "26 ก.ค.", date: "2026-07-26", files: 8, sizeMb: 6.1 },
+  { day: "27 ก.ค.", date: "2026-07-27", files: 5, sizeMb: 3.4 },
+  { day: "28 ก.ค.", date: "2026-07-28", files: 12, sizeMb: 9.8 },
+  { day: "29 ก.ค.", date: "2026-07-29", files: 7, sizeMb: 5.2 },
+  { day: "30 ก.ค.", date: "2026-07-30", files: 15, sizeMb: 11.6 },
+  { day: "31 ก.ค.", date: "2026-07-31", files: 9, sizeMb: 7.0 },
+  { day: "1 ส.ค.", date: "2026-08-01", files: 5, sizeMb: 4.3 },
+];
+
+const uploadStatusChartColors: Record<UploadLogEntry["status"], string> = {
+  "สำเร็จ": "#10b981",
+  "ล้มเหลว": "#ef4444",
+  "กำลังตรวจสอบ": "#f59e0b",
+};
+
 // ----- Helpers -----
 
 function apiStatusBadge(status: ApiConnectionStatus["status"]) {
@@ -272,6 +309,22 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   const visibleUploads = showAllUploads ? mockUploadLog : mockUploadLog.slice(0, 4);
   const visibleAccessLogs = showAllAccessLogs ? mockAccessLog : mockAccessLog.slice(0, 4);
 
+  const uploadStatusBreakdown = useMemo(() => {
+    const counts: Record<UploadLogEntry["status"], number> = {
+      "สำเร็จ": 0,
+      "ล้มเหลว": 0,
+      "กำลังตรวจสอบ": 0,
+    };
+    mockUploadLog.forEach((entry) => {
+      counts[entry.status] += 1;
+    });
+    return (Object.keys(counts) as UploadLogEntry["status"][])
+      .filter((status) => counts[status] > 0)
+      .map((status) => ({ name: status, value: counts[status] }));
+  }, []);
+
+  const totalFilesThisPeriod = mockDailyUploads.reduce((sum, d) => sum + d.files, 0);
+
   const sectionTitle: Record<AdminSection, { heading: string; sub: string }> = {
     overview: {
       heading: "ภาพรวมระบบ",
@@ -322,16 +375,16 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
         <div className="px-3 py-4 border-t border-gray-100 space-y-1">
           <button
             type="button"
-            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition cursor-pointer"
+            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition"
           >
-            <Settings className="w-4 h-4r" />
+            <Settings className="w-4 h-4" />
             ตั้งค่าระบบ
           </button>
           <button
             type="button"
-            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition cursor-pointer"
+            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition"
           >
-            <HelpCircle className="w-4 h-4 " />
+            <HelpCircle className="w-4 h-4" />
             ความช่วยเหลือ
           </button>
 
@@ -364,19 +417,19 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
               className="w-9 h-9 rounded-lg flex items-center justify-center text-gray-400 hover:bg-gray-50 transition"
               aria-label="การแจ้งเตือน"
             >
-              <Bell className="w-4 h-4 cursor-pointer" />
+              <Bell className="w-4 h-4" />
             </button>
             <button
               type="button"
               className="w-9 h-9 rounded-lg flex items-center justify-center text-gray-400 hover:bg-gray-50 transition"
               aria-label="ตั้งค่า"
             >
-              <Settings className="w-4 h-4 cursor-pointer" />
+              <Settings className="w-4 h-4" />
             </button>
             <button
               type="button"
               onClick={handleLogout}
-              className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-red-600 transition px-2 cursor-pointer"
+              className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-red-600 transition px-2"
             >
               <LogOut className="w-4 h-4" />
               ออกจากระบบ
@@ -431,6 +484,91 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                       className="h-full rounded-full bg-blue-900"
                       style={{ width: `${(connectedApis / mockApiConnections.length) * 100}%` }}
                     />
+                  </div>
+                </div>
+              </div>
+
+              {/* Charts: upload volume trend + status breakdown */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div className="lg:col-span-2 bg-white rounded-xl border border-gray-100 p-5">
+                  <div className="flex items-center justify-between mb-1">
+                    <h2 className="text-sm font-semibold text-gray-800">
+                      ปริมาณการอัปโหลดไฟล์รายวัน
+                    </h2>
+                    <span className="text-xs text-gray-400">
+                      รวม {totalFilesThisPeriod} ไฟล์ · 7 วันล่าสุด
+                    </span>
+                  </div>
+                  <div className="h-64 mt-3">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={mockDailyUploads} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f3f4f6" />
+                        <XAxis
+                          dataKey="day"
+                          tick={{ fontSize: 11, fill: "#9ca3af" }}
+                          axisLine={{ stroke: "#e5e7eb" }}
+                          tickLine={false}
+                        />
+                        <YAxis
+                          allowDecimals={false}
+                          tick={{ fontSize: 11, fill: "#9ca3af" }}
+                          axisLine={false}
+                          tickLine={false}
+                        />
+                        <Tooltip
+                          cursor={{ fill: "#f9fafb" }}
+                          contentStyle={{
+                            borderRadius: 8,
+                            border: "1px solid #e5e7eb",
+                            fontSize: 12,
+                          }}
+                          formatter={(value: number, name) =>
+                            name === "files" ? [`${value} ไฟล์`, "จำนวนไฟล์"] : [`${value} MB`, "ขนาดรวม"]
+                          }
+                          labelFormatter={(_, payload) => payload?.[0]?.payload?.date ?? ""}
+                        />
+                        <Bar dataKey="files" fill="#1e3a8a" radius={[4, 4, 0, 0]} maxBarSize={28} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-xl border border-gray-100 p-5">
+                  <h2 className="text-sm font-semibold text-gray-800 mb-1">
+                    สถานะไฟล์ที่อัปโหลด
+                  </h2>
+                  <p className="text-xs text-gray-400 mb-2">แบ่งตามผลการตรวจสอบล่าสุด</p>
+                  <div className="h-52">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie
+                          data={uploadStatusBreakdown}
+                          dataKey="value"
+                          nameKey="name"
+                          innerRadius={45}
+                          outerRadius={70}
+                          paddingAngle={2}
+                        >
+                          {uploadStatusBreakdown.map((entry) => (
+                            <Cell
+                              key={entry.name}
+                              fill={uploadStatusChartColors[entry.name as UploadLogEntry["status"]]}
+                            />
+                          ))}
+                        </Pie>
+                        <Tooltip
+                          contentStyle={{ borderRadius: 8, border: "1px solid #e5e7eb", fontSize: 12 }}
+                          formatter={(value: number, name) => [`${value} ไฟล์`, name]}
+                        />
+                        <Legend
+                          verticalAlign="bottom"
+                          height={28}
+                          iconType="circle"
+                          iconSize={8}
+                          wrapperStyle={{ fontSize: 11, color: "#6b7280" }}
+                        />
+                      </PieChart>
+                    </ResponsiveContainer>
                   </div>
                 </div>
               </div>
@@ -563,12 +701,12 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                               >
                                 {u.status === "active" ? (
                                   <>
-                                    <Ban className="w-3.5 h-3.5 cursor-pointer" />
+                                    <Ban className="w-3.5 h-3.5" />
                                     ระงับบัญชี
                                   </>
                                 ) : (
                                   <>
-                                    <CheckCircle2 className="w-3.5 h-3.5 cursor-pointer" />
+                                    <CheckCircle2 className="w-3.5 h-3.5" />
                                     เปิดใช้งาน
                                   </>
                                 )}
@@ -624,7 +762,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     <button
                       type="button"
                       onClick={() => setShowAllUploads((p) => !p)}
-                      className="inline-flex items-center gap-1 text-xs text-blue-800 font-medium hover:underline cursor-pointer"
+                      className="inline-flex items-center gap-1 text-xs text-blue-800 font-medium hover:underline"
                     >
                       {showAllUploads ? "ย่อรายการ" : "ดูประวัติทั้งหมด"}
                       {showAllUploads ? (
@@ -677,7 +815,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     <button
                       type="button"
                       onClick={() => setShowAllAccessLogs((p) => !p)}
-                      className="inline-flex items-center gap-1 text-xs text-blue-800 font-medium hover:underline cursor-pointer"
+                      className="inline-flex items-center gap-1 text-xs text-blue-800 font-medium hover:underline"
                     >
                       {showAllAccessLogs ? "ย่อรายการ" : "ดูประวัติทั้งหมด"}
                       {showAllAccessLogs ? (

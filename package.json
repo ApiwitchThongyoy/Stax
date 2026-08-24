@@ -6,25 +6,35 @@
     "build": "react-router build",
     "dev": "react-router dev",
     "start": "react-router-serve ./build/server/index.js",
-    "typecheck": "react-router typegen && tsc"
+    "typecheck": "react-router typegen && tsc",
+    "db:migrate": "node scripts/run-drizzle-migrations.mjs"
   },
   "dependencies": {
     "@react-router/node": "8.0.0",
     "@react-router/serve": "8.0.0",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
     "isbot": "^5.1.36",
+    "jsonwebtoken": "^9.0.3",
     "lucide-react": "^1.25.0",
     "pdfjs-dist": "^6.1.200",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-router": "8.0.0",
+    "recharts": "^3.10.1",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@react-router/dev": "8.0.0",
     "@tailwindcss/vite": "^4.3.3",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "drizzle-kit": "^0.31.10",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
     "vite": "^8.0.3"
