@@ -1,4 +1,13 @@
-import { pgTable, text, numeric, integer, index, timestamp } from "drizzle-orm/pg-core";
+import {
+  pgTable,
+  text,
+  numeric,
+  integer,
+  index,
+  uniqueIndex,
+  timestamp,
+  jsonb,
+} from "drizzle-orm/pg-core";
 
 export const users = pgTable("User", {
   id: text("id").primaryKey(),
@@ -41,4 +50,46 @@ export const documents = pgTable(
     updatedAt: text("updated_at").notNull(),
   },
   (table) => [index("documents_user_id_idx").on(table.userId)]
+);
+
+export const dailyTaxSummaries = pgTable(
+  "daily_tax_summaries",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    summaryDate: text("summary_date").notNull(),
+    totalAmountThb: numeric("total_amount_thb").notNull(),
+    totalTaxAmount: numeric("total_tax_amount"),
+    transactionCount: integer("transaction_count").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("daily_tax_summaries_user_id_idx").on(table.userId),
+    index("daily_tax_summaries_summary_date_idx").on(table.summaryDate),
+    uniqueIndex("daily_tax_summaries_user_date_idx").on(
+      table.userId,
+      table.summaryDate
+    ),
+  ]
+);
+
+export const auditLogs = pgTable(
+  "audit_logs",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id").references(() => users.id),
+    action: text("action").notNull(),
+    entityType: text("entity_type"),
+    entityId: text("entity_id"),
+    details: jsonb("details"),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    index("audit_logs_user_id_idx").on(table.userId),
+    index("audit_logs_created_at_idx").on(table.createdAt),
+    index("audit_logs_action_idx").on(table.action),
+  ]
 );
