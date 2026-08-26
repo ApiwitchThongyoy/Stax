@@ -45,7 +45,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   }
 
   try {
-    const row = db
+    const rows = await db
       .select()
       .from(capitalTransactions)
       .where(
@@ -54,7 +54,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
           eq(capitalTransactions.userId, auth.userId)
         )
       )
-      .get();
+      .limit(1);
+    const row = rows[0];
 
     if (!row) {
       return Response.json(
@@ -209,7 +210,7 @@ async function handleUpdate(
   }
 
   try {
-    const existing = db
+    const existingRows = await db
       .select()
       .from(capitalTransactions)
       .where(
@@ -218,16 +219,17 @@ async function handleUpdate(
           eq(capitalTransactions.userId, userId)
         )
       )
-      .get();
+      .limit(1);
 
-    if (!existing) {
+    if (existingRows.length === 0) {
       return Response.json(
         { success: false, message: "Record not found" },
         { status: 404 }
       );
     }
 
-    db.update(capitalTransactions)
+    await db
+      .update(capitalTransactions)
       .set(setValues)
       .where(
         and(
@@ -235,9 +237,9 @@ async function handleUpdate(
           eq(capitalTransactions.userId, userId)
         )
       )
-      .run();
+      .execute();
 
-    const updated = db
+    const updatedRows = await db
       .select()
       .from(capitalTransactions)
       .where(
@@ -246,9 +248,9 @@ async function handleUpdate(
           eq(capitalTransactions.userId, userId)
         )
       )
-      .get();
+      .limit(1);
 
-    return Response.json({ success: true, data: updated }, { status: 200 });
+    return Response.json({ success: true, data: updatedRows[0] }, { status: 200 });
   } catch (error) {
     console.error("CapitalLedgers PUT: failed to update", error);
     return Response.json(
@@ -263,7 +265,7 @@ async function handleDelete(
   transactionId: string
 ): Promise<Response> {
   try {
-    const existing = db
+    const existingRows = await db
       .select()
       .from(capitalTransactions)
       .where(
@@ -272,23 +274,24 @@ async function handleDelete(
           eq(capitalTransactions.userId, userId)
         )
       )
-      .get();
+      .limit(1);
 
-    if (!existing) {
+    if (existingRows.length === 0) {
       return Response.json(
         { success: false, message: "Record not found" },
         { status: 404 }
       );
     }
 
-    db.delete(capitalTransactions)
+    await db
+      .delete(capitalTransactions)
       .where(
         and(
           eq(capitalTransactions.transactionId, transactionId),
           eq(capitalTransactions.userId, userId)
         )
       )
-      .run();
+      .execute();
 
     return Response.json(
       { success: true, message: "Record deleted" },
