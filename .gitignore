@@ -1,13 +1,18 @@
 .DS_Store
 .env
+.env.*
+!.env.example
+
 /node_modules/
 
 # React Router
 /.react-router/
 /build/
 
-# SQLite
+# Storage
+/storage/
+
+# Local SQLite files
 *.db
-*.db-journal
 *.db-shm
 *.db-wal

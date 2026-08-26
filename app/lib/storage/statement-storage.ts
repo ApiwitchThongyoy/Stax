@@ -6,7 +6,7 @@ import { db } from "../drizzle-db";
 import { documents } from "../../db/schema";
 
 // Persistent storage root for uploaded statement PDFs.
-// Files live on the filesystem only — SQLite keeps metadata/path rows (documents table).
+// Files live on the filesystem only — PostgreSQL keeps metadata/path rows (documents table).
 export const STATEMENTS_DIR = path.resolve(process.cwd(), "storage", "statements");
 
 // No size limit existed in the previous system; 20 MB is a safe default for statement PDFs.
@@ -118,7 +118,8 @@ export async function saveStatementPdf(
     const now = new Date().toISOString();
     const documentId = randomUUID();
 
-    db.insert(documents)
+    await db
+      .insert(documents)
       .values({
         id: documentId,
         userId,
@@ -129,7 +130,7 @@ export async function saveStatementPdf(
         createdAt: now,
         updatedAt: now,
       })
-      .run();
+      .execute();
 
     return {
       ok: true,

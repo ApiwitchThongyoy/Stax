@@ -77,25 +77,26 @@ export async function action({ request, params }: Route.ActionArgs) {
   }
 
   try {
-    const existing = db
+    const existingRows = await db
       .select({ id: users.id })
       .from(users)
       .where(eq(users.id, id))
-      .get();
+      .limit(1);
 
-    if (!existing) {
+    if (existingRows.length === 0) {
       return Response.json(
         { success: false, message: "User not found" },
         { status: 404 }
       );
     }
 
-    db.update(users)
+    await db
+      .update(users)
       .set({ status })
       .where(eq(users.id, id))
-      .run();
+      .execute();
 
-    const updated = db
+    const updatedRows = await db
       .select({
         id: users.id,
         email: users.email,
@@ -104,9 +105,9 @@ export async function action({ request, params }: Route.ActionArgs) {
       })
       .from(users)
       .where(eq(users.id, id))
-      .get();
+      .limit(1);
 
-    return Response.json({ success: true, data: updated }, { status: 200 });
+    return Response.json({ success: true, data: updatedRows[0] }, { status: 200 });
   } catch (error) {
     console.error("AdminUsers PATCH: failed to update", error);
     return Response.json(

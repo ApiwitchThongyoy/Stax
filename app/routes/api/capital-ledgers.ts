@@ -38,11 +38,11 @@ export async function loader({ request }: Route.LoaderArgs) {
   }
 
   try {
-    const rows = db
+    const rows = await db
       .select()
       .from(capitalTransactions)
       .where(eq(capitalTransactions.userId, auth.userId))
-      .all();
+      .execute();
 
     return Response.json({ success: true, data: rows }, { status: 200 });
   } catch (error) {
@@ -155,7 +155,8 @@ async function handleCreate(
   const transactionId = randomUUID();
 
   try {
-    db.insert(capitalTransactions)
+    await db
+      .insert(capitalTransactions)
       .values({
         transactionId,
         userId: auth.userId,
@@ -167,7 +168,7 @@ async function handleCreate(
         type,
         sourceType,
       })
-      .run();
+      .execute();
 
     return Response.json(
       {

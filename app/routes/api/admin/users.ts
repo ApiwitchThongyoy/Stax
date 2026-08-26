@@ -29,7 +29,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   }
 
   try {
-    const rows = db
+    const rows = await db
       .select({
         id: users.id,
         email: users.email,
@@ -37,7 +37,7 @@ export async function loader({ request }: Route.LoaderArgs) {
         status: users.status,
       })
       .from(users)
-      .all();
+      .execute();
 
     return Response.json({ success: true, data: rows }, { status: 200 });
   } catch (error) {

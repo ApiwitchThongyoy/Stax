@@ -67,11 +67,12 @@ export async function action({ request }: Route.ActionArgs) {
 
   let user;
   try {
-    user = db
+    const rows = await db
       .select()
       .from(users)
       .where(eq(users.email, normalizedEmail))
-      .get();
+      .limit(1);
+    user = rows[0];
   } catch (error) {
     console.error("Login: failed to query user", error);
     return Response.json(
