@@ -1,0 +1,2 @@
+ALTER TABLE "Capital_Transactions" ADD COLUMN "source_document_id" text;--> statement-breakpoint
+CREATE INDEX "Capital_Transactions_source_document_id_idx" ON "Capital_Transactions" USING btree ("source_document_id");

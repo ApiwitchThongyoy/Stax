@@ -1,6 +1,7 @@
 import { useRef, useState, type DragEvent } from "react";
 import { UploadCloud, Sparkles, FileWarning, CheckCircle2, X } from "lucide-react";
 import { saveDocument } from "../../lib/Documentstorage";
+import { useAuth } from "../../lib/auth";
 import {
   parsePdfStatement,
   loadCostBasis,
@@ -39,6 +40,11 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
   const [isReviewOpen, setIsReviewOpen] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const { user } = useAuth();
+  const [serverStatus, setServerStatus] = useState<
+    "idle" | "saving" | "saved" | "error"
+  >("idle");
+  const [serverMessage, setServerMessage] = useState("");
 
   const resetToIdle = () => {
     setStatus("idle");
@@ -47,6 +53,8 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
     setExtracted([]);
     setIsReviewOpen(false);
     setPendingFile(null);
+    setServerStatus("idle");
+    setServerMessage("");
   };
 
   const processFile = async (file: File) => {
@@ -102,6 +110,11 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
     const selected = extracted.filter((t) => t.included);
     onImport(selected);
 
+    // ส่งไฟล์ PDF ไปยังเซิร์ฟเวอร์เพื่อ extract/parse และ INSERT ลง Capital_Transactions
+    if (pendingFile) {
+      void uploadToServer(pendingFile);
+    }
+
     // เก็บไฟล์ PDF ต้นฉบับไว้ใน IndexedDB ของเบราว์เซอร์ (ดูย้อนหลัง/ดาวน์โหลดได้ในเครื่องนี้)
     if (pendingFile) {
       saveDocument(pendingFile)
@@ -112,6 +125,55 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
     }
 
     resetToIdle();
+  };
+
+  const uploadToServer = async (file: File) => {
+    if (!user?.accessToken) {
+      setServerStatus("error");
+      setServerMessage("กรุณาเข้าสู่ระบบก่อนส่งข้อมูลเข้าสู่ระบบ");
+      return;
+    }
+
+    setServerStatus("saving");
+    setServerMessage("กำลังบันทึกข้อมูลลงฐานข้อมูล...");
+    try {
+      const body = new FormData();
+      body.append("file", file, file.name);
+      const response = await fetch("/api/v1/statements/upload", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${user.accessToken}` },
+        body,
+      });
+
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setServerStatus("error");
+        setServerMessage(data.message || "ไม่สามารถส่งข้อมูลได้ กรุณาลองใหม่");
+        return;
+      }
+
+      const res = data.data;
+      if (res.duplicates) {
+        setServerStatus("saved");
+        setServerMessage("เอกสารนี้เคยบันทึกแล้ว ไม่เพิ่มรายการซ้ำ");
+      } else if (res.saved > 0) {
+        setServerStatus("saved");
+        setServerMessage(
+          `บันทึกลงฐานข้อมูลแล้ว ${res.saved} รายการ (จากที่รู้จัก ${res.extracted} รายการ)`
+        );
+      } else if (res.unsupported) {
+        setServerStatus("idle");
+        setServerMessage(
+          "ไม่พบรายการที่ระบบรู้จัก จึงไม่ได้บันทึกลงฐานข้อมูล (ไม่มีข้อมูลที่สร้างขึ้นเอง)"
+        );
+      } else {
+        setServerStatus("saved");
+        setServerMessage("ไม่มีรายการใหม่ที่บันทึก");
+      }
+    } catch {
+      setServerStatus("error");
+      setServerMessage("ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ โปรดลองอีกครั้ง");
+    }
   };
 
   const selectedCount = extracted.filter((t) => t.included).length;
@@ -187,6 +249,24 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
             </>
           )}
         </label>
+      )}
+
+      {/* ----- สถานะการบันทึกลงฐานข้อมูล (server upload) ----- */}
+      {serverStatus !== "idle" && (
+        <div
+          className={`mt-3 flex items-center gap-2 px-3 py-2.5 rounded-lg text-xs font-medium ${
+            serverStatus === "error"
+              ? "bg-red-50 text-red-600"
+              : serverStatus === "saving"
+              ? "bg-blue-50 text-blue-800"
+              : "bg-emerald-50 text-emerald-700"
+          }`}
+        >
+          {serverStatus === "saving" && (
+            <span className="w-3.5 h-3.5 border-2 border-blue-800 border-t-transparent rounded-full animate-spin shrink-0" />
+          )}
+          {serverMessage}
+        </div>
       )}
 
       {/* ----- หน้าต่างพรีวิว (modal) แยกออกมาต่างหาก ให้ตรวจสอบก่อนกดยืนยันนำเข้า ----- */}
