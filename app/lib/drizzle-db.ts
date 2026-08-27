@@ -2,10 +2,11 @@ import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import * as schema from "../db/schema";
 
-const databaseUrl = process.env.DATABASE_URL;
+const testDatabaseUrl = process.env.TEST_DATABASE_URL;
+const databaseUrl = testDatabaseUrl || process.env.DATABASE_URL;
 if (!databaseUrl) {
   throw new Error(
-    "DATABASE_URL environment variable is not set. Please configure your PostgreSQL connection string."
+    "No database connection string is set. Please configure TEST_DATABASE_URL (for tests) or DATABASE_URL (for production)."
   );
 }
 

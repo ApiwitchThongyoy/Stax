@@ -7,6 +7,7 @@ import {
   insertStatementTransactions,
   hasSavedDocumentRows,
 } from "~/lib/statement-pipeline";
+import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
   return (
@@ -32,7 +33,7 @@ export async function action({ request }: Route.ActionArgs) {
     );
   }
 
-  const auth = verifyAuth(request);
+  const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
     return Response.json(
       { success: false, message: auth.message },
@@ -69,6 +70,18 @@ export async function action({ request }: Route.ActionArgs) {
 
   const documentId = stored.document.id;
   const fileName = stored.document.originalName;
+
+  await insertAuditLog({
+    userId: auth.userId,
+    action: AuditAction.STATEMENT_UPLOAD,
+    entityType: "documents",
+    entityId: documentId,
+    details: {
+      route: "/api/v1/statements/upload",
+      method: "POST",
+      result: "uploaded",
+    },
+  });
 
   try {
     // 2. Server-side text extraction from the stored file path.
@@ -128,6 +141,19 @@ export async function action({ request }: Route.ActionArgs) {
 
     // 5. Atomic insert into Capital_Transactions.
     const result = await insertStatementTransactions(auth.userId, built.rows);
+
+    await insertAuditLog({
+      userId: auth.userId,
+      action: AuditAction.STATEMENT_IMPORT,
+      entityType: "Capital_Transactions",
+      entityId: documentId,
+      details: {
+        route: "/api/v1/statements/upload",
+        method: "POST",
+        result: "imported",
+        insertedCount: result.insertedCount,
+      },
+    });
 
     return Response.json({
       success: true,

@@ -3,6 +3,7 @@ import type { Route } from "./+types/users.$id";
 import { db } from "~/lib/drizzle-db";
 import { users } from "~/db/schema";
 import { verifyAuth } from "~/lib/auth-middleware";
+import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 const VALID_STATUSES = ["ACTIVE", "SUSPENDED"];
 const UUID_REGEX =
@@ -32,7 +33,7 @@ export async function action({ request, params }: Route.ActionArgs) {
     );
   }
 
-  const auth = verifyAuth(request);
+  const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
     return Response.json(
       { success: false, message: auth.message },
@@ -41,6 +42,17 @@ export async function action({ request, params }: Route.ActionArgs) {
   }
 
   if (auth.role !== "ADMIN") {
+    await insertAuditLog({
+      userId: auth.userId,
+      action: AuditAction.ADMIN_UNAUTHORIZED_ACCESS,
+      entityType: "User",
+      entityId: params.id,
+      details: {
+        route: `/api/v1/admin/users/${params.id ?? ""}`,
+        method: "PATCH",
+        result: "denied",
+      },
+    });
     return Response.json(
       { success: false, message: "Forbidden" },
       { status: 403 }
@@ -95,6 +107,20 @@ export async function action({ request, params }: Route.ActionArgs) {
       .set({ status })
       .where(eq(users.id, id))
       .execute();
+
+    await insertAuditLog({
+      userId: auth.userId,
+      action: AuditAction.ADMIN_USER_STATUS_UPDATE,
+      entityType: "User",
+      entityId: id,
+      details: {
+        route: `/api/v1/admin/users/${id}`,
+        method: "PATCH",
+        result: "success",
+        targetUserId: id,
+        newStatus: status,
+      },
+    });
 
     const updatedRows = await db
       .select({

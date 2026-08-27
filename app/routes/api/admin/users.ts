@@ -2,6 +2,7 @@ import type { Route } from "./+types/users";
 import { db } from "~/lib/drizzle-db";
 import { users } from "~/db/schema";
 import { verifyAuth } from "~/lib/auth-middleware";
+import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
   return (
@@ -13,7 +14,7 @@ function isAuthError(result: unknown): result is { status: number; message: stri
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
-  const auth = verifyAuth(request);
+  const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
     return Response.json(
       { success: false, message: auth.message },
@@ -22,6 +23,16 @@ export async function loader({ request }: Route.LoaderArgs) {
   }
 
   if (auth.role !== "ADMIN") {
+    await insertAuditLog({
+      userId: auth.userId,
+      action: AuditAction.ADMIN_UNAUTHORIZED_ACCESS,
+      entityType: "User",
+      details: {
+        route: "/api/v1/admin/users",
+        method: "GET",
+        result: "denied",
+      },
+    });
     return Response.json(
       { success: false, message: "Forbidden" },
       { status: 403 }
@@ -38,6 +49,18 @@ export async function loader({ request }: Route.LoaderArgs) {
       })
       .from(users)
       .execute();
+
+    await insertAuditLog({
+      userId: auth.userId,
+      action: AuditAction.ADMIN_USER_LIST_VIEW,
+      entityType: "User",
+      details: {
+        route: "/api/v1/admin/users",
+        method: "GET",
+        result: "success",
+        userCount: rows.length,
+      },
+    });
 
     return Response.json({ success: true, data: rows }, { status: 200 });
   } catch (error) {

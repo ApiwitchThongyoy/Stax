@@ -10,15 +10,38 @@ export interface AuditLogInput {
   details?: Record<string, unknown> | null;
 }
 
+export const AuditAction = {
+  LOGIN_SUCCESS: "LOGIN_SUCCESS",
+  LOGIN_FAILED: "LOGIN_FAILED",
+  STATEMENT_UPLOAD: "STATEMENT_UPLOAD",
+  STATEMENT_IMPORT: "STATEMENT_IMPORT",
+  CAPITAL_TRANSACTION_CREATE: "CAPITAL_TRANSACTION_CREATE",
+  CAPITAL_TRANSACTION_UPDATE: "CAPITAL_TRANSACTION_UPDATE",
+  CAPITAL_TRANSACTION_DELETE: "CAPITAL_TRANSACTION_DELETE",
+  ADMIN_LOGIN_SUCCESS: "ADMIN_LOGIN_SUCCESS",
+  ADMIN_USER_LIST_VIEW: "ADMIN_USER_LIST_VIEW",
+  ADMIN_USER_STATUS_UPDATE: "ADMIN_USER_STATUS_UPDATE",
+  ADMIN_UNAUTHORIZED_ACCESS: "ADMIN_UNAUTHORIZED_ACCESS",
+} as const;
+
 const FORBIDDEN_KEYS = [
   "password",
   "password_hash",
   "passwordHash",
   "jwt",
   "token",
+  "authorization",
+  "api_key",
+  "apikey",
   "DATABASE_URL",
+  "TEST_DATABASE_URL",
   "secret",
   "JWT_SECRET",
+  "pdf",
+  "statement_text",
+  "statementtext",
+  "file_content",
+  "filecontent",
 ];
 
 function sanitizeDetails(

@@ -4,6 +4,7 @@ import type { Route } from "./+types/capital-ledgers";
 import { db } from "~/lib/drizzle-db";
 import { capitalTransactions } from "~/db/schema";
 import { verifyAuth, type AuthPayload } from "~/lib/auth-middleware";
+import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"];
 const VALID_SOURCE_TYPES = ["MANUAL", "AI_PARSED"];
@@ -29,7 +30,7 @@ function validateAmount(value: unknown, fieldName: string): string | null {
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
-  const auth = verifyAuth(request);
+  const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
     return Response.json(
       { success: false, message: auth.message },
@@ -55,7 +56,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 }
 
 export async function action({ request }: Route.ActionArgs) {
-  const auth = verifyAuth(request);
+  const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
     return Response.json(
       { success: false, message: auth.message },
@@ -169,6 +170,22 @@ async function handleCreate(
         sourceType,
       })
       .execute();
+
+    await insertAuditLog({
+      userId: auth.userId,
+      action: AuditAction.CAPITAL_TRANSACTION_CREATE,
+      entityType: "Capital_Transactions",
+      entityId: transactionId,
+      details: {
+        method: "POST",
+        route: "/api/v1/capital-ledgers",
+        result: "created",
+        type,
+        sourceType,
+        currency: currency.trim(),
+        transactionDate: transactionDate.trim(),
+      },
+    });
 
     return Response.json(
       {
