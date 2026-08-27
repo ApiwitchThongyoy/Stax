@@ -1,9 +1,8 @@
-import { sql } from "drizzle-orm";
-import type { Route } from "./+types/users";
+import { desc, sql } from "drizzle-orm";
+import type { Route } from "./+types/audit-logs";
 import { db } from "~/lib/drizzle-db";
-import { users, documents } from "~/db/schema";
+import { auditLogs, users } from "~/db/schema";
 import { verifyAuth } from "~/lib/auth-middleware";
-import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
   return (
@@ -24,50 +23,37 @@ export async function loader({ request }: Route.LoaderArgs) {
   }
 
   if (auth.role !== "ADMIN") {
-    await insertAuditLog({
-      userId: auth.userId,
-      action: AuditAction.ADMIN_UNAUTHORIZED_ACCESS,
-      entityType: "User",
-      details: {
-        route: "/api/v1/admin/users",
-        method: "GET",
-        result: "denied",
-      },
-    });
     return Response.json(
       { success: false, message: "Forbidden" },
       { status: 403 }
     );
   }
 
+  const url = new URL(request.url);
+  const rawLimit = Number(url.searchParams.get("limit") ?? "50");
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : 50;
+
   try {
     const rows = await db
       .select({
-        id: users.id,
-        email: users.email,
-        role: users.role,
-        status: users.status,
-        documentCount: sql<number>`coalesce((SELECT count(*)::int FROM ${documents} WHERE ${documents}.user_id = ${users}.id), 0)`,
+        id: auditLogs.id,
+        action: auditLogs.action,
+        entityType: auditLogs.entityType,
+        entityId: auditLogs.entityId,
+        details: auditLogs.details,
+        createdAt: auditLogs.createdAt,
+        userEmail: users.email,
+        userId: auditLogs.userId,
       })
-      .from(users)
-      .orderBy(users.email)
+      .from(auditLogs)
+      .leftJoin(users, sql`${users.id} = ${auditLogs.userId}`)
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(limit)
       .execute();
-
-    await insertAuditLog({
-      userId: auth.userId,
-      action: AuditAction.ADMIN_USER_LIST_VIEW,
-      entityType: "User",
-      details: {
-        route: "/api/v1/admin/users",
-        method: "GET",
-        result: "success",
-        userCount: rows.length,
-      },
-    });
 
     return Response.json({ success: true, data: rows }, { status: 200 });
   } catch (error) {
-    console.error("AdminUsers GET: failed to query", error);
+    console.error("AdminAuditLogs GET: failed to query", error);
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }

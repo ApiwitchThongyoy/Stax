@@ -24,4 +24,7 @@ export default [
 
   route("api/v1/admin/users", "routes/api/admin/users.ts"),
   route("api/v1/admin/users/:id", "routes/api/admin/users.$id.ts"),
+  route("api/v1/admin/stats", "routes/api/admin/stats.ts"),
+  route("api/v1/admin/audit-logs", "routes/api/admin/audit-logs.ts"),
+  route("api/v1/admin/documents", "routes/api/admin/documents.ts"),
 ] satisfies RouteConfig;

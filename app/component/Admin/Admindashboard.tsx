@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect, useCallback } from "react";
 import { useLocation } from "react-router";
 import {
   LayoutDashboard,
@@ -21,6 +21,7 @@ import {
   CheckCircle2,
   ChevronRight,
   ChevronUp,
+  Loader2,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -30,13 +31,11 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  PieChart,
-  Pie,
-  Cell,
   Legend,
 } from "recharts";
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
+import { readAdminSession } from "../../lib/admin-auth";
 
 type AdminSection = "overview" | "users" | "audit";
 
@@ -46,20 +45,11 @@ interface AdminUserRow {
   id: string;
   name: string;
   email: string;
-  role: "ผู้ใช้งานทั่วไป" | "นักบัญชี" | "ผู้ดูแลระบบ";
+  role: string;
   status: UserStatus;
-  joinedAt: string; // yyyy-mm-dd
-  lastActive: string; // human readable
+  joinedAt: string;
+  lastActive: string;
   filesUploaded: number;
-}
-
-interface ApiConnectionStatus {
-  id: string;
-  name: string;
-  description: string;
-  status: "connected" | "degraded" | "down";
-  latencyMs: number | null;
-  lastChecked: string;
 }
 
 interface UploadLogEntry {
@@ -74,13 +64,28 @@ interface UploadLogEntry {
 interface AccessLogEntry {
   id: string;
   user: string;
-  action: "เข้าสู่ระบบ" | "ออกจากระบบ" | "เข้าสู่ระบบล้มเหลว" | "เปลี่ยนรหัสผ่าน";
+  action: string;
   ipAddress: string;
   device: string;
   timestamp: string;
 }
 
-// ----- Mock data (แทนที่ด้วยข้อมูลจริงจาก API เมื่อเชื่อมต่อ) -----
+interface IntervalUploadStat {
+  day: string;
+  date: string;
+  files: number;
+  sizeMb: number;
+}
+
+interface AdminStatsPayload {
+  userCounts?: { total: number; active: number; suspended: number };
+  documents?: {
+    total: number;
+    last7Days: number;
+    perDay?: { date: string; files: number }[];
+  };
+  uploadStatus?: { available: boolean; reason?: string };
+}
 
 const adminNavItems: { id: AdminSection; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "overview", label: "แดชบอร์ดผู้ดูแลระบบ", icon: LayoutDashboard },
@@ -88,145 +93,28 @@ const adminNavItems: { id: AdminSection; label: string; icon: typeof LayoutDashb
   { id: "audit", label: "ตรวจสอบเอกสาร & กิจกรรม", icon: FileSearch },
 ];
 
-const mockUsers: AdminUserRow[] = [
-  {
-    id: "u-1042",
-    name: "ณัฐวุฒิ ศรีสมบูรณ์",
-    email: "nattawut@stax.com",
-    role: "นักบัญชี",
-    status: "active",
-    joinedAt: "2025-11-02",
-    lastActive: "5 นาทีที่แล้ว",
-    filesUploaded: 34,
-  },
-  {
-    id: "u-1043",
-    name: "ปวีณา จันทร์เพ็ญ",
-    email: "paweena@stax.com",
-    role: "ผู้ใช้งานทั่วไป",
-    status: "active",
-    joinedAt: "2025-12-14",
-    lastActive: "2 ชั่วโมงที่แล้ว",
-    filesUploaded: 11,
-  },
-  {
-    id: "u-1044",
-    name: "ธีรพงษ์ วงศ์สวัสดิ์",
-    email: "teerapong@stax.com",
-    role: "ผู้ใช้งานทั่วไป",
-    status: "suspended",
-    joinedAt: "2026-01-20",
-    lastActive: "6 วันที่แล้ว",
-    filesUploaded: 3,
-  },
-  {
-    id: "u-1045",
-    name: "กมลชนก อินทร์แก้ว",
-    email: "kamonchanok@stax.com",
-    role: "ผู้ดูแลระบบ",
-    status: "active",
-    joinedAt: "2025-08-09",
-    lastActive: "ออนไลน์อยู่",
-    filesUploaded: 58,
-  },
-  {
-    id: "u-1046",
-    name: "สุรชัย เพชรรัตน์",
-    email: "surachai@stax.com",
-    role: "ผู้ใช้งานทั่วไป",
-    status: "active",
-    joinedAt: "2026-03-02",
-    lastActive: "1 วันที่แล้ว",
-    filesUploaded: 7,
-  },
+const THAI_MONTHS_ABBR = [
+  "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+  "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.",
 ];
 
-const mockApiConnections: ApiConnectionStatus[] = [
-  {
-    id: "bot-fx",
-    name: "BOT API — อัตราแลกเปลี่ยน",
-    description: "ดึงอัตราแลกเปลี่ยนเรียลไทม์จากธนาคารแห่งประเทศไทย",
-    status: "connected",
-    latencyMs: 118,
-    lastChecked: "1 นาทีที่แล้ว",
-  },
-  {
-    id: "pdf-parser",
-    name: "PDF Statement Parser",
-    description: "บริการแยกวิเคราะห์ไฟล์ statement ที่ผู้ใช้อัปโหลด",
-    status: "connected",
-    latencyMs: 342,
-    lastChecked: "1 นาทีที่แล้ว",
-  },
-  {
-    id: "tax-engine",
-    name: "Tax Estimation Engine",
-    description: "คำนวณประมาณการภาษีจากรายการธุรกรรม",
-    status: "degraded",
-    latencyMs: 1840,
-    lastChecked: "3 นาทีที่แล้ว",
-  },
-  {
-    id: "notify",
-    name: "Notification Service",
-    description: "ส่งอีเมลและการแจ้งเตือนในระบบ",
-    status: "down",
-    latencyMs: null,
-    lastChecked: "8 นาทีที่แล้ว",
-  },
-];
-
-const mockUploadLog: UploadLogEntry[] = [
-  { id: "up-1", fileName: "statement_march_2026.pdf", uploadedBy: "ณัฐวุฒิ ศรีสมบูรณ์", sizeKb: 842, status: "สำเร็จ", uploadedAt: "2026-08-01 09:12" },
-  { id: "up-2", fileName: "statement_hk_broker.pdf", uploadedBy: "กมลชนก อินทร์แก้ว", sizeKb: 1204, status: "สำเร็จ", uploadedAt: "2026-08-01 08:47" },
-  { id: "up-3", fileName: "dividend_report_q2.pdf", uploadedBy: "ปวีณา จันทร์เพ็ญ", sizeKb: 96, status: "กำลังตรวจสอบ", uploadedAt: "2026-08-01 08:20" },
-  { id: "up-4", fileName: "statement_corrupted.pdf", uploadedBy: "ธีรพงษ์ วงศ์สวัสดิ์", sizeKb: 12, status: "ล้มเหลว", uploadedAt: "2026-07-31 22:05" },
-  { id: "up-5", fileName: "statement_july_2026.pdf", uploadedBy: "สุรชัย เพชรรัตน์", sizeKb: 655, status: "สำเร็จ", uploadedAt: "2026-07-31 17:33" },
-];
-
-const mockAccessLog: AccessLogEntry[] = [
-  { id: "log-1", user: "ณัฐวุฒิ ศรีสมบูรณ์", action: "เข้าสู่ระบบ", ipAddress: "203.150.12.4", device: "Chrome · Windows", timestamp: "2026-08-01 09:10" },
-  { id: "log-2", user: "ธีรพงษ์ วงศ์สวัสดิ์", action: "เข้าสู่ระบบล้มเหลว", ipAddress: "171.4.88.201", device: "Safari · iPhone", timestamp: "2026-08-01 07:58" },
-  { id: "log-3", user: "กมลชนก อินทร์แก้ว", action: "เปลี่ยนรหัสผ่าน", ipAddress: "203.150.12.4", device: "Chrome · macOS", timestamp: "2026-07-31 21:40" },
-  { id: "log-4", user: "ปวีณา จันทร์เพ็ญ", action: "ออกจากระบบ", ipAddress: "49.230.14.77", device: "Edge · Windows", timestamp: "2026-07-31 19:02" },
-  { id: "log-5", user: "สุรชัย เพชรรัตน์", action: "เข้าสู่ระบบ", ipAddress: "184.22.6.19", device: "Chrome · Android", timestamp: "2026-07-31 17:31" },
-];
-
-// ปริมาณไฟล์ที่อัปโหลดรายวัน ย้อนหลัง 7 วัน (แทนที่ด้วยข้อมูลจริงจาก API เมื่อเชื่อมต่อ)
-interface DailyUploadStat {
-  day: string; // ป้ายกำกับแกน X แบบสั้น
-  date: string; // yyyy-mm-dd เต็ม ใช้โชว์ใน tooltip
-  files: number;
-  sizeMb: number;
-}
-
-const mockDailyUploads: DailyUploadStat[] = [
-  { day: "26 ก.ค.", date: "2026-07-26", files: 8, sizeMb: 6.1 },
-  { day: "27 ก.ค.", date: "2026-07-27", files: 5, sizeMb: 3.4 },
-  { day: "28 ก.ค.", date: "2026-07-28", files: 12, sizeMb: 9.8 },
-  { day: "29 ก.ค.", date: "2026-07-29", files: 7, sizeMb: 5.2 },
-  { day: "30 ก.ค.", date: "2026-07-30", files: 15, sizeMb: 11.6 },
-  { day: "31 ก.ค.", date: "2026-07-31", files: 9, sizeMb: 7.0 },
-  { day: "1 ส.ค.", date: "2026-08-01", files: 5, sizeMb: 4.3 },
-];
-
-const uploadStatusChartColors: Record<UploadLogEntry["status"], string> = {
-  "สำเร็จ": "#10b981",
-  "ล้มเหลว": "#ef4444",
-  "กำลังตรวจสอบ": "#f59e0b",
+const ROLE_LABEL: Record<string, string> = {
+  ADMIN: "ผู้ดูแลระบบ",
+  USER: "ผู้ใช้งานทั่วไป",
+  ACCOUNTANT: "นักบัญชี",
 };
 
-// ----- Helpers -----
+function formatShortDay(date: string): string {
+  if (!date) return "";
+  const parts = date.split("-").map(Number);
+  if (parts.length !== 3 || parts.some((d) => Number.isNaN(d))) return date;
+  const [, m, d] = parts;
+  return `${d} ${THAI_MONTHS_ABBR[m - 1] ?? ""}`;
+}
 
-function apiStatusBadge(status: ApiConnectionStatus["status"]) {
-  switch (status) {
-    case "connected":
-      return { label: "เชื่อมต่อปกติ", cls: "bg-emerald-50 text-emerald-600", Icon: Wifi };
-    case "degraded":
-      return { label: "ล่าช้าผิดปกติ", cls: "bg-amber-50 text-amber-600", Icon: Wifi };
-    case "down":
-      return { label: "ขาดการเชื่อมต่อ", cls: "bg-red-50 text-red-600", Icon: WifiOff };
-  }
+function displayNameFromEmail(email: string): string {
+  const prefix = email.split("@")[0] || "ผู้ใช้งาน";
+  return prefix.charAt(0).toUpperCase() + prefix.slice(1);
 }
 
 function uploadStatusBadge(status: UploadLogEntry["status"]) {
@@ -237,21 +125,24 @@ function uploadStatusBadge(status: UploadLogEntry["status"]) {
       return "bg-red-50 text-red-600";
     case "กำลังตรวจสอบ":
       return "bg-amber-50 text-amber-600";
+    default:
+      return "bg-gray-50 text-gray-500";
   }
 }
 
-function accessActionBadge(action: AccessLogEntry["action"]) {
-  switch (action) {
-    case "เข้าสู่ระบบ":
-      return { cls: "bg-emerald-50 text-emerald-600", Icon: LogIn };
-    case "ออกจากระบบ":
-      return { cls: "bg-gray-100 text-gray-500", Icon: LogOut };
-    case "เข้าสู่ระบบล้มเหลว":
-      return { cls: "bg-red-50 text-red-600", Icon: ShieldAlert };
-    case "เปลี่ยนรหัสผ่าน":
-      return { cls: "bg-blue-50 text-blue-700", Icon: ShieldCheck };
-  }
+function accessActionBadge(action: string) {
+  if (action.includes("ล้มเหลว"))
+    return { cls: "bg-red-50 text-red-600", Icon: ShieldAlert };
+  if (action.includes("ออกจากระบบ"))
+    return { cls: "bg-gray-100 text-gray-500", Icon: LogOut };
+  if (action.includes("เปลี่ยน"))
+    return { cls: "bg-blue-50 text-blue-700", Icon: ShieldCheck };
+  if (action.includes("ADMIN_") || action === "LOGIN_SUCCESS")
+    return { cls: "bg-emerald-50 text-emerald-600", Icon: LogIn };
+  return { cls: "bg-emerald-50 text-emerald-600", Icon: LogIn };
 }
+
+// ----- Helpers -----
 
 interface AdminDashboardProps {
   userEmail?: string;
@@ -264,7 +155,14 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   const [activeSection, setActiveSection] = useState<AdminSection>("overview");
   const [userSearch, setUserSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | UserStatus>("all");
-  const [users, setUsers] = useState<AdminUserRow[]>(mockUsers);
+  const [users, setUsers] = useState<AdminUserRow[]>([]);
+  const [stats, setStats] = useState<AdminStatsPayload | null>(null);
+  const [uploadLog, setUploadLog] = useState<UploadLogEntry[]>([]);
+  const [accessLog, setAccessLog] = useState<AccessLogEntry[]>([]);
+  const [barData, setBarData] = useState<IntervalUploadStat[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [togglingId, setTogglingId] = useState<string | null>(null);
   const [showAllUploads, setShowAllUploads] = useState(false);
   const [showAllAccessLogs, setShowAllAccessLogs] = useState(false);
 
@@ -278,52 +176,174 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
     navigate("/admin/login", { replace: true });
   };
 
-  const toggleUserStatus = (id: string) => {
-    setUsers((prev) =>
-      prev.map((u) =>
-        u.id === id
-          ? { ...u, status: u.status === "active" ? "suspended" : "active" }
-          : u
-      )
-    );
+  const loadData = useCallback(async () => {
+    const session = readAdminSession();
+    if (!session?.accessToken) {
+      setLoadError("ไม่พบ session ผู้ดูแลระบบ กรุณาเข้าสู่ระบบใหม่");
+      setLoading(false);
+      return;
+    }
+    const token = session.accessToken;
+    const headers = { Authorization: `Bearer ${token}` };
+    try {
+      const [userRes, statsRes, docRes, auditRes] = await Promise.all([
+        fetch("/api/v1/admin/users", { headers }),
+        fetch("/api/v1/admin/stats", { headers }),
+        fetch("/api/v1/admin/documents", { headers }),
+        fetch("/api/v1/admin/audit-logs?limit=100", { headers }),
+      ]);
+
+      const userJson = await userRes.json().catch(() => null);
+      const statsJson = await statsRes.json().catch(() => null);
+      const docJson = await docRes.json().catch(() => null);
+      const auditJson = await auditRes.json().catch(() => null);
+
+      const apiUsers = (userJson?.data ?? []) as {
+        id: string;
+        email: string;
+        role: string;
+        status: string;
+        documentCount?: number;
+      }[];
+
+      void setUsers(
+        apiUsers.map((u) => ({
+          id: u.id,
+          name: displayNameFromEmail(u.email),
+          email: u.email,
+          role: ROLE_LABEL[u.role] ?? u.role,
+          status: u.status === "SUSPENDED" ? "suspended" : "active",
+          joinedAt: "",
+          lastActive: "",
+          filesUploaded: u.documentCount ?? 0,
+        }))
+      );
+
+      void setStats(statsJson?.data ?? null);
+
+      const apiDocs = (docJson?.data ?? []) as {
+        id: string;
+        originalName: string;
+        fileSize: number;
+        createdAt: string;
+        userEmail: string;
+      }[];
+      // documents table has no status field -> every upload is shown as "สำเร็จ" (stored on disk)
+      void setUploadLog(
+        apiDocs.map((d) => ({
+          id: d.id,
+          fileName: d.originalName,
+          uploadedBy: d.userEmail || "ไม่ทราบ",
+          sizeKb: Math.round(d.fileSize / 1024),
+          status: "สำเร็จ" as const,
+          uploadedAt: d.createdAt,
+        }))
+      );
+
+      const apiAudit = (auditJson?.data ?? []) as {
+        id: string;
+        action: string;
+        entityType: string | null;
+        entityId: string | null;
+        details: Record<string, unknown> | null;
+        createdAt: string;
+        userEmail: string | null;
+      }[];
+      void setAccessLog(
+        apiAudit.map((a) => ({
+          id: a.id,
+          user: a.userEmail || "—",
+          action: String(a.action ?? ""),
+          ipAddress: "",
+          device:
+            a.entityType || a.entityId
+              ? `${a.entityType ?? ""}${a.entityId ? ` · ${a.entityId}` : ""}`
+              : "",
+          timestamp: a.createdAt,
+        }))
+      );
+
+      const perDay = (statsJson?.data?.documents?.perDay ?? []) as {
+        date: string;
+        files: number;
+      }[];
+      void setBarData(
+        perDay.map((d) => ({
+          day: formatShortDay(d.date),
+          date: d.date,
+          files: d.files,
+          sizeMb: 0,
+        }))
+      );
+
+      setLoading(false);
+    } catch {
+      setLoadError("ไม่สามารถโหลดข้อมูลจากเซิร์ฟเวอร์ได้ กรุณาลองใหม่ภายหลัง");
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  const toggleUserStatus = async (id: string) => {
+    const session = readAdminSession();
+    if (!session?.accessToken) return;
+    const current = users.find((u) => u.id === id);
+    if (!current) return;
+    const nextStatus = current.status === "active" ? "SUSPENDED" : "ACTIVE";
+
+    setTogglingId(id);
+    try {
+      const res = await fetch(`/api/v1/admin/users/${id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.accessToken}`,
+        },
+        body: JSON.stringify({ status: nextStatus }),
+      });
+      if (res.ok) {
+        setUsers((prev) =>
+          prev.map((u) =>
+            u.id === id
+              ? { ...u, status: nextStatus === "SUSPENDED" ? "suspended" : "active" }
+              : u
+          )
+        );
+        loadData();
+      }
+    } finally {
+      setTogglingId(null);
+    }
   };
 
   const filteredUsers = useMemo(() => {
     return users.filter((u) => {
       const matchesSearch =
         userSearch.trim() === "" ||
-        u.name.toLowerCase().includes(userSearch.toLowerCase()) ||
-        u.email.toLowerCase().includes(userSearch.toLowerCase());
+        (u.name && u.name.toLowerCase().includes(userSearch.toLowerCase())) ||
+        (u.email && u.email.toLowerCase().includes(userSearch.toLowerCase()));
       const matchesStatus = statusFilter === "all" || u.status === statusFilter;
       return matchesSearch && matchesStatus;
     });
   }, [users, userSearch, statusFilter]);
 
-  const totalUsers = users.length;
-  const activeUsers = users.filter((u) => u.status === "active").length;
-  const suspendedUsers = totalUsers - activeUsers;
-  const totalUploadsThisWeek = mockUploadLog.length;
-  const failedUploads = mockUploadLog.filter((u) => u.status === "ล้มเหลว").length;
-  const connectedApis = mockApiConnections.filter((a) => a.status === "connected").length;
+  const totalUsers = stats?.userCounts?.total ?? users.length;
+  const activeUsers = stats?.userCounts?.active ?? 0;
+  const suspendedUsers = stats?.userCounts?.suspended ?? 0;
+  const totalUploadsThisWeek = stats?.documents?.last7Days ?? uploadLog.length;
+  const failedUploads: number | null = null;
+  const connectedApis: number | null = null;
+  const apiTotal: number | null = null;
 
-  const visibleUploads = showAllUploads ? mockUploadLog : mockUploadLog.slice(0, 4);
-  const visibleAccessLogs = showAllAccessLogs ? mockAccessLog : mockAccessLog.slice(0, 4);
+  const visibleUploads = showAllUploads ? uploadLog : uploadLog.slice(0, 4);
+  const visibleAccessLogs = showAllAccessLogs ? accessLog : accessLog.slice(0, 4);
 
-  const uploadStatusBreakdown = useMemo(() => {
-    const counts: Record<UploadLogEntry["status"], number> = {
-      "สำเร็จ": 0,
-      "ล้มเหลว": 0,
-      "กำลังตรวจสอบ": 0,
-    };
-    mockUploadLog.forEach((entry) => {
-      counts[entry.status] += 1;
-    });
-    return (Object.keys(counts) as UploadLogEntry["status"][])
-      .filter((status) => counts[status] > 0)
-      .map((status) => ({ name: status, value: counts[status] }));
-  }, []);
+  const uploadStatusBreakdown: { name: string; value: number }[] = [];
 
-  const totalFilesThisPeriod = mockDailyUploads.reduce((sum, d) => sum + d.files, 0);
+  const totalFilesThisPeriod = barData.reduce((sum, d) => sum + d.files, 0);
 
   const sectionTitle: Record<AdminSection, { heading: string; sub: string }> = {
     overview: {
@@ -439,6 +459,28 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
 
         {/* Scrollable body */}
         <main className="flex-1 overflow-y-auto p-6 space-y-6">
+          {loading ? (
+            <div className="flex flex-col items-center justify-center py-24">
+              <Loader2 className="w-6 h-6 animate-spin text-blue-900" />
+              <p className="text-sm text-gray-500 mt-3">กำลังโหลดข้อมูล...</p>
+            </div>
+          ) : loadError ? (
+            <div className="bg-white rounded-xl border border-gray-100 p-6 text-center">
+              <p className="text-sm font-medium text-red-600">{loadError}</p>
+              <button
+                type="button"
+                onClick={() => {
+                  setLoadError("");
+                  setLoading(true);
+                  loadData();
+                }}
+                className="mt-4 text-xs text-blue-900 font-medium underline"
+              >
+                ลองอีกครั้ง
+              </button>
+            </div>
+          ) : (
+          <>
           {activeSection === "overview" && (
             <>
               {/* Stat cards */}
@@ -463,11 +505,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                   </div>
                   <p className="text-xl font-semibold text-gray-800">{totalUploadsThisWeek}</p>
                   <p className="text-[11px] text-gray-400 mt-3">
-                    {failedUploads > 0 ? (
-                      <span className="text-red-500 font-medium">{failedUploads} รายการล้มเหลว</span>
-                    ) : (
-                      <span className="text-emerald-500 font-medium">ไม่มีรายการล้มเหลว</span>
-                    )}
+                    <span className="text-gray-400">สถานะการตรวจสอบ: NOT AVAILABLE</span>
                   </p>
                 </div>
 
@@ -477,14 +515,11 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     <Wifi className="w-4 h-4 text-gray-300" />
                   </div>
                   <p className="text-xl font-semibold text-gray-800">
-                    {connectedApis}/{mockApiConnections.length} เชื่อมต่อปกติ
+                    {connectedApis === null || apiTotal === null ? "NOT AVAILABLE" : `${connectedApis}/${apiTotal} เชื่อมต่อปกติ`}
                   </p>
-                  <div className="h-1.5 bg-gray-100 rounded-full mt-3 overflow-hidden">
-                    <div
-                      className="h-full rounded-full bg-blue-900"
-                      style={{ width: `${(connectedApis / mockApiConnections.length) * 100}%` }}
-                    />
-                  </div>
+                  <p className="text-[11px] text-gray-400 mt-3">
+                    BOT API ยังไม่ได้เชื่อมต่อกับ backend
+                  </p>
                 </div>
               </div>
 
@@ -501,7 +536,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                   </div>
                   <div className="h-64 mt-3">
                     <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={mockDailyUploads} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
+                      <BarChart data={barData} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
                         <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f3f4f6" />
                         <XAxis
                           dataKey="day"
@@ -538,37 +573,14 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     สถานะไฟล์ที่อัปโหลด
                   </h2>
                   <p className="text-xs text-gray-400 mb-2">แบ่งตามผลการตรวจสอบล่าสุด</p>
-                  <div className="h-52">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <PieChart>
-                        <Pie
-                          data={uploadStatusBreakdown}
-                          dataKey="value"
-                          nameKey="name"
-                          innerRadius={45}
-                          outerRadius={70}
-                          paddingAngle={2}
-                        >
-                          {uploadStatusBreakdown.map((entry) => (
-                            <Cell
-                              key={entry.name}
-                              fill={uploadStatusChartColors[entry.name as UploadLogEntry["status"]]}
-                            />
-                          ))}
-                        </Pie>
-                        <Tooltip
-                          contentStyle={{ borderRadius: 8, border: "1px solid #e5e7eb", fontSize: 12 }}
-                          formatter={(value: number, name) => [`${value} ไฟล์`, name]}
-                        />
-                        <Legend
-                          verticalAlign="bottom"
-                          height={28}
-                          iconType="circle"
-                          iconSize={8}
-                          wrapperStyle={{ fontSize: 11, color: "#6b7280" }}
-                        />
-                      </PieChart>
-                    </ResponsiveContainer>
+                  <div className="h-52 flex flex-col items-center justify-center">
+                    <div className="flex items-center gap-2 text-sm text-gray-400">
+                      <WifiOff className="w-4 h-4" />
+                      <span>NOT AVAILABLE</span>
+                    </div>
+                    <p className="text-[11px] text-gray-400 mt-2 text-center max-w-[220px]">
+                      ตาราง documents ไม่มีฟิลด์สถานะการตรวจสอบไฟล์
+                    </p>
                   </div>
                 </div>
               </div>
@@ -578,32 +590,12 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                 <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
                   <h2 className="text-sm font-semibold text-gray-800">การเชื่อมต่อ API ภายนอก</h2>
                 </div>
-                <div className="divide-y divide-gray-50">
-                  {mockApiConnections.map((api) => {
-                    const badge = apiStatusBadge(api.status);
-                    return (
-                      <div
-                        key={api.id}
-                        className="flex items-center justify-between px-5 py-3.5 hover:bg-gray-50/60 transition"
-                      >
-                        <div className="min-w-0">
-                          <p className="text-sm font-medium text-gray-800">{api.name}</p>
-                          <p className="text-xs text-gray-400 mt-0.5">{api.description}</p>
-                        </div>
-                        <div className="flex items-center gap-4 shrink-0">
-                          <span className="text-xs text-gray-400 hidden sm:inline">
-                            {api.latencyMs !== null ? `${api.latencyMs} ms` : "—"} · {api.lastChecked}
-                          </span>
-                          <span
-                            className={`flex items-center gap-1.5 text-xs font-medium px-2 py-1 rounded-md ${badge.cls}`}
-                          >
-                            <badge.Icon className="w-3.5 h-3.5" />
-                            {badge.label}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
+                <div className="px-5 py-8 flex flex-col items-center justify-center text-center">
+                  <WifiOff className="w-7 h-7 text-gray-300 mb-2" />
+                  <p className="text-sm font-medium text-gray-600">NOT AVAILABLE</p>
+                  <p className="text-xs text-gray-400 mt-1 max-w-[320px]">
+                    การเชื่อมต่อ API ภายนอก (BOT API, Tax Engine ฯลฯ) ยังไม่ถูกนำมาเชื่อมต่อกับ backend
+                  </p>
                 </div>
               </div>
             </>
@@ -674,8 +666,8 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                             </div>
                           </td>
                           <td className="px-5 py-3.5 text-gray-500 whitespace-nowrap">{u.role}</td>
-                          <td className="px-5 py-3.5 text-gray-500 whitespace-nowrap">{u.joinedAt}</td>
-                          <td className="px-5 py-3.5 text-gray-500 whitespace-nowrap">{u.lastActive}</td>
+                          <td className="px-5 py-3.5 text-gray-400 whitespace-nowrap text-xs">NOT AVAILABLE</td>
+                          <td className="px-5 py-3.5 text-gray-400 whitespace-nowrap text-xs">NOT AVAILABLE</td>
                           <td className="px-5 py-3.5 text-gray-500">{u.filesUploaded}</td>
                           <td className="px-5 py-3.5">
                             <span
@@ -693,13 +685,16 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                               <button
                                 type="button"
                                 onClick={() => toggleUserStatus(u.id)}
-                                className={`flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition ${
+                                disabled={togglingId === u.id}
+                                className={`flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition disabled:opacity-50 ${
                                   u.status === "active"
                                     ? "border-red-100 text-red-600 hover:bg-red-50"
                                     : "border-emerald-100 text-emerald-600 hover:bg-emerald-50"
                                 }`}
                               >
-                                {u.status === "active" ? (
+                                {togglingId === u.id ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : u.status === "active" ? (
                                   <>
                                     <Ban className="w-3.5 h-3.5" />
                                     ระงับบัญชี
@@ -757,7 +752,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     </div>
                   ))}
                 </div>
-                {mockUploadLog.length > 4 && (
+                {uploadLog.length > 4 && (
                   <div className="px-5 py-3 text-center border-t border-gray-100">
                     <button
                       type="button"
@@ -810,7 +805,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     );
                   })}
                 </div>
-                {mockAccessLog.length > 4 && (
+                {accessLog.length > 4 && (
                   <div className="px-5 py-3 text-center border-t border-gray-100">
                     <button
                       type="button"
@@ -828,6 +823,8 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                 )}
               </div>
             </div>
+          )}
+          </>
           )}
 
           {/* Footer */}
