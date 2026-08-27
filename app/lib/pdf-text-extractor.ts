@@ -43,7 +43,10 @@ export async function extractTextFromPdf(
   }
 
   try {
-    const pdfjsLib = await import("pdfjs-dist");
+    // Use the legacy build for Node.js environments (the modern `pdfjs-dist`
+    // build depends on the browser-only `DOMMatrix` global and crashes on the
+    // server with "DOMMatrix is not defined").
+    const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
     const data = new Uint8Array(buffer);
     const doc = await pdfjsLib.getDocument({ data }).promise;
     const pageCount = doc.numPages;
