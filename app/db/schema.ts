@@ -76,6 +76,26 @@ export const dailyTaxSummaries = pgTable(
   ]
 );
 
+export const exchangeRateCache = pgTable(
+  "exchange_rate_cache",
+  {
+    id: text("id").primaryKey(),
+    rateDate: text("rate_date").notNull(),
+    currency: text("currency").notNull(),
+    rate: numeric("rate").notNull(),
+    source: text("source"),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("exchange_rate_cache_date_currency_idx").on(
+      table.rateDate,
+      table.currency
+    ),
+    index("exchange_rate_cache_rate_date_idx").on(table.rateDate),
+    index("exchange_rate_cache_currency_idx").on(table.currency),
+  ]
+);
+
 export const auditLogs = pgTable(
   "audit_logs",
   {
