@@ -22,6 +22,13 @@
       "when": 1787761419418,
       "tag": "0002_third_captain_midlands",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1787831130401,
+      "tag": "0003_black_the_enforcers",
+      "breakpoints": true
     }
   ]
 }

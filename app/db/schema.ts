@@ -31,8 +31,14 @@ export const capitalTransactions = pgTable(
     amountThb: numeric("amount_thb").notNull(),
     type: text("type").notNull(),
     sourceType: text("source_type").notNull(),
+    sourceDocumentId: text("source_document_id"),
   },
-  (table) => [index("Capital_Transactions_user_id_idx").on(table.userId)]
+  (table) => [
+    index("Capital_Transactions_user_id_idx").on(table.userId),
+    index("Capital_Transactions_source_document_id_idx").on(
+      table.sourceDocumentId
+    ),
+  ]
 );
 
 export const documents = pgTable(
