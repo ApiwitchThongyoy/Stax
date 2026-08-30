@@ -170,6 +170,8 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   const resolvedEmail = userEmail || emailFromLogin || "admin@stax.com";
   const emailPrefix = resolvedEmail.split("@")[0] || "ผู้ดูแลระบบ";
   const displayName = emailPrefix.charAt(0).toUpperCase() + emailPrefix.slice(1);
+  const adminSession = readAdminSession();
+  const currentAdminId = adminSession?.user?.id ?? null;
 
   const handleLogout = () => {
     sessionStorage.removeItem("stax_admin_session");
@@ -293,6 +295,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
     const current = users.find((u) => u.id === id);
     if (!current) return;
     const nextStatus = current.status === "active" ? "SUSPENDED" : "ACTIVE";
+    if (id === currentAdminId && nextStatus === "SUSPENDED") return;
 
     setTogglingId(id);
     try {
@@ -682,6 +685,11 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                           </td>
                           <td className="px-5 py-3.5">
                             <div className="flex items-center justify-end">
+                              {u.id === currentAdminId ? (
+                                <span className="text-[11px] text-gray-400 font-medium px-1.5">
+                                  คุณ (บัญชีผู้ดูแลระบบปัจจุบัน)
+                                </span>
+                              ) : (
                               <button
                                 type="button"
                                 onClick={() => toggleUserStatus(u.id)}
@@ -706,6 +714,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                                   </>
                                 )}
                               </button>
+                              )}
                             </div>
                           </td>
                         </tr>
