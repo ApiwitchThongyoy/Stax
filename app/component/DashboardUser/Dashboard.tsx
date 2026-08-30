@@ -7,7 +7,6 @@ import {
   Users,
   Settings,
   HelpCircle,
-  Bell,
   LogOut,
   Pencil,
   Trash2,
@@ -25,6 +24,8 @@ import StoredDocumentsList from "./Storeddocumentslist";
 import StatementArchivePage from "./StatementArchivePage";
 import DailyCalendarExport from "./Dailycalendarexport";
 import CapitalLedgerPage from "../Ledger/CapitalLedgerPage";
+import SettingsPage from "./SettingsPage";
+import NotificationBell from "./NotificationBell";
 import type { ExtractedTransaction } from "../../lib/pdfStatementParser";
 import type { Transaction, TransactionCategory } from "../../lib/Financeutils";
 import { formatMoney, toDisplayDate, parseRateString } from "../../lib/Financeutils";
@@ -32,7 +33,7 @@ import { formatMoney, toDisplayDate, parseRateString } from "../../lib/Financeut
 // ไม่มีข้อมูลตัวอย่างแล้ว — สมุดบัญชีเริ่มต้นว่างเปล่า รอผู้ใช้ import ไฟล์ statement จริง
 const initialTransactions: Transaction[] = [];
 
-type NavId = "dashboard" | "ledger" | "archive" | "users";
+type NavId = "dashboard" | "ledger" | "archive" | "users" | "settings";
 
 const navItems: { id: NavId; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "dashboard", label: "แดชบอร์ด", icon: LayoutDashboard },
@@ -260,7 +261,12 @@ export default function Dashboard({ userEmail }: DashboardProps) {
         <div className="px-3 py-4 border-t border-gray-100 space-y-1">
           <button
             type="button"
-            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition"
+            onClick={() => setActiveNav("settings")}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition ${
+              activeNav === "settings"
+                ? "bg-blue-900 text-white"
+                : "text-gray-600 hover:bg-gray-50"
+            }`}
           >
             <Settings className="w-4 h-4" />
             ตั้งค่า
@@ -311,15 +317,10 @@ export default function Dashboard({ userEmail }: DashboardProps) {
           </div>
 
           <div className="flex items-center gap-3">
+            <NotificationBell />
             <button
               type="button"
-              className="w-9 h-9 rounded-lg flex items-center justify-center text-gray-400 hover:bg-gray-50 transition"
-              aria-label="การแจ้งเตือน"
-            >
-              <Bell className="w-4 h-4" />
-            </button>
-            <button
-              type="button"
+              onClick={() => setActiveNav("settings")}
               className="w-9 h-9 rounded-lg flex items-center justify-center text-gray-400 hover:bg-gray-50 transition"
               aria-label="ตั้งค่า"
             >
@@ -344,6 +345,8 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             <StatementArchivePage />
           ) : activeNav === "ledger" ? (
             <CapitalLedgerPage />
+          ) : activeNav === "settings" ? (
+            <SettingsPage />
           ) : (
             <>
               {/* Welcome banner */}
