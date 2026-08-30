@@ -22,6 +22,11 @@ if (!testDatabaseUrl) {
   process.exit(1);
 }
 
+// Opt into the test database BEFORE importing the routes so drizzle-db resolves
+// TEST_DATABASE_URL. Without this flag drizzle-db uses DATABASE_URL (production),
+// which this harness must never touch.
+process.env.USE_TEST_DATABASE = "1";
+
 // Imported after the TEST_DATABASE_URL guard so drizzle-db picks the TEST URL.
 const loginRoute = await import("../app/routes/api/auth/login");
 const ledgersRoute = await import("../app/routes/api/capital-ledgers");
