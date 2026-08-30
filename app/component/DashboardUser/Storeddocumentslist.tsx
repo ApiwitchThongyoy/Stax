@@ -22,10 +22,9 @@ function formatDate(iso: string): string {
 // รายการนี้เก็บไฟล์ไว้แค่ในเบราว์เซอร์เครื่องนี้เท่านั้น (IndexedDB) — ไม่ใช่การเก็บบน cloud/server จริง
 interface StoredDocumentsListProps {
   refreshTrigger?: number;
-  onViewAll?: () => void;
 }
 
-export default function StoredDocumentsList({ refreshTrigger, onViewAll }: StoredDocumentsListProps) {
+export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsListProps) {
   const { user } = useAuth();
   const [docs, setDocs] = useState<StoredDocumentMeta[]>([]);
   const [loading, setLoading] = useState(true);
@@ -84,52 +83,40 @@ export default function StoredDocumentsList({ refreshTrigger, onViewAll }: Store
           ยังไม่มีไฟล์ที่จัดเก็บไว้
         </p>
       ) : (
-        <>
-          <div className="space-y-2">
-            {docs.slice(0, 3).map((doc) => (
-              <div
-                key={doc.id}
-                className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg border border-gray-100 hover:bg-gray-50/60 transition"
-              >
-                <FileText className="w-4 h-4 text-blue-800 shrink-0" />
-                <div className="min-w-0 flex-1">
-                  <p className="text-xs font-medium text-gray-800 truncate">
-                    {doc.fileName}
-                  </p>
-                  <p className="text-[11px] text-gray-400">
-                    {formatDate(doc.uploadedAt)} · {formatFileSize(doc.size)}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => handleDownload(doc)}
-                  className="text-gray-400 hover:text-blue-800 transition shrink-0"
-                  aria-label="ดาวน์โหลด"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleDelete(doc.id)}
-                  className="text-gray-400 hover:text-red-600 transition shrink-0"
-                  aria-label="ลบไฟล์"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            ))}
-          </div>
-
-          {docs.length > 3 && (
-            <button
-              type="button"
-              onClick={onViewAll}
-              className="w-full text-center text-xs text-blue-800 font-medium hover:underline mt-3"
+        <div className="space-y-2 max-h-64 overflow-y-auto">
+          {docs.map((doc) => (
+            <div
+              key={doc.id}
+              className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg border border-gray-100 hover:bg-gray-50/60 transition"
             >
-              ดูทั้งหมด ({docs.length} ไฟล์) →
-            </button>
-          )}
-        </>
+              <FileText className="w-4 h-4 text-blue-800 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-medium text-gray-800 truncate">
+                  {doc.fileName}
+                </p>
+                <p className="text-[11px] text-gray-400">
+                  {formatDate(doc.uploadedAt)} · {formatFileSize(doc.size)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => handleDownload(doc)}
+                className="text-gray-400 hover:text-blue-800 transition shrink-0"
+                aria-label="ดาวน์โหลด"
+              >
+                <Download className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDelete(doc.id)}
+                className="text-gray-400 hover:text-red-600 transition shrink-0"
+                aria-label="ลบไฟล์"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
