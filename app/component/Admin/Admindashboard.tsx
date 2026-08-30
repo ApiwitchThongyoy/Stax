@@ -40,8 +40,10 @@ import { readAdminSession } from "../../lib/admin-auth";
 import { clearAdminSession, clearAllSessions, isSuspendedResponse } from "../../lib/session";
 import { usePresenceHeartbeat } from "../../lib/usePresenceHeartbeat";
 import { useAdminUsersPolling, type AdminUsersApiRow } from "../../lib/useAdminUsersPolling";
+import { useTheme } from "../../lib/useTheme";
+import ThemeToggle from "../ThemeToggle";
 
-type AdminSection = "overview" | "users" | "audit";
+type AdminSection = "overview" | "users" | "audit" | "settings";
 
 type UserStatus = "active" | "suspended";
 
@@ -179,6 +181,7 @@ interface AdminDashboardProps {
 export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   const navigate = useNavigate();
   const location = useLocation();
+  const { theme, toggleTheme } = useTheme();
 
   const [activeSection, setActiveSection] = useState<AdminSection>("overview");
   const [userSearch, setUserSearch] = useState("");
@@ -444,10 +447,18 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
       heading: "ตรวจสอบเอกสารและกิจกรรม",
       sub: "ติดตามประวัติการอัปโหลดไฟล์และประวัติการเข้าใช้งานเพื่อความปลอดภัยของระบบ",
     },
+    settings: {
+      heading: "ตั้งค่าระบบ",
+      sub: "จัดการบัญชีผู้ดูแลระบบและดูคู่มือการใช้งาน",
+    },
   };
 
   return (
-    <div className="min-h-screen w-full bg-gray-50 flex">
+    <div
+      className={`min-h-screen w-full bg-gray-50 flex ${
+        theme === "dark" ? "dark" : ""
+      }`}
+    >
       {/* Sidebar */}
       <aside className="hidden md:flex w-64 shrink-0 flex-col bg-white border-r border-gray-100">
         <div className="flex items-center gap-2.5 px-5 py-5 border-b border-gray-100">
@@ -481,7 +492,12 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
         <div className="px-3 py-4 border-t border-gray-100 space-y-1">
           <button
             type="button"
-            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition"
+            onClick={() => setActiveSection("settings")}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition ${
+              activeSection === "settings"
+                ? "bg-blue-900 text-white"
+                : "text-gray-600 hover:bg-gray-50"
+            }`}
           >
             <Settings className="w-4 h-4" />
             ตั้งค่าระบบ
@@ -532,14 +548,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
             >
               <Settings className="w-4 h-4" />
             </button>
-            <button
-              type="button"
-              onClick={handleLogout}
-              className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-red-600 transition px-2"
-            >
-              <LogOut className="w-4 h-4" />
-              ออกจากระบบ
-            </button>
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
           </div>
         </header>
 
@@ -941,6 +950,104 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     </button>
                   </div>
                 )}
+              </div>
+            </div>
+          )}
+
+          {activeSection === "settings" && (
+            <div className="space-y-6">
+              <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
+                <div className="px-5 py-4 border-b border-gray-100">
+                  <h2 className="text-sm font-semibold text-gray-800">
+                    บัญชีผู้ดูแลระบบ
+                  </h2>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    จัดการเซสชันผู้ดูแลระบบของคุณ
+                  </p>
+                </div>
+                <div className="px-5 py-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="w-9 h-9 rounded-full bg-blue-900 flex items-center justify-center text-white text-xs font-semibold shrink-0">
+                        {displayName.charAt(0).toUpperCase()}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-gray-800 truncate">
+                          {displayName}
+                        </p>
+                        <p className="text-xs text-gray-400 truncate">
+                          {resolvedEmail}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleLogout}
+                      className="flex items-center gap-1.5 text-sm font-medium text-red-600 hover:text-red-700 transition px-2 py-1.5 rounded-lg hover:bg-red-50/60 shrink-0"
+                    >
+                      <LogOut className="w-4 h-4" />
+                      ออกจากระบบ
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-400 mt-3">
+                    การออกจากระบบจะสิ้นสุดเซสชันและนำคุณกลับไปยังหน้าเข้าสู่ระบบผู้ดูแลระบบ
+                  </p>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
+                <div className="px-5 py-4 border-b border-gray-100">
+                  <h2 className="text-sm font-semibold text-gray-800">
+                    คู่มือการใช้งานสำหรับผู้ดูแลระบบ
+                  </h2>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    ภาพรวมฟีเจอร์หลักของระบบ
+                  </p>
+                </div>
+                <div className="divide-y divide-gray-50">
+                  <div className="flex items-start gap-3 px-5 py-4">
+                    <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center shrink-0">
+                      <Users className="w-4 h-4 text-blue-800" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-gray-800">
+                        จัดการผู้ใช้งาน
+                      </p>
+                      <p className="text-xs text-gray-400 mt-0.5">
+                        ไปที่เมนู "จัดการผู้ใช้งาน" เพื่อค้นหา ตรวจสอบ
+                        และเปิด-ปิดการใช้งานบัญชีผู้ใช้ทั่วไป
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-start gap-3 px-5 py-4">
+                    <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center shrink-0">
+                      <FileSearch className="w-4 h-4 text-blue-800" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-gray-800">
+                        ตรวจสอบเอกสารและกิจกรรม
+                      </p>
+                      <p className="text-xs text-gray-400 mt-0.5">
+                        ไปที่เมนู "ตรวจสอบเอกสาร & กิจกรรม"
+                        เพื่อติดตามประวัติการอัปโหลดไฟล์และการเข้าใช้งานระบบ
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-start gap-3 px-5 py-4">
+                    <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center shrink-0">
+                      <ShieldCheck className="w-4 h-4 text-blue-800" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-gray-800">
+                        สลับธีมสว่าง/มืด
+                      </p>
+                      <p className="text-xs text-gray-400 mt-0.5">
+                        ใช้ปุ่มพระจันทร์/พระอาทิตย์ที่มุมขวาบนเพื่อสลับธีม
+                        โดยใช้การตั้งค่าเดียวกันกับฝั่งผู้ใช้งาน
+                      </p>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           )}
