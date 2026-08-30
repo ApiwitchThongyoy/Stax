@@ -98,6 +98,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return { success: false, error: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" };
       }
 
+      if (response.status === 403) {
+        const suspendedMsg =
+          (data as { message?: string } | undefined)?.message ||
+          "บัญชีนี้ถูกระงับ โปรดติดต่อผู้ดูแลระบบที่ [email]";
+        return { success: false, error: suspendedMsg };
+      }
+
       if (!response.ok || !data.success || !data.data?.accessToken || !data.data?.user) {
         return { success: false, error: "เข้าสู่ระบบไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" };
       }

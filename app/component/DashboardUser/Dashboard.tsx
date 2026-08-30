@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router";
 import {
   LayoutDashboard,
@@ -56,9 +56,23 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const [showAllTransactions, setShowAllTransactions] = useState(false);
   const location = useLocation();
 
+  // Identity must come from the authenticated user only. Never fabricate a
+  // fallback ("investor@stax.com") — ProtectedLayout guarantees <Dashboard/>
+  // only ever renders with an authenticated session, so user?.email is present.
   const emailFromLogin = (location.state as { email?: string } | null)
     ?.email;
-  const resolvedEmail = userEmail || emailFromLogin || "investor@stax.com";
+  const resolvedEmail = user?.email || userEmail || emailFromLogin || "";
+
+  // Reset user-scoped in-memory state the moment the authenticated user changes
+  // (A -> B) so the next render can never reuse the previous user's data. This
+  // is defensive; normal logout already unmounts <Dashboard/> via ProtectedLayout.
+  const prevUserId = useRef<string | undefined>(user?.id);
+  useEffect(() => {
+    if (prevUserId.current !== user?.id) {
+      prevUserId.current = user?.id;
+      setTransactions([]);
+    }
+  }, [user?.id]);
 
   // ตัดชื่อย่อจากอีเมล (ส่วนก่อน @) แล้วปรับให้ตัวแรกเป็นตัวใหญ่
   const emailPrefix = resolvedEmail.split("@")[0] || "ผู้ใช้งาน";
