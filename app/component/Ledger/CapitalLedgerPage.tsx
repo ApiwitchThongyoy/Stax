@@ -11,6 +11,10 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
+import {
+  useSuspendedAccount,
+  flagSuspendedFromResponse,
+} from "../../lib/suspended-account";
 
 const CURRENCY_OPTIONS = ["THB", "USD", "HKD", "CNH"];
 
@@ -77,6 +81,7 @@ function emptyForm(): FormState {
 export default function CapitalLedgerPage() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  const { suspended, markSuspended } = useSuspendedAccount();
 
   const [entries, setEntries] = useState<ApiTransaction[]>([]);
   const [loadState, setLoadState] = useState<"loading" | "success" | "error">("loading");
@@ -103,6 +108,7 @@ export default function CapitalLedgerPage() {
   };
 
   const fetchHistory = useCallback(async () => {
+    if (suspended) return;
     setLoadState("loading");
     setLoadError("");
 
@@ -122,6 +128,10 @@ export default function CapitalLedgerPage() {
       return;
     }
 
+    if (await flagSuspendedFromResponse(response, markSuspended)) {
+      return;
+    }
+
     let data: { success?: boolean; data?: ApiTransaction[] };
     try {
       data = await response.json();
@@ -138,7 +148,7 @@ export default function CapitalLedgerPage() {
     setEntries(data.data);
     setLoadState("success");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handleUnauthorized, user?.accessToken]);
+  }, [handleUnauthorized, user?.accessToken, suspended, markSuspended]);
 
   useEffect(() => {
     fetchHistory();
@@ -197,6 +207,7 @@ export default function CapitalLedgerPage() {
 
     setIsSaving(true);
     setFormError("");
+    if (suspended) return;
 
     let response: Response;
     try {
@@ -216,6 +227,10 @@ export default function CapitalLedgerPage() {
 
     if (response.status === 401) {
       handleUnauthorized();
+      return;
+    }
+
+    if (await flagSuspendedFromResponse(response, markSuspended)) {
       return;
     }
 
@@ -243,6 +258,7 @@ export default function CapitalLedgerPage() {
   };
 
   const handleDelete = async (id: string) => {
+    if (suspended) return;
     let response: Response;
     try {
       response = await fetch(`/api/v1/capital-ledgers/${id}`, {
@@ -256,6 +272,10 @@ export default function CapitalLedgerPage() {
 
     if (response.status === 401) {
       handleUnauthorized();
+      return;
+    }
+
+    if (await flagSuspendedFromResponse(response, markSuspended)) {
       return;
     }
 

@@ -8,6 +8,7 @@ import {
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
+import { useAuth } from "../../lib/auth";
 import {
   listDocuments,
   getDocumentBlob,
@@ -36,6 +37,7 @@ function monthFolderKey(iso: string): string {
 
 // รายการนี้เก็บไฟล์ไว้แค่ในเบราว์เซอร์เครื่องนี้เท่านั้น (IndexedDB) — ไม่ใช่การเก็บบน cloud/server จริง
 export default function StatementArchivePage() {
+  const { user } = useAuth();
   const [docs, setDocs] = useState<StoredDocumentMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
@@ -43,7 +45,11 @@ export default function StatementArchivePage() {
   const refresh = async () => {
     setLoading(true);
     try {
-      const list = await listDocuments();
+      if (!user?.id) {
+        setDocs([]);
+        return;
+      }
+      const list = await listDocuments(user.id);
       setDocs(list);
       // เปิดโฟลเดอร์ล่าสุดไว้ให้อัตโนมัติ ใช้งานสะดวกขึ้น
       if (list.length > 0) {
@@ -56,10 +62,12 @@ export default function StatementArchivePage() {
 
   useEffect(() => {
     refresh();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
 
   const handleDownload = async (doc: StoredDocumentMeta) => {
-    const blob = await getDocumentBlob(doc.id);
+    if (!user?.id) return;
+    const blob = await getDocumentBlob(user.id, doc.id);
     if (!blob) return;
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -70,7 +78,8 @@ export default function StatementArchivePage() {
   };
 
   const handleDelete = async (id: string) => {
-    await deleteDocument(id);
+    if (!user?.id) return;
+    await deleteDocument(user.id, id);
     refresh();
   };
 

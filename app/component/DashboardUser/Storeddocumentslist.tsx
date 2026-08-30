@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { FileText, Download, Trash2 } from "lucide-react";
+import { useAuth } from "../../lib/auth";
 import {
   listDocuments,
   getDocumentBlob,
@@ -25,12 +26,17 @@ interface StoredDocumentsListProps {
 }
 
 export default function StoredDocumentsList({ refreshTrigger, onViewAll }: StoredDocumentsListProps) {
+  const { user } = useAuth();
   const [docs, setDocs] = useState<StoredDocumentMeta[]>([]);
   const [loading, setLoading] = useState(true);
 
   const refresh = async () => {
     try {
-      const list = await listDocuments();
+      if (!user?.id) {
+        setDocs([]);
+        return;
+      }
+      const list = await listDocuments(user.id);
       setDocs(list);
     } finally {
       setLoading(false);
@@ -40,10 +46,11 @@ export default function StoredDocumentsList({ refreshTrigger, onViewAll }: Store
   useEffect(() => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshTrigger]);
+  }, [refreshTrigger, user?.id]);
 
   const handleDownload = async (doc: StoredDocumentMeta) => {
-    const blob = await getDocumentBlob(doc.id);
+    if (!user?.id) return;
+    const blob = await getDocumentBlob(user.id, doc.id);
     if (!blob) return;
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -54,7 +61,8 @@ export default function StoredDocumentsList({ refreshTrigger, onViewAll }: Store
   };
 
   const handleDelete = async (id: string) => {
-    await deleteDocument(id);
+    if (!user?.id) return;
+    await deleteDocument(user.id, id);
     refresh();
   };
 
