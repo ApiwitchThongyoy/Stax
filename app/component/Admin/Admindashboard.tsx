@@ -32,6 +32,7 @@ import {
   CartesianGrid,
   Tooltip,
   Legend,
+  type TooltipValueType,
 } from "recharts";
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
@@ -115,7 +116,6 @@ const THAI_MONTHS_ABBR = [
 const ROLE_LABEL: Record<string, string> = {
   ADMIN: "ผู้ดูแลระบบ",
   USER: "ผู้ใช้งานทั่วไป",
-  ACCOUNTANT: "นักบัญชี",
 };
 
 function formatShortDay(date: string): string {
@@ -643,8 +643,8 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                             border: "1px solid #e5e7eb",
                             fontSize: 12,
                           }}
-                          formatter={(value: number, name) =>
-                            name === "files" ? [`${value} ไฟล์`, "จำนวนไฟล์"] : [`${value} MB`, "ขนาดรวม"]
+                          formatter={(value: TooltipValueType | undefined, name) =>
+                            name === "files" ? [`${String(value)} ไฟล์`, "จำนวนไฟล์"] : [`${String(value)} MB`, "ขนาดรวม"]
                           }
                           labelFormatter={(_, payload) => payload?.[0]?.payload?.date ?? ""}
                         />
@@ -791,7 +791,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                                   : "bg-red-50 text-red-600"
                               }`}
                             >
-                              {u.status === "active" ? "ใช้งานอยู่" : "ถูกระงับ"}
+                              {u.status === "active" ? "เปิดใช้งาน" : "ถูกระงับ"}
                             </span>
                           </td>
                           <td className="px-5 py-3.5">
@@ -801,16 +801,16 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                                   คุณ (บัญชีผู้ดูแลระบบปัจจุบัน)
                                 </span>
                               ) : (
-                              <button
-                                type="button"
-                                onClick={() => toggleUserStatus(u.id)}
-                                disabled={togglingId === u.id}
-                                className={`flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition disabled:opacity-50 ${
-                                  u.status === "active"
-                                    ? "border-red-100 text-red-600 hover:bg-red-50"
-                                    : "border-emerald-100 text-emerald-600 hover:bg-emerald-50"
-                                }`}
-                              >
+                                <button
+                                  type="button"
+                                  onClick={() => toggleUserStatus(u.id)}
+                                  disabled={togglingId === u.id}
+                                  className={`flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition disabled:opacity-50 ${
+                                    u.status === "active"
+                                      ? "border-red-100 text-red-600 hover:bg-red-50"
+                                      : "border-emerald-100 text-emerald-600 hover:bg-emerald-50"
+                                  }`}
+                                >
                                 {togglingId === u.id ? (
                                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
                                 ) : u.status === "active" ? (
@@ -824,7 +824,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                                     เปิดใช้งาน
                                   </>
                                 )}
-                              </button>
+                                </button>
                               )}
                             </div>
                           </td>
