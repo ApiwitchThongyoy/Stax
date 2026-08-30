@@ -242,9 +242,10 @@ export default function Register() {
           <button
             type="button"
             onClick={handleRegister}
-              className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition cursor-pointer"
+            disabled={submitting}
+              className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            ลงทะเบียนใช้งาน
+            {submitting ? "กำลังลงทะเบียน..." : "ลงทะเบียนใช้งาน"}
             <span aria-hidden="true">→</span>
           </button>
           <p className="text-center text-sm text-gray-500">
