@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { Bell, Mail, Loader2, AlertCircle, CheckCircle2 } from "lucide-react";
+import { useNavigate } from "react-router";
+import { Bell, Mail, BookOpen, Archive, LogOut, Loader2, AlertCircle, CheckCircle2 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
 import {
   useSuspendedAccount,
@@ -29,8 +30,13 @@ function getAccessToken(): string | null {
   }
 }
 
-export default function SettingsPage() {
-  const { user } = useAuth();
+interface SettingsPageProps {
+  onLogout?: () => void;
+}
+
+export default function SettingsPage({ onLogout }: SettingsPageProps) {
+  const { user, logout: authLogout } = useAuth();
+  const navigate = useNavigate();
   const { suspended, markSuspended } = useSuspendedAccount();
   const [settings, setSettings] = useState<UserSettings | null>(null);
   const [loading, setLoading] = useState(true);
@@ -113,6 +119,15 @@ export default function SettingsPage() {
     }
   };
 
+  const handleLogout = () => {
+    if (onLogout) {
+      onLogout();
+      return;
+    }
+    authLogout();
+    navigate("/login", { replace: true });
+  };
+
   if (loading) {
     return (
       <div className="bg-white rounded-xl border border-gray-100 p-10 flex items-center justify-center">
@@ -159,8 +174,9 @@ export default function SettingsPage() {
   ];
 
   return (
-    <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
-      <div className="px-5 py-4 border-b border-gray-100">
+    <div className="space-y-6">
+      <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-100">
         <h2 className="text-sm font-semibold text-gray-800">
           การตั้งค่าการแจ้งเตือน
         </h2>
@@ -218,6 +234,83 @@ export default function SettingsPage() {
             </button>
           </div>
         ))}
+      </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-100">
+          <h2 className="text-sm font-semibold text-gray-800">
+            คู่มือการใช้งาน
+          </h2>
+          <p className="text-xs text-gray-400 mt-0.5">
+            แนะนำการใช้งานระบบ STAX
+          </p>
+        </div>
+        <div className="divide-y divide-gray-50">
+          <div className="flex items-start gap-3 px-5 py-4">
+            <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center shrink-0">
+              <BookOpen className="w-4 h-4 text-blue-800" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-gray-800">
+                นำเข้า Statement PDF
+              </p>
+              <p className="text-xs text-gray-400 mt-0.5">
+                ที่แดชบอร์ด ลากไฟล์ PDF statement ลงในช่อง "ระบบวิเคราะห์เอกสารอัจฉริยะ AI"
+                ระบบจะอ่านรายการซื้อขายและนำเข้าเข้าสมุดบัญชีให้อัตโนมัติ
+              </p>
+            </div>
+          </div>
+          <div className="flex items-start gap-3 px-5 py-4">
+            <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center shrink-0">
+              <Archive className="w-4 h-4 text-blue-800" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-gray-800">
+                ดูไฟล์ในคลัง Statement
+              </p>
+              <p className="text-xs text-gray-400 mt-0.5">
+                ไปที่เมนู "คลัง Statement" ด้านซ้ายเพื่อดูไฟล์ทั้งหมดที่อัปโหลดไว้ก่อนหน้า
+                โดยจัดกลุ่มตามปี/เดือน และกดดาวน์โหลดหรือลบได้ในหน้าเดียวกัน
+              </p>
+            </div>
+          </div>
+          <div className="flex items-start gap-3 px-5 py-4">
+            <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center shrink-0">
+              <Bell className="w-4 h-4 text-blue-800" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-gray-800">
+                จัดการการแจ้งเตือน
+              </p>
+              <p className="text-xs text-gray-400 mt-0.5">
+                ใช้โทเกิลด้านบนเพื่อเปิด/ปิดการแจ้งเตือนในระบบ และการแจ้งเตือนทางอีเมล
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-100">
+          <h2 className="text-sm font-semibold text-gray-800">บัญชี</h2>
+          <p className="text-xs text-gray-400 mt-0.5">
+            จัดการเซสชันของคุณ
+          </p>
+        </div>
+        <div className="px-5 py-4">
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="flex items-center gap-1.5 text-sm font-medium text-red-600 hover:text-red-700 transition px-2 py-1.5 rounded-lg hover:bg-red-50/60"
+          >
+            <LogOut className="w-4 h-4" />
+            ออกจากระบบ
+          </button>
+          <p className="text-xs text-gray-400 mt-2">
+            การออกจากระบบจะสิ้นสุดเซสชันนี้และนำคุณกลับไปยังหน้าเข้าสู่ระบบ
+          </p>
+        </div>
       </div>
     </div>
   );
