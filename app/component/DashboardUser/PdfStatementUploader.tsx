@@ -3,6 +3,10 @@ import { UploadCloud, Sparkles, FileWarning, CheckCircle2, X } from "lucide-reac
 import { saveDocument } from "../../lib/Documentstorage";
 import { useAuth } from "../../lib/auth";
 import {
+  useSuspendedAccount,
+  flagSuspendedFromResponse,
+} from "../../lib/suspended-account";
+import {
   parsePdfStatement,
   loadCostBasis,
   saveCostBasis,
@@ -41,6 +45,7 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const { user } = useAuth();
+  const { suspended, markSuspended } = useSuspendedAccount();
   const [serverStatus, setServerStatus] = useState<
     "idle" | "saving" | "saved" | "error"
   >("idle");
@@ -70,7 +75,7 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
     setErrorMessage("");
 
     try {
-      const existingCostBasis = loadCostBasis();
+      const existingCostBasis = loadCostBasis(user?.id ?? "");
       const { transactions, updatedCostBasis } = await parsePdfStatement(
         file,
         existingCostBasis
@@ -82,8 +87,8 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
         );
         return;
       }
-      // บันทึกต้นทุนเฉลี่ยสะสมล่าสุดไว้ ใช้ต่อตอน import ไฟล์เดือนถัดไป
-      saveCostBasis(updatedCostBasis);
+      // บันทึกต้นทุนเฉลี่ยสะสมล่าสุดไว้ไว้ ใช้ต่อตอน import ไฟล์เดือนถัดไป
+      saveCostBasis(user?.id ?? "", updatedCostBasis);
       setExtracted(transactions);
       setStatus("idle");
       setIsReviewOpen(true);
@@ -116,8 +121,8 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
     }
 
     // เก็บไฟล์ PDF ต้นฉบับไว้ใน IndexedDB ของเบราว์เซอร์ (ดูย้อนหลัง/ดาวน์โหลดได้ในเครื่องนี้)
-    if (pendingFile) {
-      saveDocument(pendingFile)
+    if (pendingFile && user?.id) {
+      saveDocument(user.id, pendingFile)
         .then(() => onDocumentSaved?.())
         .catch(() => {
           // การบันทึกไฟล์ล้มเหลวไม่ควรบล็อกการนำเข้าข้อมูลธุรกรรม จึงแค่เงียบไว้
@@ -128,6 +133,7 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
   };
 
   const uploadToServer = async (file: File) => {
+    if (suspended) return;
     if (!user?.accessToken) {
       setServerStatus("error");
       setServerMessage("กรุณาเข้าสู่ระบบก่อนส่งข้อมูลเข้าสู่ระบบ");
@@ -144,6 +150,9 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
         headers: { Authorization: `Bearer ${user.accessToken}` },
         body,
       });
+      if (await flagSuspendedFromResponse(response, markSuspended)) {
+        return;
+      }
 
       const data = await response.json();
       if (!response.ok || !data.success) {

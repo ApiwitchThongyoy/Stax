@@ -4,6 +4,8 @@ import { eq } from "drizzle-orm";
 import type { Route } from "./+types/login";
 import { db } from "../../../lib/drizzle-db";
 import { users } from "~/db/schema";
+import { insertAuditLog, AuditAction } from "~/lib/audit-log";
+import { ACCOUNT_SUSPENDED_MESSAGE } from "~/lib/auth-middleware";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ACCESS_TOKEN_EXPIRY = "1h";
@@ -82,6 +84,18 @@ export async function action({ request }: Route.ActionArgs) {
   }
 
   if (!user) {
+    await insertAuditLog({
+      userId: null,
+      action: AuditAction.LOGIN_FAILED,
+      entityType: "User",
+      details: {
+        route: "/api/v1/auth/login",
+        method: "POST",
+        result: "failed",
+        reason: "user_not_found",
+        email: normalizedEmail,
+      },
+    });
     return Response.json(
       { success: false, message: "Invalid email or password" },
       { status: 401 }
@@ -100,9 +114,44 @@ export async function action({ request }: Route.ActionArgs) {
   }
 
   if (!passwordMatches) {
+    await insertAuditLog({
+      userId: user.id,
+      action: AuditAction.LOGIN_FAILED,
+      entityType: "User",
+      entityId: user.id,
+      details: {
+        route: "/api/v1/auth/login",
+        method: "POST",
+        result: "failed",
+        reason: "invalid_password",
+      },
+    });
     return Response.json(
       { success: false, message: "Invalid email or password" },
       { status: 401 }
+    );
+  }
+
+  if (user.status !== "ACTIVE") {
+    await insertAuditLog({
+      userId: user.id,
+      action: AuditAction.LOGIN_FAILED,
+      entityType: "User",
+      entityId: user.id,
+      details: {
+        route: "/api/v1/auth/login",
+        method: "POST",
+        result: "failed",
+        reason: "account_suspended",
+      },
+    });
+    return Response.json(
+      {
+        success: false,
+        message: ACCOUNT_SUSPENDED_MESSAGE,
+        code: "ACCOUNT_SUSPENDED",
+      },
+      { status: 403 }
     );
   }
 
@@ -119,6 +168,34 @@ export async function action({ request }: Route.ActionArgs) {
       { success: false, message: "Internal server error" },
       { status: 500 }
     );
+  }
+
+  await insertAuditLog({
+    userId: user.id,
+    action:
+      user.role === "ADMIN"
+        ? AuditAction.ADMIN_LOGIN_SUCCESS
+        : AuditAction.LOGIN_SUCCESS,
+    entityType: "User",
+    entityId: user.id,
+    details: {
+      route: "/api/v1/auth/login",
+      method: "POST",
+      result: "success",
+      role: user.role,
+    },
+  });
+
+  // Record login/presence timestamps (fire-and-forget; failure must not block login).
+  try {
+    const now = new Date();
+    await db
+      .update(users)
+      .set({ lastLoginAt: now, lastSeenAt: now })
+      .where(eq(users.id, user.id))
+      .execute();
+  } catch (error) {
+    console.error("Login: failed to record last_login_at", error);
   }
 
   return Response.json(

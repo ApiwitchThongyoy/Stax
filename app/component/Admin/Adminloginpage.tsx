@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Mail, Lock, Eye, EyeOff, ShieldCheck, Users, AlertCircle } from "lucide-react";
 import { Link } from "react-router";
 import { useNavigate, useLocation } from "react-router";
@@ -22,6 +22,16 @@ export default function StaxAdminLoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
 
+  useEffect(() => {
+    const suspended = (location.state as { suspended?: boolean } | null)
+      ?.suspended;
+    if (suspended) {
+      setErrorMessage(
+        "บัญชีนี้ถูกระงับ โปรดติดต่อผู้ดูแลระบบที่ [email]"
+      );
+    }
+  }, [location.state]);
+
   const handleLogin = async () => {
     const trimmedEmail = email.trim();
 
@@ -38,6 +48,14 @@ export default function StaxAdminLoginPage() {
       });
 
       const data = (await response.json().catch(() => null)) as LoginApiResponse | null;
+
+      if (response.status === 403) {
+        const msg =
+          (data as { message?: string } | null)?.message ||
+          "บัญชีนี้ถูกระงับ โปรดติดต่อผู้ดูแลระบบที่ [email]";
+        setErrorMessage(msg);
+        return;
+      }
 
       if (!response.ok || !data?.success || !data.data?.accessToken || !data.data.user) {
         setErrorMessage("อีเมลหรือรหัสผ่านผู้ดูแลระบบไม่ถูกต้อง");
