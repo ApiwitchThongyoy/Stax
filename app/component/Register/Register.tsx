@@ -16,6 +16,7 @@ export default function Register() {
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const navigate = useNavigate();
   const { register } = useAuth();
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -47,7 +48,7 @@ export default function Register() {
     }, 1000);
   };
 
-  const handleRegister = () => {
+  const handleRegister = async () => {
     if (!isValidEmail) {
       setErrorMessage("กรุณากรอกอีเมลให้ถูกต้อง");
       return;
@@ -69,16 +70,16 @@ export default function Register() {
       return;
     }
 
-    // TODO: ใส่ logic เรียก API ลงทะเบียนจริงตรงนี้ก่อน
-    // ตอนนี้ mock ไว้ก่อนด้วยการเก็บลง localStorage ผ่าน useAuth().register
-    const result = register(email, password);
+    setSubmitting(true);
+    setErrorMessage("");
+    const result = await register(email, password);
+    setSubmitting(false);
 
     if (!result.success) {
       setErrorMessage(result.error || "ลงทะเบียนไม่สำเร็จ");
       return;
     }
 
-    setErrorMessage("");
     navigate("/login");
   };
 
@@ -241,9 +242,10 @@ export default function Register() {
           <button
             type="button"
             onClick={handleRegister}
-              className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition cursor-pointer"
+            disabled={submitting}
+              className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            ลงทะเบียนใช้งาน
+            {submitting ? "กำลังลงทะเบียน..." : "ลงทะเบียนใช้งาน"}
             <span aria-hidden="true">→</span>
           </button>
           <p className="text-center text-sm text-gray-500">

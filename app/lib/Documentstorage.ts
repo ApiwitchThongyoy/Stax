@@ -3,9 +3,15 @@
 // เหมาะสำหรับดูย้อนหลังในเครื่องเดิม ไม่ใช่ enterprise-grade secure storage
 // (ถ้าอนาคตมี backend ควรย้ายมาเก็บบน server + object storage แทน)
 
-const DB_NAME = "stax_documents_db";
 const DB_VERSION = 1;
 const STORE_NAME = "documents";
+
+// IndexedDB store is scoped per authenticated user so that on a shared
+// browser/device no user ever sees another user's locally-stored statement
+// files. Each user gets their own database: stax_documents_db_<userId>.
+function dbNameFor(userId: string): string {
+  return `stax_documents_db_${userId}`;
+}
 
 export interface StoredDocumentMeta {
   id: string;
@@ -18,13 +24,17 @@ interface StoredDocumentRecord extends StoredDocumentMeta {
   blob: Blob;
 }
 
-function openDb(): Promise<IDBDatabase> {
+function openDb(userId: string): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
+    if (!userId) {
+      reject(new Error("ต้องระบุผู้ใช้ก่อนใช้งานที่เก็บเอกสาร"));
+      return;
+    }
     if (typeof window === "undefined" || !window.indexedDB) {
       reject(new Error("IndexedDB ใช้งานได้เฉพาะฝั่งเบราว์เซอร์เท่านั้น"));
       return;
     }
-    const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+    const request = window.indexedDB.open(dbNameFor(userId), DB_VERSION);
 
     request.onupgradeneeded = () => {
       const db = request.result;
@@ -44,8 +54,11 @@ function nextDocumentId(): string {
   return `doc-${Date.now()}-${counter}`;
 }
 
-export async function saveDocument(file: File): Promise<StoredDocumentMeta> {
-  const db = await openDb();
+export async function saveDocument(
+  userId: string,
+  file: File
+): Promise<StoredDocumentMeta> {
+  const db = await openDb(userId);
   const meta: StoredDocumentMeta = {
     id: nextDocumentId(),
     fileName: file.name,
@@ -63,8 +76,8 @@ export async function saveDocument(file: File): Promise<StoredDocumentMeta> {
   });
 }
 
-export async function listDocuments(): Promise<StoredDocumentMeta[]> {
-  const db = await openDb();
+export async function listDocuments(userId: string): Promise<StoredDocumentMeta[]> {
+  const db = await openDb(userId);
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readonly");
     const store = tx.objectStore(STORE_NAME);
@@ -80,8 +93,11 @@ export async function listDocuments(): Promise<StoredDocumentMeta[]> {
   });
 }
 
-export async function getDocumentBlob(id: string): Promise<Blob | null> {
-  const db = await openDb();
+export async function getDocumentBlob(
+  userId: string,
+  id: string
+): Promise<Blob | null> {
+  const db = await openDb(userId);
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readonly");
     const store = tx.objectStore(STORE_NAME);
@@ -94,8 +110,8 @@ export async function getDocumentBlob(id: string): Promise<Blob | null> {
   });
 }
 
-export async function deleteDocument(id: string): Promise<void> {
-  const db = await openDb();
+export async function deleteDocument(userId: string, id: string): Promise<void> {
+  const db = await openDb(userId);
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readwrite");
     const store = tx.objectStore(STORE_NAME);

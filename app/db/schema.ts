@@ -3,6 +3,7 @@ import {
   text,
   numeric,
   integer,
+  boolean,
   index,
   uniqueIndex,
   timestamp,
@@ -15,6 +16,8 @@ export const users = pgTable("User", {
   passwordHash: text("password_hash").notNull(),
   role: text("role").notNull().default("USER"),
   status: text("status").notNull().default("ACTIVE"),
+  lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
 });
 
 export const capitalTransactions = pgTable(
@@ -117,5 +120,40 @@ export const auditLogs = pgTable(
     index("audit_logs_user_id_idx").on(table.userId),
     index("audit_logs_created_at_idx").on(table.createdAt),
     index("audit_logs_action_idx").on(table.action),
+  ]
+);
+
+export const userSettings = pgTable("user_settings", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .unique()
+    .references(() => users.id),
+  notificationEnabled: boolean("notification_enabled")
+    .notNull()
+    .default(true),
+  emailNotificationEnabled: boolean("email_notification_enabled")
+    .notNull()
+    .default(true),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const notifications = pgTable(
+  "notifications",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    title: text("title").notNull(),
+    message: text("message").notNull(),
+    type: text("type").notNull().default("SYSTEM"),
+    isRead: boolean("is_read").notNull().default(false),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    index("notifications_user_id_idx").on(table.userId),
+    index("notifications_user_read_idx").on(table.userId, table.isRead),
   ]
 );

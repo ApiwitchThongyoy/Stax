@@ -2,7 +2,8 @@ import { eq, and } from "drizzle-orm";
 import type { Route } from "./+types/capital-ledgers.$id";
 import { db } from "~/lib/drizzle-db";
 import { capitalTransactions } from "~/db/schema";
-import { verifyAuth } from "~/lib/auth-middleware";
+import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
+import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"];
 const VALID_SOURCE_TYPES = ["MANUAL", "AI_PARSED"];
@@ -28,12 +29,9 @@ function validateAmount(value: unknown, fieldName: string): string | null {
 }
 
 export async function loader({ request, params }: Route.LoaderArgs) {
-  const auth = verifyAuth(request);
+  const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
-    return Response.json(
-      { success: false, message: auth.message },
-      { status: auth.status }
-    );
+    return authErrorResponse(auth);
   }
 
   const { id } = params;
@@ -75,12 +73,9 @@ export async function loader({ request, params }: Route.LoaderArgs) {
 }
 
 export async function action({ request, params }: Route.ActionArgs) {
-  const auth = verifyAuth(request);
+  const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
-    return Response.json(
-      { success: false, message: auth.message },
-      { status: auth.status }
-    );
+    return authErrorResponse(auth);
   }
 
   const { id } = params;
@@ -250,6 +245,19 @@ async function handleUpdate(
       )
       .limit(1);
 
+    await insertAuditLog({
+      userId,
+      action: AuditAction.CAPITAL_TRANSACTION_UPDATE,
+      entityType: "Capital_Transactions",
+      entityId: transactionId,
+      details: {
+        method: request.method,
+        route: `/api/v1/capital-ledgers/${transactionId}`,
+        result: "updated",
+        updatedFields: Object.keys(setValues),
+      },
+    });
+
     return Response.json({ success: true, data: updatedRows[0] }, { status: 200 });
   } catch (error) {
     console.error("CapitalLedgers PUT: failed to update", error);
@@ -292,6 +300,18 @@ async function handleDelete(
         )
       )
       .execute();
+
+    await insertAuditLog({
+      userId,
+      action: AuditAction.CAPITAL_TRANSACTION_DELETE,
+      entityType: "Capital_Transactions",
+      entityId: transactionId,
+      details: {
+        method: "DELETE",
+        route: `/api/v1/capital-ledgers/${transactionId}`,
+        result: "deleted",
+      },
+    });
 
     return Response.json(
       { success: true, message: "Record deleted" },

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router";
 import {
   LayoutDashboard,
@@ -7,7 +7,6 @@ import {
   Users,
   Settings,
   HelpCircle,
-  Bell,
   LogOut,
   Plus,
   Pencil,
@@ -20,10 +19,14 @@ import {
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
 import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตรง
+import { useSuspendedAccount } from "../../lib/suspended-account";
+import { usePresenceHeartbeat } from "../../lib/usePresenceHeartbeat";
 import PdfStatementUploader from "./PdfStatementUploader";
 import StoredDocumentsList from "./Storeddocumentslist";
 import DailyCalendarExport from "./Dailycalendarexport";
 import CapitalLedgerPage from "../Ledger/CapitalLedgerPage";
+import SettingsPage from "./SettingsPage";
+import NotificationBell from "./NotificationBell";
 import type { ExtractedTransaction } from "../../lib/pdfStatementParser";
 import type { Transaction } from "../../lib/Financeutils";
 import { formatMoney, toDisplayDate, parseRateString } from "../../lib/Financeutils";
@@ -31,7 +34,7 @@ import { formatMoney, toDisplayDate, parseRateString } from "../../lib/Financeut
 // ไม่มีข้อมูลตัวอย่างแล้ว — สมุดบัญชีเริ่มต้นว่างเปล่า รอผู้ใช้ import ไฟล์ statement จริง
 const initialTransactions: Transaction[] = [];
 
-type NavId = "dashboard" | "ledger" | "fx" | "users";
+type NavId = "dashboard" | "ledger" | "fx" | "users" | "settings";
 
 const navItems: { id: NavId; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "dashboard", label: "แดชบอร์ด", icon: LayoutDashboard },
@@ -55,9 +58,32 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const [showAllTransactions, setShowAllTransactions] = useState(false);
   const location = useLocation();
 
+  // Identity must come from the authenticated user only. Never fabricate a
+  // fallback ("investor@stax.com") — ProtectedLayout guarantees <Dashboard/>
+  // only ever renders with an authenticated session, so user?.email is present.
   const emailFromLogin = (location.state as { email?: string } | null)
     ?.email;
-  const resolvedEmail = userEmail || emailFromLogin || "investor@stax.com";
+  const resolvedEmail = user?.email || userEmail || emailFromLogin || "";
+
+  const { reactivated } = useSuspendedAccount();
+
+  // Presence: bump last_seen_at ทุก 30 วิ ขณะอยู่บน dashboard หลัง login
+  // หยุดอัตโนมัติเมื่อ logout / ออกจากหน้า / ไม่มี session
+  usePresenceHeartbeat({
+    enabled: !!user?.accessToken && !reactivated,
+    accessToken: user?.accessToken ?? null,
+  });
+
+  // Reset user-scoped in-memory state the moment the authenticated user changes
+  // (A -> B) so the next render can never reuse the previous user's data. This
+  // is defensive; normal logout already unmounts <Dashboard/> via ProtectedLayout.
+  const prevUserId = useRef<string | undefined>(user?.id);
+  useEffect(() => {
+    if (prevUserId.current !== user?.id) {
+      prevUserId.current = user?.id;
+      setTransactions([]);
+    }
+  }, [user?.id]);
 
   // ตัดชื่อย่อจากอีเมล (ส่วนก่อน @) แล้วปรับให้ตัวแรกเป็นตัวใหญ่
   const emailPrefix = resolvedEmail.split("@")[0] || "ผู้ใช้งาน";
@@ -164,7 +190,12 @@ export default function Dashboard({ userEmail }: DashboardProps) {
         <div className="px-3 py-4 border-t border-gray-100 space-y-1">
           <button
             type="button"
-            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition"
+            onClick={() => setActiveNav("settings")}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition ${
+              activeNav === "settings"
+                ? "bg-blue-900 text-white"
+                : "text-gray-600 hover:bg-gray-50"
+            }`}
           >
             <Settings className="w-4 h-4" />
             ตั้งค่า
@@ -217,15 +248,10 @@ export default function Dashboard({ userEmail }: DashboardProps) {
           </div>
 
           <div className="flex items-center gap-3">
+            <NotificationBell />
             <button
               type="button"
-              className="w-9 h-9 rounded-lg flex items-center justify-center text-gray-400 hover:bg-gray-50 transition"
-              aria-label="การแจ้งเตือน"
-            >
-              <Bell className="w-4 h-4" />
-            </button>
-            <button
-              type="button"
+              onClick={() => setActiveNav("settings")}
               className="w-9 h-9 rounded-lg flex items-center justify-center text-gray-400 hover:bg-gray-50 transition"
               aria-label="ตั้งค่า"
             >
@@ -248,6 +274,8 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             <DailyCalendarExport transactions={transactions} />
           ) : activeNav === "ledger" ? (
             <CapitalLedgerPage />
+          ) : activeNav === "settings" ? (
+            <SettingsPage />
           ) : (
             <>
               {/* Welcome banner */}

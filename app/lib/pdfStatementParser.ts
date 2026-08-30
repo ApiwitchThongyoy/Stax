@@ -34,27 +34,35 @@ export interface ExtractedTransaction {
 
 // ---------- ต้นทุนเฉลี่ยสะสม (running average cost) ต่อสัญลักษณ์หุ้น ----------
 // เก็บสถานะนี้ไว้ข้าม session (localStorage) เพื่อให้แม่นยำขึ้นเรื่อยๆ ทุกครั้งที่ import statement เดือนใหม่
+// Key ถูก scope ตาม userId เพื่อไม่ให้ข้อมูลต้นทุนของอีกบัญชีหลุดข้ามมา
 export interface CostBasisEntry {
   quantity: number;
   avgCost: number; // ต้นทุนเฉลี่ยต่อหุ้น ในสกุลเงินของหุ้นตัวนั้น
 }
 export type CostBasisMap = Record<string, CostBasisEntry>;
 
-const COST_BASIS_STORAGE_KEY = "stax_cost_basis";
+function costBasisStorageKey(userId: string): string {
+  return `stax_cost_basis_${userId}`;
+}
 
-export function loadCostBasis(): CostBasisMap {
+export function loadCostBasis(userId: string): CostBasisMap {
   if (typeof window === "undefined") return {};
+  if (!userId) return {};
   try {
-    const raw = window.localStorage.getItem(COST_BASIS_STORAGE_KEY);
+    const raw = window.localStorage.getItem(costBasisStorageKey(userId));
     return raw ? (JSON.parse(raw) as CostBasisMap) : {};
   } catch {
     return {};
   }
 }
 
-export function saveCostBasis(costBasis: CostBasisMap) {
+export function saveCostBasis(
+  userId: string,
+  costBasis: CostBasisMap
+) {
   if (typeof window === "undefined") return;
-  window.localStorage.setItem(COST_BASIS_STORAGE_KEY, JSON.stringify(costBasis));
+  if (!userId) return;
+  window.localStorage.setItem(costBasisStorageKey(userId), JSON.stringify(costBasis));
 }
 
 interface PositionedItem {
