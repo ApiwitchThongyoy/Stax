@@ -36,6 +36,9 @@ import {
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
 import { readAdminSession } from "../../lib/admin-auth";
+import { clearAdminSession } from "../../lib/session";
+import { usePresenceHeartbeat } from "../../lib/usePresenceHeartbeat";
+import { useAdminUsersPolling, type AdminUsersApiRow } from "../../lib/useAdminUsersPolling";
 
 type AdminSection = "overview" | "users" | "audit";
 
@@ -48,8 +51,19 @@ interface AdminUserRow {
   role: string;
   status: UserStatus;
   joinedAt: string;
-  lastActive: string;
+  lastSeenAt: string | null;
+  lastLoginAt: string | null;
   filesUploaded: number;
+}
+
+const ONLINE_WINDOW_MS = 60_000;
+
+function isUserOnline(u: Pick<AdminUserRow, "status" | "lastSeenAt">): boolean {
+  if (u.status !== "active") return false;
+  if (!u.lastSeenAt) return false;
+  const last = new Date(u.lastSeenAt).getTime();
+  if (Number.isNaN(last)) return false;
+  return Date.now() - last <= ONLINE_WINDOW_MS;
 }
 
 interface UploadLogEntry {
@@ -117,6 +131,20 @@ function displayNameFromEmail(email: string): string {
   return prefix.charAt(0).toUpperCase() + prefix.slice(1);
 }
 
+function rowToAdminUserRow(u: AdminUsersApiRow): AdminUserRow {
+  return {
+    id: u.id,
+    name: displayNameFromEmail(u.email),
+    email: u.email,
+    role: ROLE_LABEL[u.role] ?? u.role,
+    status: u.status === "SUSPENDED" ? "suspended" : "active",
+    joinedAt: "",
+    lastSeenAt: u.lastSeenAt ?? null,
+    lastLoginAt: u.lastLoginAt ?? null,
+    filesUploaded: u.documentCount ?? 0,
+  };
+}
+
 function uploadStatusBadge(status: UploadLogEntry["status"]) {
   switch (status) {
     case "สำเร็จ":
@@ -171,7 +199,47 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   const emailPrefix = resolvedEmail.split("@")[0] || "ผู้ดูแลระบบ";
   const displayName = emailPrefix.charAt(0).toUpperCase() + emailPrefix.slice(1);
   const adminSession = readAdminSession();
+  const adminToken = adminSession?.accessToken ?? null;
   const currentAdminId = adminSession?.user?.id ?? null;
+
+  // ADMIN presence: while the admin dashboard is active, keep this admin's
+  // last_seen_at fresh (heartbeat) so THEY show as ONLINE in the user table.
+  usePresenceHeartbeat({
+    enabled: !!adminToken,
+    accessToken: adminToken,
+  });
+
+  // Admin user list presence: refresh ONLINE/OFFLINE automatically every 5s
+  // without a manual page refresh. Stops on logout/unmount; detects suspension.
+  useAdminUsersPolling({
+    enabled: !!adminToken,
+    accessToken: adminToken,
+    onUsers: (rows) => {
+      setUsers((prev) => {
+        if (prev.length === 0) {
+          return rows.map(rowToAdminUserRow);
+        }
+        const byId = new Map(rows.map((r) => [r.id, r]));
+        return prev.map((u) => {
+          const fresh = byId.get(u.id);
+          if (!fresh) return u;
+          return {
+            ...u,
+            status: fresh.status === "SUSPENDED" ? "suspended" : "active",
+            lastSeenAt: fresh.lastSeenAt ?? null,
+            lastLoginAt: fresh.lastLoginAt ?? null,
+          };
+        });
+      });
+    },
+    onSuspended: () => {
+      clearAdminSession();
+      navigate("/admin/login", {
+        replace: true,
+        state: { suspended: true },
+      });
+    },
+  });
 
   const handleLogout = () => {
     sessionStorage.removeItem("stax_admin_session");
@@ -206,6 +274,8 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
         role: string;
         status: string;
         documentCount?: number;
+        lastSeenAt?: string | null;
+        lastLoginAt?: string | null;
       }[];
 
       void setUsers(
@@ -216,7 +286,8 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
           role: ROLE_LABEL[u.role] ?? u.role,
           status: u.status === "SUSPENDED" ? "suspended" : "active",
           joinedAt: "",
-          lastActive: "",
+          lastSeenAt: u.lastSeenAt ?? null,
+          lastLoginAt: u.lastLoginAt ?? null,
           filesUploaded: u.documentCount ?? 0,
         }))
       );
@@ -645,9 +716,9 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                         <th className="px-5 py-3 font-medium">ผู้ใช้งาน</th>
                         <th className="px-5 py-3 font-medium">บทบาท</th>
                         <th className="px-5 py-3 font-medium">เข้าร่วมเมื่อ</th>
-                        <th className="px-5 py-3 font-medium">ใช้งานล่าสุด</th>
+                        <th className="px-5 py-3 font-medium">สถานะการออนไลน์</th>
                         <th className="px-5 py-3 font-medium">ไฟล์ที่อัปโหลด</th>
-                        <th className="px-5 py-3 font-medium">สถานะ</th>
+                        <th className="px-5 py-3 font-medium">สถานะบัญชี</th>
                         <th className="px-5 py-3 font-medium text-right">จัดการ</th>
                       </tr>
                     </thead>
@@ -670,7 +741,35 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                           </td>
                           <td className="px-5 py-3.5 text-gray-500 whitespace-nowrap">{u.role}</td>
                           <td className="px-5 py-3.5 text-gray-400 whitespace-nowrap text-xs">NOT AVAILABLE</td>
-                          <td className="px-5 py-3.5 text-gray-400 whitespace-nowrap text-xs">NOT AVAILABLE</td>
+                          <td className="px-5 py-3.5 whitespace-nowrap">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`inline-block w-2 h-2 rounded-full ${
+                                  isUserOnline(u)
+                                    ? "bg-emerald-500"
+                                    : "bg-gray-300"
+                                }`}
+                              />
+                              <span
+                                className={`text-xs font-medium ${
+                                  isUserOnline(u)
+                                    ? "text-emerald-600"
+                                    : "text-gray-400"
+                                }`}
+                              >
+                                {isUserOnline(u) ? "ออนไลน์" : "ออฟไลน์"}
+                              </span>
+                            </div>
+                            {u.lastSeenAt && (
+                              <div className="text-[11px] text-gray-400 mt-1">
+                                เห็นล่าสุด{" "}
+                                {new Date(u.lastSeenAt).toLocaleTimeString("th-TH", {
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                })}
+                              </div>
+                            )}
+                          </td>
                           <td className="px-5 py-3.5 text-gray-500">{u.filesUploaded}</td>
                           <td className="px-5 py-3.5">
                             <span

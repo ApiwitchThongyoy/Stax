@@ -186,6 +186,18 @@ export async function action({ request }: Route.ActionArgs) {
     },
   });
 
+  // Record login/presence timestamps (fire-and-forget; failure must not block login).
+  try {
+    const now = new Date();
+    await db
+      .update(users)
+      .set({ lastLoginAt: now, lastSeenAt: now })
+      .where(eq(users.id, user.id))
+      .execute();
+  } catch (error) {
+    console.error("Login: failed to record last_login_at", error);
+  }
+
   return Response.json(
     {
       success: true,

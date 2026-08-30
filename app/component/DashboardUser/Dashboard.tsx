@@ -19,6 +19,8 @@ import {
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
 import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตรง
+import { useSuspendedAccount } from "../../lib/suspended-account";
+import { usePresenceHeartbeat } from "../../lib/usePresenceHeartbeat";
 import PdfStatementUploader from "./PdfStatementUploader";
 import StoredDocumentsList from "./Storeddocumentslist";
 import StatementArchivePage from "./StatementArchivePage";
@@ -63,6 +65,15 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const emailFromLogin = (location.state as { email?: string } | null)
     ?.email;
   const resolvedEmail = user?.email || userEmail || emailFromLogin || "";
+
+  const { reactivated } = useSuspendedAccount();
+
+  // Presence: bump last_seen_at ทุก 30 วิ ขณะอยู่บน dashboard หลัง login
+  // หยุดอัตโนมัติเมื่อ logout / ออกจากหน้า / ไม่มี session
+  usePresenceHeartbeat({
+    enabled: !!user?.accessToken && !reactivated,
+    accessToken: user?.accessToken ?? null,
+  });
 
   // Reset user-scoped in-memory state the moment the authenticated user changes
   // (A -> B) so the next render can never reuse the previous user's data. This
