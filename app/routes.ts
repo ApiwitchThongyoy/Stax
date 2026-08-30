@@ -16,6 +16,7 @@ export default [
   ]),
 
   route("api/v1/auth/login", "routes/api/auth/login.ts"),
+  route("api/v1/auth/register", "routes/api/auth/register.ts"),
   route("api/v1/auth/session", "routes/api/auth/session.ts"),
 
   route("api/v1/capital-ledgers", "routes/api/capital-ledgers.ts"),

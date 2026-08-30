@@ -1,18 +1,12 @@
 import { createContext, useContext, useState, useCallback, type ReactNode } from "react";
 
 const STORAGE_KEY = "stax_auth_user";
-const USERS_KEY = "stax_registered_users";
 
 interface AuthUser {
   id: string;
   email: string;
   role: string;
   accessToken: string;
-}
-
-interface RegisteredUser {
-  email: string;
-  password: string;
 }
 
 interface LoginResult {
@@ -30,7 +24,7 @@ interface AuthContextValue {
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<LoginResult>;
   logout: () => void;
-  register: (email: string, password: string) => RegisterResult;
+  register: (email: string, password: string) => Promise<RegisterResult>;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -43,20 +37,6 @@ function readStoredUser(): AuthUser | null {
   } catch {
     return null;
   }
-}
-
-function readRegisteredUsers(): RegisteredUser[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(USERS_KEY);
-    return raw ? (JSON.parse(raw) as RegisteredUser[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveRegisteredUsers(users: RegisteredUser[]) {
-  window.localStorage.setItem(USERS_KEY, JSON.stringify(users));
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -128,28 +108,54 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
   }, []);
 
-  const register = useCallback((email: string, password: string): RegisterResult => {
-    const trimmedEmail = email.trim();
+  const register = useCallback(
+    async (email: string, password: string): Promise<RegisterResult> => {
+      const trimmedEmail = email.trim();
 
-    if (!trimmedEmail || !password) {
-      return { success: false, error: "กรุณากรอกอีเมลและรหัสผ่านให้ครบถ้วน" };
-    }
+      if (!trimmedEmail || !password) {
+        return { success: false, error: "กรุณากรอกอีเมลและรหัสผ่านให้ครบถ้วน" };
+      }
 
-    // TODO: ตรงนี้คือจุดที่ควรเรียก API สมัครสมาชิกจริง
-    // ตอนนี้ mock ไว้ก่อนด้วยการเก็บลง localStorage
-    const users = readRegisteredUsers();
-    const alreadyExists = users.some(
-      (u) => u.email.toLowerCase() === trimmedEmail.toLowerCase()
-    );
+      let response: Response;
+      try {
+        response = await fetch("/api/v1/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: trimmedEmail, password }),
+        });
+      } catch {
+        return {
+          success: false,
+          error: "ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ กรุณาลองใหม่อีกครั้ง",
+        };
+      }
 
-    if (alreadyExists) {
-      return { success: false, error: "อีเมลนี้ถูกลงทะเบียนไว้แล้ว" };
-    }
+      let data: { code?: string; message?: string };
+      try {
+        data = await response.json();
+      } catch {
+        data = {};
+      }
 
-    users.push({ email: trimmedEmail, password });
-    saveRegisteredUsers(users);
-    return { success: true };
-  }, []);
+      if (response.status === 409 && data.code === "EMAIL_ALREADY_EXISTS") {
+        return { success: false, error: "อีเมลนี้ถูกลงทะเบียนไว้แล้ว" };
+      }
+
+      if (response.status === 400) {
+        return {
+          success: false,
+          error: data.message || "ข้อมูลการลงทะเบียนไม่ถูกต้อง",
+        };
+      }
+
+      if (!response.ok) {
+        return { success: false, error: "ลงทะเบียนไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" };
+      }
+
+      return { success: true };
+    },
+    []
+  );
 
   const value: AuthContextValue = {
     user,
