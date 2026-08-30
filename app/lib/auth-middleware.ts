@@ -9,9 +9,33 @@ export interface AuthPayload {
   role: string;
 }
 
+export const ACCOUNT_SUSPENDED_MESSAGE =
+  "บัญชีนี้ถูกระงับ โปรดติดต่อผู้ดูแลระบบที่ [email]";
+
 export interface AuthError {
   status: number;
   message: string;
+  code?: string;
+}
+
+export function isAuthError(result: unknown): result is AuthError {
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    "status" in result &&
+    "message" in result
+  );
+}
+
+export function authErrorResponse(auth: AuthError): Response {
+  return Response.json(
+    {
+      success: false,
+      message: auth.message,
+      ...(auth.code ? { code: auth.code } : {}),
+    },
+    { status: auth.status }
+  );
 }
 
 /**
@@ -76,7 +100,11 @@ export async function verifyAuth(
   }
 
   if (user.status !== "ACTIVE") {
-    return { status: 403, message: "Account is disabled" };
+    return {
+      status: 403,
+      code: "ACCOUNT_SUSPENDED",
+      message: ACCOUNT_SUSPENDED_MESSAGE,
+    };
   }
 
   return { userId: user.id, email: user.email, role: user.role };

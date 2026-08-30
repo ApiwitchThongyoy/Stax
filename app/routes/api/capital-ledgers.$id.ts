@@ -2,7 +2,7 @@ import { eq, and } from "drizzle-orm";
 import type { Route } from "./+types/capital-ledgers.$id";
 import { db } from "~/lib/drizzle-db";
 import { capitalTransactions } from "~/db/schema";
-import { verifyAuth } from "~/lib/auth-middleware";
+import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"];
@@ -31,10 +31,7 @@ function validateAmount(value: unknown, fieldName: string): string | null {
 export async function loader({ request, params }: Route.LoaderArgs) {
   const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
-    return Response.json(
-      { success: false, message: auth.message },
-      { status: auth.status }
-    );
+    return authErrorResponse(auth);
   }
 
   const { id } = params;
@@ -78,10 +75,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
 export async function action({ request, params }: Route.ActionArgs) {
   const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
-    return Response.json(
-      { success: false, message: auth.message },
-      { status: auth.status }
-    );
+    return authErrorResponse(auth);
   }
 
   const { id } = params;

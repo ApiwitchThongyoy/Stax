@@ -1,5 +1,5 @@
 import type { Route } from "./+types/upload";
-import { verifyAuth } from "~/lib/auth-middleware";
+import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import { saveStatementPdf } from "~/lib/storage/statement-storage";
 import { extractTextFromPdf } from "~/lib/pdf-text-extractor";
 import {
@@ -35,10 +35,7 @@ export async function action({ request }: Route.ActionArgs) {
 
   const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
-    return Response.json(
-      { success: false, message: auth.message },
-      { status: auth.status }
-    );
+    return authErrorResponse(auth);
   }
 
   let formData: FormData;

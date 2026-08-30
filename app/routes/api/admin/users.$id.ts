@@ -2,7 +2,7 @@ import { eq } from "drizzle-orm";
 import type { Route } from "./+types/users.$id";
 import { db } from "~/lib/drizzle-db";
 import { users } from "~/db/schema";
-import { verifyAuth } from "~/lib/auth-middleware";
+import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 const VALID_STATUSES = ["ACTIVE", "SUSPENDED"];
@@ -35,10 +35,7 @@ export async function action({ request, params }: Route.ActionArgs) {
 
   const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
-    return Response.json(
-      { success: false, message: auth.message },
-      { status: auth.status }
-    );
+    return authErrorResponse(auth);
   }
 
   if (auth.role !== "ADMIN") {
@@ -83,6 +80,28 @@ export async function action({ request, params }: Route.ActionArgs) {
       {
         success: false,
         message: `status must be one of: ${VALID_STATUSES.join(", ")}`,
+      },
+      { status: 400 }
+    );
+  }
+
+  if (auth.userId === id && status === "SUSPENDED") {
+    await insertAuditLog({
+      userId: auth.userId,
+      action: AuditAction.ADMIN_USER_STATUS_UPDATE,
+      entityType: "User",
+      entityId: id,
+      details: {
+        route: `/api/v1/admin/users/${id}`,
+        method: "PATCH",
+        result: "rejected",
+        reason: "self_suspend_forbidden",
+      },
+    });
+    return Response.json(
+      {
+        success: false,
+        message: "ไม่สามารถระงับบัญชีผู้ดูแลระบบที่กำลังใช้งานอยู่ได้",
       },
       { status: 400 }
     );

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { Route } from "./+types/capital-ledgers";
 import { db } from "~/lib/drizzle-db";
 import { capitalTransactions } from "~/db/schema";
-import { verifyAuth, type AuthPayload } from "~/lib/auth-middleware";
+import { verifyAuth, type AuthPayload, authErrorResponse } from "~/lib/auth-middleware";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"];
@@ -32,10 +32,7 @@ function validateAmount(value: unknown, fieldName: string): string | null {
 export async function loader({ request }: Route.LoaderArgs) {
   const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
-    return Response.json(
-      { success: false, message: auth.message },
-      { status: auth.status }
-    );
+    return authErrorResponse(auth);
   }
 
   try {
@@ -58,10 +55,7 @@ export async function loader({ request }: Route.LoaderArgs) {
 export async function action({ request }: Route.ActionArgs) {
   const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
-    return Response.json(
-      { success: false, message: auth.message },
-      { status: auth.status }
-    );
+    return authErrorResponse(auth);
   }
 
   if (request.method === "POST") {

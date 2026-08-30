@@ -2,7 +2,7 @@ import { and, eq, gte, sql } from "drizzle-orm";
 import type { Route } from "./+types/stats";
 import { db } from "~/lib/drizzle-db";
 import { users, documents } from "~/db/schema";
-import { verifyAuth } from "~/lib/auth-middleware";
+import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
   return (
@@ -16,10 +16,7 @@ function isAuthError(result: unknown): result is { status: number; message: stri
 export async function loader({ request }: Route.LoaderArgs) {
   const auth = await verifyAuth(request);
   if (isAuthError(auth)) {
-    return Response.json(
-      { success: false, message: auth.message },
-      { status: auth.status }
-    );
+    return authErrorResponse(auth);
   }
 
   if (auth.role !== "ADMIN") {
