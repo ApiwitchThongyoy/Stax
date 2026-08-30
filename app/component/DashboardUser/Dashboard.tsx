@@ -7,7 +7,7 @@ import {
   Users,
   Settings,
   HelpCircle,
-  LogOut,
+  Archive,
   Plus,
   Pencil,
   Trash2,
@@ -21,12 +21,16 @@ import { useNavigate } from "react-router";
 import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตรง
 import { useSuspendedAccount } from "../../lib/suspended-account";
 import { usePresenceHeartbeat } from "../../lib/usePresenceHeartbeat";
+import { useTheme } from "../../lib/useTheme";
+import ThemeToggle from "../ThemeToggle";
 import PdfStatementUploader from "./PdfStatementUploader";
 import StoredDocumentsList from "./Storeddocumentslist";
 import DailyCalendarExport from "./Dailycalendarexport";
 import CapitalLedgerPage from "../Ledger/CapitalLedgerPage";
 import SettingsPage from "./SettingsPage";
 import NotificationBell from "./NotificationBell";
+import StatementArchivePage from "./StatementArchivePage";
+import FxAiPage from "./FxAiPage";
 import type { ExtractedTransaction } from "../../lib/pdfStatementParser";
 import type { Transaction } from "../../lib/Financeutils";
 import { formatMoney, toDisplayDate, parseRateString } from "../../lib/Financeutils";
@@ -34,13 +38,14 @@ import { formatMoney, toDisplayDate, parseRateString } from "../../lib/Financeut
 // ไม่มีข้อมูลตัวอย่างแล้ว — สมุดบัญชีเริ่มต้นว่างเปล่า รอผู้ใช้ import ไฟล์ statement จริง
 const initialTransactions: Transaction[] = [];
 
-type NavId = "dashboard" | "ledger" | "fx" | "users" | "settings";
+type NavId = "dashboard" | "ledger" | "fx" | "users" | "settings" | "archive";
 
 const navItems: { id: NavId; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "dashboard", label: "แดชบอร์ด", icon: LayoutDashboard },
   { id: "ledger", label: "สมุดบัญชี", icon: BookOpen },
   { id: "fx", label: "อัตราแลกเปลี่ยน AI", icon: TrendingUp },
   { id: "users", label: "ปฏิทิน", icon: CalendarDays },
+  { id: "archive", label: "คลัง Statement", icon: Archive },
 ];
 
 interface DashboardProps {
@@ -50,7 +55,7 @@ interface DashboardProps {
 export default function Dashboard({ userEmail }: DashboardProps) {
   const navigate = useNavigate();
   const { logout, user } = useAuth();
-  const [activeTab, setActiveTab] = useState("stax");
+  const { theme, toggleTheme } = useTheme();
   const [activeNav, setActiveNav] = useState<NavId>("dashboard");
   const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions);
   const [docsRefreshKey, setDocsRefreshKey] = useState(0);
@@ -155,7 +160,11 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const isGain = fxGainLoss >= 0;
 
   return (
-    <div className="min-h-screen w-full bg-gray-50 flex">
+    <div
+      className={`min-h-screen w-full bg-gray-50 flex ${
+        theme === "dark" ? "dark" : ""
+      }`}
+    >
       {/* Sidebar */}
       <aside className="hidden md:flex w-60 shrink-0 flex-col bg-white border-r border-gray-100">
         <div className="flex items-center gap-2.5 px-5 py-5 border-b border-gray-100">
@@ -225,28 +234,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
       {/* Main content */}
       <div className="flex-1 min-w-0 flex flex-col">
         {/* Top bar */}
-        <header className="flex items-center justify-between px-6 py-4 bg-white border-b border-gray-100">
-          <div className="flex items-center gap-6">
-            {[
-              { id: "stax", label: "STAX" },
-              { id: "insights", label: "สังเคราะห์" },
-              { id: "guide", label: "คู่มือ" },
-            ].map((tab) => (
-              <button
-                key={tab.id}
-                type="button"
-                onClick={() => setActiveTab(tab.id)}
-                className={`text-sm font-medium pb-1 border-b-2 transition ${
-                  activeTab === tab.id
-                    ? "text-blue-900 border-blue-900"
-                    : "text-gray-400 border-transparent hover:text-gray-600"
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
+        <header className="flex items-center justify-end px-6 py-4 bg-white border-b border-gray-100">
           <div className="flex items-center gap-3">
             <NotificationBell />
             <button
@@ -257,14 +245,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             >
               <Settings className="w-4 h-4" />
             </button>
-            <button
-              type="button"
-              onClick={handleLogout}
-              className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-red-600 transition px-2"
-            >
-              <LogOut className="w-4 h-4" />
-              ออกจากระบบ
-            </button>
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
           </div>
         </header>
 
@@ -274,8 +255,16 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             <DailyCalendarExport transactions={transactions} />
           ) : activeNav === "ledger" ? (
             <CapitalLedgerPage />
+          ) : activeNav === "fx" ? (
+            <FxAiPage
+              transactions={transactions}
+              onImport={handleImportFromPdf}
+              onDocumentSaved={() => setDocsRefreshKey((k) => k + 1)}
+            />
           ) : activeNav === "settings" ? (
-            <SettingsPage />
+            <SettingsPage onLogout={handleLogout} />
+          ) : activeNav === "archive" ? (
+            <StatementArchivePage />
           ) : (
             <>
               {/* Welcome banner */}
