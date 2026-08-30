@@ -36,7 +36,7 @@ import {
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
 import { readAdminSession } from "../../lib/admin-auth";
-import { clearAdminSession } from "../../lib/session";
+import { clearAdminSession, clearAllSessions, isSuspendedResponse } from "../../lib/session";
 import { usePresenceHeartbeat } from "../../lib/usePresenceHeartbeat";
 import { useAdminUsersPolling, type AdminUsersApiRow } from "../../lib/useAdminUsersPolling";
 
@@ -242,7 +242,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   });
 
   const handleLogout = () => {
-    sessionStorage.removeItem("stax_admin_session");
+    clearAllSessions();
     navigate("/admin/login", { replace: true });
   };
 
@@ -262,6 +262,18 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
         fetch("/api/v1/admin/documents", { headers }),
         fetch("/api/v1/admin/audit-logs?limit=100", { headers }),
       ]);
+
+      for (const res of [userRes, statsRes, docRes, auditRes]) {
+        if (await isSuspendedResponse(res)) {
+          clearAdminSession();
+          navigate("/admin/login", {
+            replace: true,
+            state: { suspended: true },
+          });
+          setLoading(false);
+          return;
+        }
+      }
 
       const userJson = await userRes.json().catch(() => null);
       const statsJson = await statsRes.json().catch(() => null);
