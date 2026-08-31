@@ -9,6 +9,7 @@ import {
   timestamp,
   jsonb,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 export const users = pgTable("User", {
   id: text("id").primaryKey(),
@@ -52,13 +53,28 @@ export const documents = pgTable(
       .notNull()
       .references(() => users.id),
     originalName: text("original_name").notNull(),
+    // SHA-256 of the uploaded file bytes, used for user-scoped duplicate
+    // detection. Nullable so existing historical rows (created before this
+    // column existed) migrate cleanly and never fail a UNIQUE/backfill step.
+    // New uploads always set it. See statement-storage.ts and the upload route.
+    contentHash: text("content_hash"),
     filePath: text("file_path").notNull(),
     mimeType: text("mime_type").notNull(),
     fileSize: integer("file_size").notNull(),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
-  (table) => [index("documents_user_id_idx").on(table.userId)]
+  (table) => [
+    index("documents_user_id_idx").on(table.userId),
+    // Partial UNIQUE index: enforces one document per (user, content hash) for
+    // hashed rows only. Existing historical rows carry a NULL hash (excluded,
+    // so the migration never fails on pre-existing duplicates), while new
+    // imports get a hard DB-level guarantee against concurrent duplicate
+    // inserts. The WHERE clause keeps it safe to add without cleaning data.
+    uniqueIndex("documents_user_content_hash_key")
+      .on(table.userId, table.contentHash)
+      .where(sql`${table.contentHash} IS NOT NULL`),
+  ]
 );
 
 export const dailyTaxSummaries = pgTable(

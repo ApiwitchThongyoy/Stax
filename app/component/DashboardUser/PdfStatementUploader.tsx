@@ -165,6 +165,11 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved, onGemi
       }
 
       const res = data.data;
+      if (res.code === "STATEMENT_ALREADY_IMPORTED") {
+        setServerStatus("saved");
+        setServerMessage("Statement นี้เคยถูกนำเข้าแล้ว จึงไม่มีการเพิ่มรายการซ้ำ");
+        return;
+      }
       if (res.ai) {
         const ai = res.ai as AiResult;
         saveLatestGeminiAnalysis(ai);

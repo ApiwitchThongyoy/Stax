@@ -43,6 +43,9 @@ const dashboard = read("app/component/DashboardUser/Dashboard.tsx");
 const fx = read("app/component/DashboardUser/FxAiPage.tsx");
 const uploader = read("app/component/DashboardUser/PdfStatementUploader.tsx");
 const uploadRoute = read("app/routes/api/statements/upload.ts");
+const dbSchema = read("app/db/schema.ts");
+const statementHash = read("app/lib/statement-hash.ts");
+const migration = read("drizzle/0006_add_document_content_hash.sql");
 
 // ---------------------------------------------------------------------------
 // 1. No stale fake placeholder values anywhere in the user UI.
@@ -215,6 +218,54 @@ ok(
     }
   })(),
   "schema-invalid Gemini output is rejected by the server validator"
+);
+
+// ---------------------------------------------------------------------------
+// 6. Duplicate Statement import — content-hash guard wiring (W3).
+// ---------------------------------------------------------------------------
+ok(
+  dbSchema.includes("contentHash") && dbSchema.includes("content_hash"),
+  "documents schema declares a content-hash column"
+);
+ok(
+  dbSchema.includes("documents_user_content_hash_key") &&
+    dbSchema.includes("IS NOT NULL"),
+  "documents schema declares a partial unique (user, content hash) index"
+);
+ok(
+  migration.includes('ADD COLUMN "content_hash" text') &&
+    migration.includes("CREATE UNIQUE INDEX") &&
+    migration.includes("WHERE") &&
+    migration.includes("content_hash") ,
+  "migration adds the nullable content_hash column + partial unique index (safe for existing rows)"
+);
+ok(
+  statementHash.includes("computeContentHash") &&
+    statementHash.includes("STATEMENT_ALREADY_IMPORTED") &&
+    statementHash.includes("buildDuplicatePayload"),
+  "pure hash + duplicate-payload helpers exist"
+);
+ok(
+  uploadRoute.includes("computeContentHash") &&
+    uploadRoute.includes("findExistingDocumentByHash") &&
+    uploadRoute.includes("buildDuplicatePayload"),
+  "upload route computes hash, checks user-scoped duplicates, returns duplicate payload"
+);
+ok(
+  uploadRoute.includes("buildDuplicatePayload") &&
+    statementHash.includes("STATEMENT_ALREADY_IMPORTED") &&
+    statementHash.includes("duplicate: true") &&
+    statementHash.includes('message: "Statement นี้เคยถูกนำเข้าแล้ว"'),
+  "upload route returns STATEMENT_ALREADY_IMPORTED duplicate response"
+);
+ok(
+  uploader.includes("STATEMENT_ALREADY_IMPORTED") &&
+    uploader.includes("Statement นี้เคยถูกนำเข้าแล้ว จึงไม่มีการเพิ่มรายการซ้ำ"),
+  "uploader surfaces a clear Thai duplicate message (not a generic failure)"
+);
+ok(
+  !uploader.includes("Statement นี้เคยถูกนำเข้าแล้ว") === false,
+  "uploader does not regress the duplicate message"
 );
 
 console.log("\n================ SUMMARY ================");
