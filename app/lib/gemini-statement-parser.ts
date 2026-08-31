@@ -13,7 +13,7 @@ import { z } from "zod";
  * Default model used when GEMINI_MODEL is not configured in the environment.
  * This is a documented server-side default constant — never a credential.
  */
-export const DEFAULT_GEMINI_MODEL = "gemini-2.0-flash";
+export const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
 
 export const GeminiErrorCode = {
   NOT_CONFIGURED: "GEMINI_NOT_CONFIGURED",
@@ -56,6 +56,28 @@ const decimalStringSchema = z
   .trim()
   .regex(/^-?\d+(\.\d+)?$/, "must be a valid finite decimal string");
 
+// Normalizes a finite JSON number to its canonical decimal string form. Gemini
+// structured output sometimes emits monetary values as numbers despite the
+// STRING contract (model-dependent). Accepting the number is a compatibility
+// normalization, NOT a validation weakening: the decimal regex still rejects
+// any malformed value after coercion. Null/undefined/missing pass through.
+function moneyAsDecimalString(v: unknown): unknown {
+  if (v === null || v === undefined || typeof v === "string") return v;
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  return v;
+}
+
+// Normalizes a numeric string (e.g. "0.9") into a number for confidence, and
+// passes through real numbers and null/undefined.
+function percentAsNumber(v: unknown): unknown {
+  if (v === null || v === undefined || typeof v === "number") return v;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    if (!Number.isNaN(n)) return n;
+  }
+  return v;
+}
+
 const isoDateSchema = z
   .string()
   .trim()
@@ -79,10 +101,19 @@ const geminiTransactionSchema = z
           .string()
           .regex(/^[A-Z]{2,3}$/, "currency must be 2-3 uppercase letters")
       ),
-    amount: decimalStringSchema,
-    exchangeRate: decimalStringSchema.nullable().optional(),
-    amountThb: decimalStringSchema.nullable().optional(),
-    confidence: z.number().min(0).max(1).nullable().optional(),
+    amount: z.preprocess(moneyAsDecimalString, decimalStringSchema),
+    exchangeRate: z
+      .preprocess(moneyAsDecimalString, decimalStringSchema)
+      .nullable()
+      .optional(),
+    amountThb: z
+      .preprocess(moneyAsDecimalString, decimalStringSchema)
+      .nullable()
+      .optional(),
+    confidence: z
+      .preprocess(percentAsNumber, z.number().min(0).max(1))
+      .nullable()
+      .optional(),
   })
   .strict();
 
