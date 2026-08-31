@@ -325,13 +325,16 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                     <span className="text-xs text-gray-400">
                       อัตราแลกเปลี่ยนแบบเรียลไทม์ (USD/THB)
                     </span>
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-500 font-medium">
-                      Live BOT API
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium">
+                      NOT AVAILABLE
                     </span>
                   </div>
-                  <p className="text-xl font-semibold text-gray-800">35.42</p>
+                  <p className="text-xl font-semibold text-gray-800">
+                    ยังไม่ได้เชื่อมต่อ BOT API
+                  </p>
                   <p className="text-[11px] text-gray-400 mt-3">
-                    อัปเดตล่าสุด 2 นาทีที่แล้ว
+                    อัตราแบบเรียลไทม์จะแสดงที่นี่เมื่อเชื่อมต่อ BOT API กับ
+                    backend แล้ว
                   </p>
                 </div>
 
@@ -340,12 +343,16 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                     <span className="text-xs text-gray-400">
                       ประมาณการภาษีที่ต้องชำระ
                     </span>
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 font-medium">
-                      ใกล้ครบกำหนด
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium">
+                      NOT AVAILABLE
                     </span>
                   </div>
                   <p className="text-xl font-semibold text-gray-800">
-                    $4,120.35
+                    ยังไม่สามารถคำนวณภาษีได้
+                  </p>
+                  <p className="text-[11px] text-gray-400 mt-3">
+                    Tax Core Engine พร้อมใช้งาน แต่ข้อมูลธุรกรรมปัจจุบันยังไม่
+                    สามารถคำนวณภาษีได้
                   </p>
                 </div>
               </div>
@@ -491,15 +498,12 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                       ข้อเสนอแนะจาก AI
                     </p>
                     <p className="text-sm text-emerald-900 leading-relaxed">
-                      รายจ่ายด้านซอฟต์แวร์เดือนนี้สูงกว่าค่าเฉลี่ย 18%
-                      แนะนำให้ตรวจสอบใบสมัครที่ไม่ได้ใช้งาน
+                      ยังไม่มีคำแนะนำจาก AI (NOT AVAILABLE)
                     </p>
-                    <button
-                      type="button"
-                      className="text-xs text-emerald-700 font-medium hover:underline mt-2"
-                    >
-                      ดูรายละเอียด
-                    </button>
+                    <p className="text-xs text-emerald-700/80 mt-2">
+                      AI ใช้วิเคราะห์โครงสร้างของ Statement เท่านั้น
+                      ไม่ใช่การคาดการณ์คำแนะนำด้านการเงิน
+                    </p>
                   </div>
                 </div>
               </div>

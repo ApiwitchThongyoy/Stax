@@ -12,12 +12,15 @@ import {
   saveCostBasis,
   type ExtractedTransaction,
 } from "../../lib/pdfStatementParser";
+import type { AiResult } from "../../lib/ai-result";
+import { saveLatestGeminiAnalysis } from "../../lib/gemini-analysis-storage";
 
 type Status = "idle" | "processing" | "error";
 
 interface PdfStatementUploaderProps {
   onImport: (transactions: ExtractedTransaction[]) => void;
   onDocumentSaved?: () => void;
+  onGeminiResult?: (ai: AiResult) => void;
 }
 
 function SkeletonRow() {
@@ -35,7 +38,7 @@ function SkeletonRow() {
   );
 }
 
-export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfStatementUploaderProps) {
+export default function PdfStatementUploader({ onImport, onDocumentSaved, onGeminiResult }: PdfStatementUploaderProps) {
   const [status, setStatus] = useState<Status>("idle");
   const [isDragActive, setIsDragActive] = useState(false);
   const [fileName, setFileName] = useState("");
@@ -162,6 +165,11 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved }: PdfS
       }
 
       const res = data.data;
+      if (res.ai) {
+        const ai = res.ai as AiResult;
+        saveLatestGeminiAnalysis(ai);
+        onGeminiResult?.(ai);
+      }
       if (res.duplicates) {
         setServerStatus("saved");
         setServerMessage("เอกสารนี้เคยบันทึกแล้ว ไม่เพิ่มรายการซ้ำ");
