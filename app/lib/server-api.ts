@@ -86,6 +86,28 @@ export async function fetchUserDocuments(
 }
 
 /**
+ * Delete one of the authenticated user's Statements on the server.
+ *
+ * The server is authoritative: it removes the document row AND the transactions
+ * that originate from that exact document (user-scoped, atomic). Returns the
+ * deleted document id on success, or throws with a stable message on failure.
+ */
+export async function deleteUserDocument(
+  accessToken: string,
+  documentId: string
+): Promise<string> {
+  const res = await fetch(`/api/v1/documents/${documentId}`, {
+    method: "DELETE",
+    headers: authHeaders(accessToken),
+  });
+  const out = await okJson<{ id?: string }>(res);
+  if (!out.ok || !out.data?.id) {
+    throw new Error(out.message || "Failed to delete the statement");
+  }
+  return out.data.id;
+}
+
+/**
  * Map a server Capital_Transactions row into the frontend Transaction shape
  * used by the Dashboard, FX page and Calendar.
  *

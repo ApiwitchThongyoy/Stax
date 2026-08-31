@@ -31,6 +31,7 @@ export default [
   route("api/v1/statements/upload", "routes/api/statements/upload.ts"),
 
   route("api/v1/documents", "routes/api/documents.ts"),
+  route("api/v1/documents/:id", "routes/api/documents.$id.ts"),
 
   route("api/v1/tax/calculate", "routes/api/tax/calculate.ts"),
 

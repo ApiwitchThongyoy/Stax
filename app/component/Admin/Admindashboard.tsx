@@ -52,6 +52,7 @@ interface AdminUserRow {
   name: string;
   email: string;
   role: string;
+  rawRole: string;
   status: UserStatus;
   joinedAt: string;
   lastSeenAt: string | null;
@@ -139,6 +140,7 @@ function rowToAdminUserRow(u: AdminUsersApiRow): AdminUserRow {
     name: displayNameFromEmail(u.email),
     email: u.email,
     role: ROLE_LABEL[u.role] ?? u.role,
+    rawRole: u.role,
     status: u.status === "SUSPENDED" ? "suspended" : "active",
     joinedAt: "",
     lastSeenAt: u.lastSeenAt ?? null,
@@ -203,7 +205,6 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   const displayName = emailPrefix.charAt(0).toUpperCase() + emailPrefix.slice(1);
   const adminSession = readAdminSession();
   const adminToken = adminSession?.accessToken ?? null;
-  const currentAdminId = adminSession?.user?.id ?? null;
 
   // ADMIN presence: while the admin dashboard is active, keep this admin's
   // last_seen_at fresh (heartbeat) so THEY show as ONLINE in the user table.
@@ -299,6 +300,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
           name: displayNameFromEmail(u.email),
           email: u.email,
           role: ROLE_LABEL[u.role] ?? u.role,
+          rawRole: u.role,
           status: u.status === "SUSPENDED" ? "suspended" : "active",
           joinedAt: "",
           lastSeenAt: u.lastSeenAt ?? null,
@@ -381,7 +383,10 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
     const current = users.find((u) => u.id === id);
     if (!current) return;
     const nextStatus = current.status === "active" ? "SUSPENDED" : "ACTIVE";
-    if (id === currentAdminId && nextStatus === "SUSPENDED") return;
+    // Only role USER accounts may be suspended/reactivated. The backend enforces
+    // this authoritatively; this guard is extra safety so an ADMIN row can never
+    // be toggled from the UI even if a stale button were somehow invoked.
+    if (current.rawRole !== "USER") return;
 
     setTogglingId(id);
     try {
@@ -455,7 +460,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
 
   return (
     <div
-      className={`min-h-screen w-full bg-gray-50 flex ${
+      className={`h-screen w-full bg-gray-50 flex overflow-hidden ${
         theme === "dark" ? "dark" : ""
       }`}
     >
@@ -523,7 +528,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
       </aside>
 
       {/* Main content */}
-      <div className="flex-1 min-w-0 flex flex-col">
+      <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
         {/* Top bar */}
         <header className="flex items-center justify-between px-6 py-4 bg-white border-b border-gray-100">
           <div>
@@ -805,9 +810,13 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                           </td>
                           <td className="px-5 py-3.5">
                             <div className="flex items-center justify-end">
-                              {u.id === currentAdminId ? (
-                                <span className="text-[11px] text-gray-400 font-medium px-1.5">
-                                  คุณ (บัญชีผู้ดูแลระบบปัจจุบัน)
+                              {u.rawRole === "ADMIN" ? (
+                                <span
+                                  className="inline-flex items-center gap-1.5 text-[11px] text-gray-400 font-medium px-2.5 py-1.5 rounded-lg cursor-default"
+                                  title="ไม่สามารถระงับหรือเปิดใช้งานบัญชีผู้ดูแลระบบได้"
+                                >
+                                  <ShieldCheck className="w-3.5 h-3.5" />
+                                  ผู้ดูแลระบบ
                                 </span>
                               ) : (
                                 <button

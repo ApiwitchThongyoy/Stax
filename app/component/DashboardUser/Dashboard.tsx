@@ -166,7 +166,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
 
   return (
     <div
-      className={`min-h-screen w-full bg-gray-50 flex ${
+      className={`h-screen w-full bg-gray-50 flex overflow-hidden ${
         theme === "dark" ? "dark" : ""
       }`}
     >
@@ -237,7 +237,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
       </aside>
 
       {/* Main content */}
-      <div className="flex-1 min-w-0 flex flex-col">
+      <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
         {/* Top bar */}
         <header className="flex items-center justify-end px-6 py-4 bg-white border-b border-gray-100">
           <div className="flex items-center gap-3">
@@ -269,7 +269,9 @@ export default function Dashboard({ userEmail }: DashboardProps) {
           ) : activeNav === "settings" ? (
             <SettingsPage onLogout={handleLogout} />
           ) : activeNav === "archive" ? (
-            <StatementArchivePage />
+            <StatementArchivePage
+              onDocumentDeleted={() => setDocsRefreshKey((k) => k + 1)}
+            />
           ) : (
             <>
               {/* Welcome banner */}

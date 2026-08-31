@@ -35,6 +35,7 @@ const adminUsersRoute = await import("../app/routes/api/admin/users");
 const adminUserRoute = await import("../app/routes/api/admin/users.$id");
 const uploadRoute = await import("../app/routes/api/statements/upload");
 const documentsRoute = await import("../app/routes/api/documents");
+const documentRoute = await import("../app/routes/api/documents.$id");
 const taxCalculateRoute = await import("../app/routes/api/tax/calculate");
 
 const { AuditAction } = await import("../app/lib/audit-log");
@@ -260,6 +261,139 @@ async function main() {
       request: authedRequest("GET", tokenAd),
     } as never);
     ok(adminListRes.status === 200, "W2-9: ADMIN can access admin users API");
+  }
+
+  // ================= W2-9: USER-SCOPED STATEMENT DELETE =================
+  // DELETE /api/v1/documents/:id must remove ONLY the caller's document and the
+  // transactions from that exact source_document_id — never another user's
+  // document, and never same-looking transactions from a different document.
+  {
+    const docX = "00000000-0000-0000-0000-0000000000e1"; // USER A's own doc
+    const docY = "00000000-0000-0000-0000-0000000000e2"; // USER A's other doc
+    const txnX = "00000000-0000-0000-0000-0000000000f1"; // tx from docX
+    const txnY = "00000000-0000-0000-0000-0000000000f2"; // same-looking tx from docY
+    const now = new Date().toISOString();
+
+    // user A owns both docs; user B owns docB (from earlier block, still present)
+    if (userARow) {
+      await client`DELETE FROM documents WHERE id IN (${docX}, ${docY})`;
+      await client`DELETE FROM "Capital_Transactions" WHERE transaction_id IN (${txnX}, ${txnY})`;
+      await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                   VALUES (${docX}, ${userARow.id}, 'X.PDF', '/tmp/delete-x.pdf', 'application/pdf', 100, ${now}, ${now})`;
+      await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                   VALUES (${docY}, ${userARow.id}, 'Y.PDF', '/tmp/delete-y.pdf', 'application/pdf', 200, ${now}, ${now})`;
+      // Two transactions that LOOK identical (same date/amount) but come from
+      // different source documents docX vs docY.
+      await client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, fx_rate_bot, amount_thb, type, source_type, source_document_id)
+                   VALUES (${txnX}, ${userARow.id}, '5000.00', 'THB', '2026-01-30', '1', '5000.00', 'CASH_IN', 'AI_PARSED', ${docX})`;
+      await client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, fx_rate_bot, amount_thb, type, source_type, source_document_id)
+                   VALUES (${txnY}, ${userARow.id}, '5000.00', 'THB', '2026-01-30', '1', '5000.00', 'CASH_IN', 'AI_PARSED', ${docY})`;
+    }
+
+    // missing document -> safe 404
+    const missingRes = await documentRoute.action({
+      request: authedRequest("DELETE", tokenA),
+      params: { id: "00000000-0000-0000-0000-000000000099" },
+    } as never);
+    ok(missingRes.status === 404, "REG: deleting a missing document returns 404");
+
+    if (tokenB) {
+      // USER B tries to delete USER A's document -> must be denied (404, no leak)
+      const crossRes = await documentRoute.action({
+        request: authedRequest("DELETE", tokenB),
+        params: { id: docX },
+      } as never);
+      ok(crossRes.status === 404, "REG: another user cannot delete USER A's document (404)");
+    }
+
+    if (tokenA) {
+      const delRes = await documentRoute.action({
+        request: authedRequest("DELETE", tokenA),
+        params: { id: docX },
+      } as never);
+      ok(delRes.status === 200 && (await (delRes.clone().json() as Promise<{ success?: boolean }>)).success === true,
+        "REG: USER A deletes their own document successfully");
+
+      const docXrows = await client`SELECT * FROM documents WHERE id = ${docX}`;
+      ok(docXrows.length === 0, "REG: deleted document row is gone");
+      const txnXrows = await client`SELECT * FROM "Capital_Transactions" WHERE transaction_id = ${txnX}`;
+      ok(txnXrows.length === 0, "REG: transactions from the deleted source document are removed");
+
+      // Other document + its same-looking transaction must survive
+      const docYrows = await client`SELECT * FROM documents WHERE id = ${docY}`;
+      ok(docYrows.length === 1, "REG: other document remains after delete");
+      const txnYrows = await client`SELECT * FROM "Capital_Transactions" WHERE transaction_id = ${txnY}`;
+      ok(txnYrows.length === 1, "REG: same-looking transaction from another document is preserved (not value-deduped)");
+    }
+
+    // cleanup the surviving docY + txnY
+    await client`DELETE FROM "Capital_Transactions" WHERE transaction_id IN (${txnX}, ${txnY})`;
+    await client`DELETE FROM documents WHERE id IN (${docX}, ${docY})`;
+  }
+
+  // ================= W2-9: ADMIN STATUS LOCK (only USER may be toggled) =================
+  {
+    const adminBEmail = "w1adminb@test.local";
+    const adminBId = "00000000-0000-0000-0000-0000000000ab";
+    await client`DELETE FROM "User" WHERE id = ${adminBId}`;
+    await client`INSERT INTO "User" (id, email, password_hash, role, status)
+                 VALUES (${adminBId}, ${adminBEmail}, '$2b$10$placeholderhashplaceholderplaceholder', 'ADMIN', 'ACTIVE')`;
+
+    // USER -> admin PATCH -> forbidden
+    if (tokenA) {
+      const userPatch = await adminUserRoute.action({
+        request: jsonBody({ status: "SUSPENDED" }, "PATCH", tokenA),
+        params: { id: userBRow?.id ?? "" },
+      } as never);
+      ok(userPatch.status === 403, "REG: non-admin USER calling admin status PATCH is forbidden");
+    }
+
+    if (tokenAd && adminRow) {
+      // ADMIN suspends SELF -> rejected
+      const selfRes = await adminUserRoute.action({
+        request: jsonBody({ status: "SUSPENDED" }, "PATCH", tokenAd),
+        params: { id: adminRow.id },
+      } as never);
+      ok(selfRes.status === 400, "REG: ADMIN suspending itself is rejected");
+
+      // ADMIN A suspends ADMIN B -> rejected
+      const otherAdminRes = await adminUserRoute.action({
+        request: jsonBody({ status: "SUSPENDED" }, "PATCH", tokenAd),
+        params: { id: adminBId },
+      } as never);
+      ok(otherAdminRes.status === 400, "REG: ADMIN suspending another ADMIN is rejected");
+
+      // ADMIN A reactivates ADMIN B -> also rejected
+      const otherAdminAct = await adminUserRoute.action({
+        request: jsonBody({ status: "ACTIVE" }, "PATCH", tokenAd),
+        params: { id: adminBId },
+      } as never);
+      ok(otherAdminAct.status === 400, "REG: ADMIN reactivating another ADMIN is rejected");
+
+      // ADMIN B's status must remain unchanged (ACTIVE)
+      const adminBRow = await client`SELECT * FROM "User" WHERE id = ${adminBId}`;
+      ok(adminBRow[0]?.status === "ACTIVE", "REG: ADMIN B status is unchanged after rejected mutations");
+
+      // ADMIN suspends a USER -> succeeds
+      if (userBRow) {
+        const suspRes = await adminUserRoute.action({
+          request: jsonBody({ status: "SUSPENDED" }, "PATCH", tokenAd),
+          params: { id: userBRow.id },
+        } as never);
+        ok(suspRes.status === 200, "REG: ADMIN suspending a USER succeeds");
+
+        // ADMIN reactivates a USER -> succeeds
+        const actRes = await adminUserRoute.action({
+          request: jsonBody({ status: "ACTIVE" }, "PATCH", tokenAd),
+          params: { id: userBRow.id },
+        } as never);
+        ok(actRes.status === 200, "REG: ADMIN reactivating a USER succeeds");
+        const userBAfter = await client`SELECT * FROM "User" WHERE id = ${userBRow.id}`;
+        ok(userBAfter[0]?.status === "ACTIVE", "REG: USER B is ACTIVE after reactivation");
+      }
+    }
+
+    await client`DELETE FROM "User" WHERE id = ${adminBId}`;
   }
 
   // ================= W2-10 TESTS =================
