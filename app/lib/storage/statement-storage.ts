@@ -4,6 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { db } from "../drizzle-db";
 import { documents } from "../../db/schema";
+import { computeContentHash } from "../statement-hash";
 
 // Persistent storage root for uploaded statement PDFs.
 // Files live on the filesystem only — PostgreSQL keeps metadata/path rows (documents table).
@@ -26,6 +27,7 @@ export interface StoredStatementMeta {
   id: string;
   userId: string;
   originalName: string;
+  contentHash: string;
   filePath: string;
   mimeType: string;
   fileSize: number;
@@ -82,6 +84,31 @@ async function hasPdfMagicBytes(file: File): Promise<boolean> {
   return decoded === PDF_MAGIC;
 }
 
+/**
+ * Look up whether this user has ALREADY imported a document with the same
+ * content hash. Scoped strictly to `userId` so cross-user data is never
+ * compared. Returns the user's own existing document id, or null.
+ *
+ * A DB partial unique index (documents_user_content_hash_key) backs this with
+ * a hard guarantee for new hashed imports; existing NULL-hash historical rows
+ * are excluded from it.
+ */
+export async function findExistingDocumentByHash(
+  userId: string,
+  contentHash: string
+): Promise<{ id: string } | null> {
+  const { eq, and } = await import("drizzle-orm");
+  const rows = await db
+    .select({ id: documents.id })
+    .from(documents)
+    .where(
+      and(eq(documents.userId, userId), eq(documents.contentHash, contentHash))
+    )
+    .limit(1)
+    .execute();
+  return rows[0] ?? null;
+}
+
 export async function saveStatementPdf(
   input: StatementSaveInput
 ): Promise<SaveStatementResult> {
@@ -115,6 +142,9 @@ export async function saveStatementPdf(
     const buffer = Buffer.from(await file.arrayBuffer());
     await writeFile(destination, buffer);
 
+    // Deterministic SHA-256 of the file bytes, used for user-scoped dedup.
+    const contentHash = computeContentHash(buffer);
+
     const now = new Date().toISOString();
     const documentId = randomUUID();
 
@@ -124,6 +154,7 @@ export async function saveStatementPdf(
         id: documentId,
         userId,
         originalName: sanitizeOriginalName(file.name),
+        contentHash,
         filePath: destination,
         mimeType: PDF_MIME_TYPE,
         fileSize: file.size,
@@ -138,6 +169,7 @@ export async function saveStatementPdf(
         id: documentId,
         userId,
         originalName: sanitizeOriginalName(file.name),
+        contentHash,
         filePath: destination,
         mimeType: PDF_MIME_TYPE,
         fileSize: file.size,

@@ -1,6 +1,7 @@
 import type { Route } from "./+types/upload";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
-import { saveStatementPdf } from "~/lib/storage/statement-storage";
+import { saveStatementPdf, findExistingDocumentByHash } from "~/lib/storage/statement-storage";
+import { computeContentHash, buildDuplicatePayload } from "~/lib/statement-hash";
 import { extractTextFromPdf } from "~/lib/pdf-text-extractor";
 import {
   buildStatementTransactions,
@@ -12,6 +13,8 @@ import {
   isGeminiConfigured,
   GeminiError,
   GeminiErrorCode,
+  type GeminiStatementResult,
+  type GeminiErrorCodeValue,
 } from "~/lib/gemini-statement-parser";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
@@ -25,6 +28,18 @@ function isAuthError(result: unknown): result is { status: number; message: stri
 }
 
 /**
+ * Shape of the `ai` field returned in the upload response so the UI can render
+ * a truthful Gemini state from a real backend result.
+ *  - success: source "gemini" + the locally validated structured result.
+ *  - failure: source "unavailable" + a stable machine-readable code + messages.
+ * Never exposes the API key. Malformed AI output is rejected server-side and
+ * never reaches this payload (it surfaces as a failure code instead).
+ */
+export type UploadAiResult =
+  | { source: "gemini"; code: null; result: GeminiStatementResult }
+  | { source: "unavailable"; code: GeminiErrorCodeValue; errors: string[] };
+
+/**
  * Run Gemini structured analysis on the extracted statement text when Gemini is
  * configured. Never throws — on any failure it returns a clear "not available"
  * state and logs an audit event, so a Gemini problem can never break the
@@ -35,10 +50,11 @@ async function runGeminiAnalysis(
   text: string,
   userId: string,
   documentId: string
-): Promise<{ source: "gemini" | "unavailable"; result?: unknown; errors?: string[] }> {
+): Promise<UploadAiResult> {
   if (!isGeminiConfigured()) {
     return {
       source: "unavailable",
+      code: GeminiErrorCode.NOT_CONFIGURED,
       errors: ["Gemini integration is not configured (GEMINI_API_KEY is missing)"],
     };
   }
@@ -57,7 +73,7 @@ async function runGeminiAnalysis(
         warningCount: outcome.result.statement.warnings.length,
       },
     });
-    return { source: "gemini", result: outcome.result };
+    return { source: "gemini", code: null, result: outcome.result };
   } catch (error) {
     const code =
       error instanceof GeminiError ? error.code : GeminiErrorCode.REQUEST_FAILED;
@@ -71,6 +87,7 @@ async function runGeminiAnalysis(
     }).catch(() => {});
     return {
       source: "unavailable",
+      code,
       errors: [
         code === GeminiErrorCode.NOT_CONFIGURED
           ? "Gemini integration is not configured (GEMINI_API_KEY is missing)"
@@ -118,8 +135,56 @@ export async function action({ request }: Route.ActionArgs) {
     );
   }
 
+  // 0. User-scoped duplicate detection BEFORE storing anything, so a re-uploaded
+  // Statement never creates an orphaned file/document row and never re-imports
+  // or re-analyzes the same PDF. The hash is deterministic on the file bytes.
+  const contentHash = computeContentHash(
+    new Uint8Array(await file.arrayBuffer())
+  );
+  const existingDocument = await findExistingDocumentByHash(
+    auth.userId,
+    contentHash
+  );
+  if (existingDocument) {
+    await insertAuditLog({
+      userId: auth.userId,
+      action: AuditAction.STATEMENT_UPLOAD,
+      entityType: "documents",
+      entityId: existingDocument.id,
+      details: {
+        route: "/api/v1/statements/upload",
+        method: "POST",
+        result: "duplicate",
+        contentHash,
+      },
+    });
+    return Response.json({
+      success: true,
+      data: buildDuplicatePayload(existingDocument.id),
+    });
+  }
+
   // 1. Validate + store the PDF (UUID filename) and record it in the documents table.
-  const stored = await saveStatementPdf({ userId: auth.userId, file });
+  let stored;
+  try {
+    stored = await saveStatementPdf({ userId: auth.userId, file });
+  } catch (error) {
+    // Concurrent duplicate guard: the partial unique index can reject a second
+    // simultaneous upload of the same PDF (postgres unique violation 23505).
+    // Treat it as a duplicate, not a server failure.
+    if (
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as { code?: unknown }).code === "23505"
+    ) {
+      return Response.json({
+        success: true,
+        data: buildDuplicatePayload(null),
+      });
+    }
+    throw error;
+  }
   if (!stored.ok) {
     return Response.json(
       { success: false, message: stored.message },

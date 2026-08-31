@@ -1,0 +1,2 @@
+ALTER TABLE "documents" ADD COLUMN "content_hash" text;--> statement-breakpoint
+CREATE UNIQUE INDEX "documents_user_content_hash_key" ON "documents" USING btree ("user_id","content_hash") WHERE "documents"."content_hash" IS NOT NULL;

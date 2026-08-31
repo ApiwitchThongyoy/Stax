@@ -178,6 +178,101 @@ async function main() {
   // restore
   process.env.GEMINI_API_KEY = prevKey ?? "";
 
+  // 14. REGRESSION — Gemini sometimes returns monetary values as JSON numbers
+  // (and confidence as a numeric string) despite the STRING contract. These are
+  // legitimate representations that must be normalized, not rejected.
+  const numericPayload = {
+    statement: {
+      transactions: [
+        {
+          transactionDate: "2026-01-05",
+          description: "Dividend income",
+          transactionType: "income",
+          currency: "USD",
+          amount: 1000.0,
+          exchangeRate: 35.42,
+          amountThb: 35420.0,
+          confidence: "0.95",
+        },
+      ],
+      warnings: [],
+    },
+  };
+  const numericRes = safeParse(numericPayload);
+  ok(numericRes.success, "monetary JSON numbers + confidence string are accepted (+ normalization)");
+  const numTx = numericRes.success
+    ? numericRes.data.statement.transactions[0]
+    : null;
+  ok(
+    numTx !== null &&
+      numTx.amount === "1000" &&
+      numTx.exchangeRate === "35.42" &&
+      numTx.amountThb === "35420",
+    "JSON number monetary values normalize to decimal strings"
+  );
+  ok(
+    numTx !== null && numTx.confidence === 0.95,
+    "numeric-string confidence normalizes to a JSON number"
+  );
+
+  // 14b. Optional/nullable monetary fields remain optional even as numbers.
+  const sparseNumeric = {
+    statement: {
+      transactions: [
+        {
+          transactionDate: "2026-02-01",
+          description: "Fee",
+          transactionType: "expense",
+          currency: "THB",
+          amount: 50.5,
+        },
+      ],
+      warnings: [],
+    },
+  };
+  const sparseRes = safeParse(sparseNumeric);
+  ok(
+    sparseRes.success &&
+      sparseRes.data.statement.transactions[0].exchangeRate === undefined &&
+      sparseRes.data.statement.transactions[0].amountThb === undefined,
+    "omitted exchangeRate/amountThb remain optional when amount is a number"
+  );
+
+  // 14c. Not a weakening: an invalid non-decimal number is still rejected.
+  const badNumeric = {
+    statement: {
+      transactions: [
+        {
+          transactionDate: "2026-01-05",
+          description: "Bad",
+          transactionType: "income",
+          currency: "USD",
+          amount: 1e21,
+        },
+      ],
+      warnings: [],
+    },
+  };
+  ok(
+    safeParse(badNumeric).success === false,
+    "non-decimal numeric amount is still rejected (no validation weakening)"
+  );
+
+  // 14d. Full validation path accepts the numeric JSON representation too.
+  const numericJson = JSON.stringify(numericPayload);
+  let numericResult: unknown = null;
+  try {
+    numericResult = validateGeminiResponseText(numericJson);
+  } catch {
+    numericResult = null;
+  }
+  ok(
+    !!numericResult &&
+      (numericResult as { statement: { transactions: unknown[] } }).statement
+        .transactions.length === 1,
+    "validateGeminiResponseText accepts the numeric JSON representation"
+  );
+
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);
   if (failures.length) {
