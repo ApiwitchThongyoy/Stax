@@ -1,4 +1,9 @@
 import { createContext, useContext, useState, useCallback, type ReactNode } from "react";
+import {
+  canUseUserPortal,
+  ADMIN_USER_PORTAL_DENIED_MESSAGE,
+} from "./portal-access";
+import { clearAllSessions } from "./session";
 
 const STORAGE_KEY = "stax_auth_user";
 
@@ -90,6 +95,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       const { accessToken, user: apiUser } = data.data;
+
+      // The normal USER portal only allows role USER. If an ADMIN authenticates
+      // here (shared /api/v1/auth/login endpoint), do NOT save any USER session
+      // and clear any accidental/stale session state. Admin must use the admin
+      // login page instead.
+      if (!canUseUserPortal(apiUser.role)) {
+        clearAllSessions();
+        setUser(null);
+        return {
+          success: false,
+          error: ADMIN_USER_PORTAL_DENIED_MESSAGE,
+        };
+      }
+
       const nextUser: AuthUser = {
         id: apiUser.id ?? "",
         email: apiUser.email ?? trimmedEmail,

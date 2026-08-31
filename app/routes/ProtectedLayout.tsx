@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router";
 import { useAuth } from "../lib/auth";
 import { clearAllSessions } from "../lib/session";
+import { canUseUserPortal } from "../lib/portal-access";
 import { useSuspendedAccount } from "../lib/suspended-account";
 import { useAccountStatusPolling } from "../lib/useAccountStatusPolling";
 
@@ -50,6 +51,16 @@ export default function ProtectedLayout() {
       return;
     }
 
+    // Defense in depth: the normal USER portal only allows role USER. Even if a
+    // stale/manual ADMIN (or other non-USER) session somehow exists, clear it
+    // and redirect to the USER login — never render the Dashboard for it.
+    if (user && !canUseUserPortal(user.role)) {
+      clearAllSessions();
+      logout();
+      navigate("/login", { replace: true });
+      return;
+    }
+
     // มี session ในเครื่องแล้ว -> validate กับ backend หนึ่งครั้งต่อ entry
     // เพื่อกันกรณี token หมดอายุ/ถูกเพิกถอน (401) ให้กวาด session แล้วเด้งไป
     // /login. 403 + ACCOUNT_SUSPENDED ถูกจัดการต่อโดย useAccountStatusPolling
@@ -81,6 +92,7 @@ export default function ProtectedLayout() {
   // a hydration mismatch.
   if (!isAuthenticated) return null;
   if (!mounted) return null;
+  if (user && !canUseUserPortal(user.role)) return null;
 
   return <Outlet />;
 }

@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { db } from "../drizzle-db";
@@ -179,5 +179,38 @@ export async function saveStatementPdf(
   } catch (error) {
     console.error("saveStatementPdf: failed to store document", error);
     return { ok: false, status: 500, message: "Internal server error" };
+  }
+}
+
+/**
+ * Remove the physical statement PDF for a deleted document, safely.
+ *
+ * Only paths that resolve strictly INSIDE STATEMENTS_DIR are ever touched, so a
+ * corrupted/malicious file_path can never delete an arbitrary file. ENOENT is
+ * tolerated (the file may already be absent) — this is best-effort cleanup that
+ * MUST NOT fail the request. Returns `true` when removal succeeded or the file
+ * was already gone, `false` on any other error (caller logs a warning).
+ */
+export async function deleteStoredFile(filePath: string): Promise<boolean> {
+  if (!filePath || typeof filePath !== "string") {
+    console.warn("deleteStoredFile: empty or invalid stored path");
+    return true;
+  }
+  const resolved = path.resolve(filePath);
+  if (!resolved.startsWith(STATEMENTS_DIR)) {
+    console.warn(
+      "deleteStoredFile: refusing to delete path outside STATEMENTS_DIR"
+    );
+    return true;
+  }
+  try {
+    await unlink(resolved);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return true;
+    }
+    console.warn("deleteStoredFile: failed to remove file", error);
+    return false;
   }
 }
