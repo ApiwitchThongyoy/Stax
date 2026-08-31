@@ -43,17 +43,17 @@ export default function FxAiPage({
     {
       key: "ai",
       title: "ระบบวิเคราะห์ AI",
-      message: "ระบบวิเคราะห์ AI จะพร้อมหลังเชื่อมต่อ Gemini API",
+      message: "เชื่อมต่อ Gemini API พร้อมใช้งาน แล้ว",
       detail:
-        "การวิเคราะห์และข้อเสนอแนะอัตโนมัติจะพร้อมใช้งานหลังเชื่อมต่อ Gemini API",
+        "AI ใช้วิเคราะห์โครงสร้างของ Statement เท่านั้น ไม่ได้เป็นผู้คำนวณภาษี",
       Icon: Sparkles,
     },
     {
       key: "tax",
       title: "การคำนวณภาษี",
-      message: "การคำนวณภาษียังไม่พร้อมใช้งาน",
+      message: "Tax Core Engine พร้อมใช้งาน",
       detail:
-        "การประมาณภาษีจะเปิดให้ใช้งานเมื่อ Tax Core Engine เชื่อมต่อกับระบบแล้ว",
+        "คำนวณรายธุรกรรมแบบกำหนดได้ (deterministic) ด้วยเลขทศนิยม ไม่ให้ขาดทุนหักกลบข้ามรายการ",
       Icon: Calculator,
     },
   ];

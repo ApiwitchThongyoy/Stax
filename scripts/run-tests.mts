@@ -34,6 +34,7 @@ const ledgerRoute = await import("../app/routes/api/capital-ledgers.$id");
 const adminUsersRoute = await import("../app/routes/api/admin/users");
 const adminUserRoute = await import("../app/routes/api/admin/users.$id");
 const uploadRoute = await import("../app/routes/api/statements/upload");
+const taxCalculateRoute = await import("../app/routes/api/tax/calculate");
 
 const { AuditAction } = await import("../app/lib/audit-log");
 
@@ -407,6 +408,96 @@ async function main() {
     );
   });
   ok(allOwned, "W2-10: every audit row's user_id belongs to a known test account");
+
+  // ================= W1-2 TESTS =================
+  console.log("\n=== W1-2: DECIMAL TAX RECONSTRUCTION API ===");
+
+  // USER A seeded transactions (raw cash in THB):
+  //  ...a1 = CASH_IN  (amount_thb 35420)
+  //  ...a2 = CASH_OUT (amount_thb 17550)
+  //
+  // SEMANTIC: the schema stores raw cash only (no cost basis / proceeds), so the
+  // API must NOT treat CASH_IN/CASH_OUT as realized gain/loss. It returns the
+  // neutral signed cash value (transactionAmountThb) and marks the tax outcome
+  // as explicitly "not computable".
+  const userA1 = "00000000-0000-0000-0000-0000000000a1";
+  const userA2 = "00000000-0000-0000-0000-0000000000a2";
+
+  const taxFor = async (token: string | undefined, ids: string[]) =>
+    taxCalculateRoute.action({
+      request: jsonBody({ transactionIds: ids }, "POST", token),
+    } as never);
+
+  // 1. reconstruct own transactions
+  const ownRes = await taxFor(tokenA, [userA1, userA2]);
+  const ownBody = (await ownRes.json()) as {
+    success?: boolean;
+    data?: {
+      computable?: boolean;
+      totalTaxableAmountThb?: string | null;
+      transactions: {
+        transactionId: string;
+        transactionAmountThb: string;
+        realizedGainLossThb?: string | null;
+        taxableAmountThb?: string | null;
+      }[];
+    };
+  };
+  ok(ownRes.status === 200 && ownBody.success === true, "W1-2: USER A tax reconstruction succeeds");
+  ok(ownBody.data?.computable === false, "W1-2: outcome is explicitly NOT computable (schema lacks cost basis)");
+  ok(ownBody.data?.totalTaxableAmountThb === null, "W1-2: no fabricated taxable total returned");
+  ok(
+    ownBody.data?.transactions?.length === 2,
+    "W1-2: exactly A's 2 transactions returned"
+  );
+  ok(
+    ownBody.data?.transactions?.every((t) => t.taxableAmountThb === null && t.realizedGainLossThb === null) === true,
+    "W1-2: no row fabricates realizedGainLossThb/taxableAmountThb from cash flow"
+  );
+  const a1Row = ownBody.data?.transactions?.find((t) => t.transactionId === userA1);
+  const a2Row = ownBody.data?.transactions?.find((t) => t.transactionId === userA2);
+  ok(a1Row?.transactionAmountThb === "35420.00", "W1-2: CASH_IN neutral signed cash = +35420.00");
+  ok(a2Row?.transactionAmountThb === "-17550.00", "W1-2: CASH_OUT neutral signed cash = -17550.00");
+
+  // 2. USER A tries to include USER B's transaction -> B's row must NOT appear
+  if (userBTxnId) {
+    const mixRes = await taxFor(tokenA, [userA1, userA2, userBTxnId]);
+    const mixBody = (await mixRes.json()) as {
+      data?: { transactions: { transactionId: string }[] };
+    };
+    const mixIds = (mixBody.data?.transactions ?? []).map((t) => t.transactionId);
+    ok(
+      !mixIds.includes(userBTxnId),
+      "W1-2/Case F: USER A cannot mix USER B's transaction through the API"
+    );
+    ok(
+      mixIds.length === 2,
+      "W1-2/Case F: only A's 2 transactions returned when foreign id included"
+    );
+
+    // 3. USER A requests ONLY USER B's transaction -> empty result
+    const onlyBRes = await taxFor(tokenA, [userBTxnId]);
+    const onlyBBody = (await onlyBRes.json()) as {
+      data?: { transactions: unknown[] };
+    };
+    ok(onlyBRes.status === 200, "W1-2/Case F: request with only foreign id still succeeds");
+    ok(
+      (onlyBBody.data?.transactions?.length ?? 0) === 0,
+      "W1-2/Case F: foreign-only request returns empty (no data leak)"
+    );
+  }
+
+  // 4. unauthenticated request is rejected
+  const anonRes = await taxFor(undefined, [userA1]);
+  ok(anonRes.status === 401, "W1-2: unauthenticated tax calc rejected (401)");
+
+  // 5. validation: missing/empty/oversized transactionIds
+  const missingRes = await taxFor(tokenA, [] as string[]);
+  ok(missingRes.status === 400, "W1-2: empty transactionIds rejected (400)");
+  const noField = await taxFor(tokenA, undefined as never);
+  ok(noField.status === 400, "W1-2: missing transactionIds rejected (400)");
+  const tooMany = await taxFor(tokenA, Array.from({ length: 501 }, (_, i) => `id-${i}`));
+  ok(tooMany.status === 400, "W1-2: oversized transactionIds rejected (400)");
 
   // ================= CLEANUP =================
   console.log("\n=== CLEANUP ===");

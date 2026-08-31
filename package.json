@@ -12,12 +12,15 @@
     "db:studio": "drizzle-kit studio",
     "db:seed": "node scripts/seed.mjs",
     "db:seed:test": "node scripts/seed-test.mjs",
-    "test:w2": "tsx scripts/run-tests.mts"
+    "test:w2": "tsx scripts/run-tests.mts",
+    "test": "tsx scripts/test-tax-engine.mts && tsx scripts/test-gemini-parser.mts"
   },
   "dependencies": {
+    "@google/genai": "^2.19.0",
     "@react-router/node": "8.0.0",
     "@react-router/serve": "8.0.0",
     "bcryptjs": "^3.0.3",
+    "decimal.js": "^10.6.0",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "isbot": "^5.1.36",
@@ -29,7 +32,8 @@
     "react-dom": "^19.2.7",
     "react-router": "8.0.0",
     "recharts": "^3.10.1",
-    "xlsx": "^0.18.5"
+    "xlsx": "^0.18.5",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@react-router/dev": "8.0.0",
