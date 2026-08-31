@@ -73,6 +73,7 @@ Completed:
 - users table created via migration create_users (prisma/migrations/20260807130407_create_users).
 - Prisma Client generated under prisma/generated/prisma.
 - documents table created via migration create_documents (prisma/migrations/20260808105847_create_documents). Stores metadata + file_path for uploaded Statement PDFs (no binary in DB). FK documents.user_id -> User.id with index on user_id.
+- Server-authoritative frontend wiring done (Drizzle + Postgres/Supabase; Prisma is legacy, not used): added user-scoped `GET /api/v1/documents` (app/routes/api/documents.ts) returning safe metadata; shared `app/lib/server-api.ts` (fetchCapitalLedger / fetchUserDocuments / capitalRowToTransaction / capitalLedgerToTransactions — identity=authoritative transactionId, no fabricated P&L). Dashboard, FxAiPage, Calendar, Statement Archive, and StoredDocumentsList now render from server (ledger + documents API) instead of session-import React state / IndexedDB. Tests: scripts/test-server-api.mts (pure mapping + wiring) added to `npm test`; W2-9 documents user-scoping section added to scripts/run-tests.mts. All tests + typecheck + build pass. Changes NOT committed.
 
 Next:
 Wait for user instruction.
