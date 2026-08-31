@@ -7,6 +7,12 @@ import {
   insertStatementTransactions,
   hasSavedDocumentRows,
 } from "~/lib/statement-pipeline";
+import {
+  parseStatementWithGemini,
+  isGeminiConfigured,
+  GeminiError,
+  GeminiErrorCode,
+} from "~/lib/gemini-statement-parser";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
@@ -16,6 +22,62 @@ function isAuthError(result: unknown): result is { status: number; message: stri
     "status" in result &&
     "message" in result
   );
+}
+
+/**
+ * Run Gemini structured analysis on the extracted statement text when Gemini is
+ * configured. Never throws — on any failure it returns a clear "not available"
+ * state and logs an audit event, so a Gemini problem can never break the
+ * existing deterministic upload flow. The Gemini result is for preview/analysis
+ * only; it is not inserted and never decides final tax.
+ */
+async function runGeminiAnalysis(
+  text: string,
+  userId: string,
+  documentId: string
+): Promise<{ source: "gemini" | "unavailable"; result?: unknown; errors?: string[] }> {
+  if (!isGeminiConfigured()) {
+    return {
+      source: "unavailable",
+      errors: ["Gemini integration is not configured (GEMINI_API_KEY is missing)"],
+    };
+  }
+
+  try {
+    const outcome = await parseStatementWithGemini(text);
+    await insertAuditLog({
+      userId,
+      action: AuditAction.GEMINI_PARSE,
+      entityType: "Capital_Transactions",
+      entityId: documentId,
+      details: {
+        source: "gemini",
+        model: outcome.model,
+        transactionCount: outcome.result.statement.transactions.length,
+        warningCount: outcome.result.statement.warnings.length,
+      },
+    });
+    return { source: "gemini", result: outcome.result };
+  } catch (error) {
+    const code =
+      error instanceof GeminiError ? error.code : GeminiErrorCode.REQUEST_FAILED;
+    console.error("runGeminiAnalysis: failed", code);
+    await insertAuditLog({
+      userId,
+      action: AuditAction.GEMINI_PARSE_FAILED,
+      entityType: "Capital_Transactions",
+      entityId: documentId,
+      details: { code },
+    }).catch(() => {});
+    return {
+      source: "unavailable",
+      errors: [
+        code === GeminiErrorCode.NOT_CONFIGURED
+          ? "Gemini integration is not configured (GEMINI_API_KEY is missing)"
+          : "Gemini analysis is not available",
+      ],
+    };
+  }
 }
 
 export async function loader(_: Route.LoaderArgs) {
@@ -107,6 +169,13 @@ export async function action({ request }: Route.ActionArgs) {
       documentId
     );
 
+    // 3b. Gemini structured analysis (best-effort, for preview only).
+    const aiResult = await runGeminiAnalysis(
+      extraction.text,
+      auth.userId,
+      documentId
+    );
+
     if (built.rows.length === 0) {
       return Response.json({
         success: true,
@@ -117,6 +186,7 @@ export async function action({ request }: Route.ActionArgs) {
           saved: 0,
           rejected: built.rejections,
           unsupported: true,
+          ai: aiResult,
         },
       });
     }
@@ -132,6 +202,7 @@ export async function action({ request }: Route.ActionArgs) {
           saved: 0,
           duplicates: true,
           rejected: [],
+          ai: aiResult,
         },
       });
     }
@@ -161,6 +232,7 @@ export async function action({ request }: Route.ActionArgs) {
         saved: result.insertedCount,
         transactionIds: result.transactionIds,
         rejected: built.rejections,
+        ai: aiResult,
       },
     });
   } catch (error) {
