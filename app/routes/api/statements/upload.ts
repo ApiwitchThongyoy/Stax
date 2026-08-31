@@ -77,13 +77,24 @@ async function runGeminiAnalysis(
   } catch (error) {
     const code =
       error instanceof GeminiError ? error.code : GeminiErrorCode.REQUEST_FAILED;
-    console.error("runGeminiAnalysis: failed", code);
+    // Server-side only: surface the sanitized cause (type, optional HTTP status,
+    // low-level cause code) for diagnosis. Never log the API key, auth headers,
+    // or statement text. The browser payload below stays generic.
+    const sanitized =
+      error instanceof GeminiError && error.cause
+        ? {
+            upstreamType: error.cause.type,
+            upstreamStatus: error.cause.status ?? undefined,
+            causeCode: error.cause.code ?? undefined,
+          }
+        : undefined;
+    console.error("runGeminiAnalysis: failed", code, sanitized ?? "");
     await insertAuditLog({
       userId,
       action: AuditAction.GEMINI_PARSE_FAILED,
       entityType: "Capital_Transactions",
       entityId: documentId,
-      details: { code },
+      details: sanitized ? { code, ...sanitized } : { code },
     }).catch(() => {});
     return {
       source: "unavailable",
