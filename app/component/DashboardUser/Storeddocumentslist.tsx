@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { FileText, Download, Trash2 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
+import { fetchUserDocuments } from "../../lib/server-api";
 import {
-  listDocuments,
-  getDocumentBlob,
+  getLocalDocumentByName,
+  getLocalBlobById,
   deleteDocument,
   type StoredDocumentMeta,
 } from "../../lib/Documentstorage";
@@ -31,12 +32,19 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
 
   const refresh = async () => {
     try {
-      if (!user?.id) {
+      if (!user?.accessToken) {
         setDocs([]);
         return;
       }
-      const list = await listDocuments(user.id);
-      setDocs(list);
+      const list = await fetchUserDocuments(user.accessToken);
+      setDocs(
+        list.map((d) => ({
+          id: d.id,
+          fileName: d.originalName,
+          uploadedAt: d.createdAt,
+          size: d.fileSize,
+        }))
+      );
     } finally {
       setLoading(false);
     }
@@ -45,11 +53,13 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
   useEffect(() => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshTrigger, user?.id]);
+  }, [refreshTrigger, user?.accessToken]);
 
   const handleDownload = async (doc: StoredDocumentMeta) => {
     if (!user?.id) return;
-    const blob = await getDocumentBlob(user.id, doc.id);
+    const local = await getLocalDocumentByName(user.id, doc.fileName);
+    if (!local) return;
+    const blob = await getLocalBlobById(user.id, local.id);
     if (!blob) return;
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -59,9 +69,14 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
     URL.revokeObjectURL(url);
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: string, fileName: string) => {
     if (!user?.id) return;
-    await deleteDocument(user.id, id);
+    const local = await getLocalDocumentByName(user.id, fileName);
+    if (local) {
+      await deleteDocument(user.id, local.id);
+    }
+    // Server-authoritative document row is not deleted here (no user-scoped
+    // server delete endpoint yet); only the optional local IndexedDB copy.
     refresh();
   };
 
@@ -108,7 +123,7 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
               </button>
               <button
                 type="button"
-                onClick={() => handleDelete(doc.id)}
+                onClick={() => handleDelete(doc.id, doc.fileName)}
                 className="text-gray-400 hover:text-red-600 transition shrink-0"
                 aria-label="ลบไฟล์"
               >

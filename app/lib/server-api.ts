@@ -1,0 +1,123 @@
+import {
+  formatMoney,
+  type Transaction,
+} from "./Financeutils";
+
+/**
+ * Shape of a single row returned by GET /api/v1/capital-ledgers.
+ */
+export interface CapitalLedgerRow {
+  transactionId: string;
+  userId: string;
+  amountForeign: string;
+  currency: string;
+  transactionDate: string;
+  fxRateBot: string;
+  amountThb: string;
+  type: "CASH_IN" | "CASH_OUT";
+  sourceType: string;
+  sourceDocumentId?: string | null;
+}
+
+/**
+ * Shape of a single document returned by GET /api/v1/documents.
+ */
+export interface ServerDocumentMeta {
+  id: string;
+  originalName: string;
+  mimeType: string;
+  fileSize: number;
+  createdAt: string;
+}
+
+function authHeaders(accessToken: string): Record<string, string> {
+  return { Authorization: `Bearer ${accessToken}` };
+}
+
+async function okJson<T>(
+  res: Response
+): Promise<{ ok: boolean; status: number; data?: T; message?: string }> {
+  let body: { success?: boolean; data?: T; message?: string };
+  try {
+    body = await res.json();
+  } catch {
+    body = {};
+  }
+  return {
+    ok: res.ok && body.success === true && body.data !== undefined,
+    status: res.status,
+    data: body.data,
+    message: body.message,
+  };
+}
+
+/**
+ * Fetch the authenticated user's Capital_Transactions from the server.
+ * The server is authoritative for the ledger.
+ */
+export async function fetchCapitalLedger(
+  accessToken: string
+): Promise<CapitalLedgerRow[]> {
+  const res = await fetch("/api/v1/capital-ledgers", {
+    headers: authHeaders(accessToken),
+  });
+  const out = await okJson<CapitalLedgerRow[]>(res);
+  if (!out.ok || !Array.isArray(out.data)) {
+    throw new Error("Failed to load capital ledger from the server");
+  }
+  return out.data;
+}
+
+/**
+ * Fetch the authenticated user's Statement documents (metadata only).
+ * The server is authoritative for the archive list.
+ */
+export async function fetchUserDocuments(
+  accessToken: string
+): Promise<ServerDocumentMeta[]> {
+  const res = await fetch("/api/v1/documents", {
+    headers: authHeaders(accessToken),
+  });
+  const out = await okJson<ServerDocumentMeta[]>(res);
+  if (!out.ok || !Array.isArray(out.data)) {
+    throw new Error("Failed to load documents from the server");
+  }
+  return out.data;
+}
+
+/**
+ * Map a server Capital_Transactions row into the frontend Transaction shape
+ * used by the Dashboard, FX page and Calendar.
+ *
+ * The server schema stores raw cash (CASH_IN/CASH_OUT) with no P&L column, so
+ * pnlAmount is 0 (we never invent gain/loss). `amount` is the foreign amount
+ * and `rate` the FX rate so the existing `amount * rate` business formulas keep
+ * working unchanged. Identity is the authoritative transactionId.
+ */
+export function capitalRowToTransaction(row: CapitalLedgerRow): Transaction {
+  const amountForeign = Number(row.amountForeign);
+  const isIn = row.type === "CASH_IN";
+  const signedAmount = isIn ? amountForeign : -amountForeign;
+  return {
+    id: row.transactionId,
+    date: row.transactionDate.slice(0, 10),
+    description: isIn ? "CASH IN" : "CASH OUT",
+    subLabel: row.currency,
+    income: isIn ? formatMoney(amountForeign, row.currency) : null,
+    expense: !isIn ? formatMoney(amountForeign, row.currency) : null,
+    rate: row.fxRateBot,
+    category: "equity",
+    pnlAmount: 0,
+    amount: signedAmount,
+    currency: row.currency,
+  };
+}
+
+/**
+ * Map many server rows into the frontend Transaction shape.
+ */
+export function capitalLedgerToTransactions(
+  rows: CapitalLedgerRow[]
+): Transaction[] {
+  return rows.map(capitalRowToTransaction);
+}

@@ -120,3 +120,48 @@ export async function deleteDocument(userId: string, id: string): Promise<void> 
     tx.onerror = () => reject(tx.error);
   });
 }
+
+/**
+ * Optional local cache by filename. The server is authoritative for the
+ * document LIST; IndexedDB keeps only an optional local blob copy for download.
+ * Lookups are matched by original file name (server document ids are UUIDs and
+ * are unrelated to the local `doc-...` ids).
+ */
+export async function getLocalDocumentByName(
+  userId: string,
+  fileName: string
+): Promise<StoredDocumentMeta | null> {
+  const db = await openDb(userId);
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.getAll();
+    request.onsuccess = () => {
+      const records = request.result as StoredDocumentRecord[];
+      const hit = records.find((r) => r.fileName === fileName);
+      resolve(
+        hit
+          ? { id: hit.id, fileName: hit.fileName, uploadedAt: hit.uploadedAt, size: hit.size }
+          : null
+      );
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function getLocalBlobById(
+  userId: string,
+  id: string
+): Promise<Blob | null> {
+  const db = await openDb(userId);
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.get(id);
+    request.onsuccess = () => {
+      const record = request.result as StoredDocumentRecord | undefined;
+      resolve(record ? record.blob : null);
+    };
+    request.onerror = () => reject(request.error);
+  });
+}

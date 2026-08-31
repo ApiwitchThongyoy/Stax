@@ -9,9 +9,10 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
+import { fetchUserDocuments } from "../../lib/server-api";
 import {
-  listDocuments,
-  getDocumentBlob,
+  getLocalDocumentByName,
+  getLocalBlobById,
   deleteDocument,
   type StoredDocumentMeta,
 } from "../../lib/Documentstorage";
@@ -49,14 +50,21 @@ export default function StatementArchivePage() {
   const refresh = async () => {
     setLoading(true);
     try {
-      if (!user?.id) {
+      if (!user?.accessToken) {
         setDocs([]);
         return;
       }
-      const list = await listDocuments(user.id);
-      setDocs(list);
+      const list = await fetchUserDocuments(user.accessToken);
+      setDocs(
+        list.map((d) => ({
+          id: d.id,
+          fileName: d.originalName,
+          uploadedAt: d.createdAt,
+          size: d.fileSize,
+        }))
+      );
       if (list.length > 0) {
-        setExpandedFolders(new Set([monthFolderKey(list[0].uploadedAt)]));
+        setExpandedFolders(new Set([monthFolderKey(list[0].createdAt)]));
       }
     } finally {
       setLoading(false);
@@ -66,11 +74,13 @@ export default function StatementArchivePage() {
   useEffect(() => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.id]);
+  }, [user?.accessToken]);
 
   const handleDownload = async (doc: StoredDocumentMeta) => {
     if (!user?.id) return;
-    const blob = await getDocumentBlob(user.id, doc.id);
+    const local = await getLocalDocumentByName(user.id, doc.fileName);
+    if (!local) return;
+    const blob = await getLocalBlobById(user.id, local.id);
     if (!blob) return;
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -80,9 +90,15 @@ export default function StatementArchivePage() {
     URL.revokeObjectURL(url);
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: string, fileName: string) => {
     if (!user?.id) return;
-    await deleteDocument(user.id, id);
+    const local = await getLocalDocumentByName(user.id, fileName);
+    if (local) {
+      await deleteDocument(user.id, local.id);
+    }
+    // The server-authoritative document row is not deleted here: no user-scoped
+    // server document delete endpoint is wired yet. Only the optional local
+    // IndexedDB cache copy is removed.
     refresh();
   };
 
@@ -184,7 +200,7 @@ export default function StatementArchivePage() {
                           </button>
                           <button
                             type="button"
-                            onClick={() => handleDelete(doc.id)}
+                            onClick={() => handleDelete(doc.id, doc.fileName)}
                             className="text-gray-400 hover:text-red-600 transition shrink-0"
                             aria-label="ลบไฟล์"
                           >

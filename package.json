@@ -13,7 +13,7 @@
     "db:seed": "node scripts/seed.mjs",
     "db:seed:test": "node scripts/seed-test.mjs",
     "test:w2": "tsx scripts/run-tests.mts",
-    "test": "tsx scripts/test-tax-engine.mts && tsx scripts/test-gemini-parser.mts && tsx scripts/test-gemini-analysis-storage.mts && tsx scripts/test-statement-dedup.mts && tsx scripts/test-ui-placeholders.mts"
+    "test": "tsx scripts/test-tax-engine.mts && tsx scripts/test-gemini-parser.mts && tsx scripts/test-gemini-analysis-storage.mts && tsx scripts/test-statement-dedup.mts && tsx scripts/test-server-api.mts && tsx scripts/test-ui-placeholders.mts"
   },
   "dependencies": {
     "@google/genai": "^2.19.0",
