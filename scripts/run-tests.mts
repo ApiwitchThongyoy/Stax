@@ -34,6 +34,7 @@ const ledgerRoute = await import("../app/routes/api/capital-ledgers.$id");
 const adminUsersRoute = await import("../app/routes/api/admin/users");
 const adminUserRoute = await import("../app/routes/api/admin/users.$id");
 const uploadRoute = await import("../app/routes/api/statements/upload");
+const documentsRoute = await import("../app/routes/api/documents");
 const taxCalculateRoute = await import("../app/routes/api/tax/calculate");
 
 const { AuditAction } = await import("../app/lib/audit-log");
@@ -205,6 +206,48 @@ async function main() {
       params: { id: userBTxnId! },
     } as never);
     ok(byIdRes.status === 404, "W2-9: USER A cannot read USER B transaction by id (404)");
+  }
+
+  // ================= W2-9: USER-SCOPED DOCUMENT LIST API =================
+  // GET /api/v1/documents is user-scoped: USER A sees only their own documents,
+  // USER B cannot see USER A's, and unauthenticated requests are rejected.
+  {
+    const docA = "00000000-0000-0000-0000-0000000000d1";
+    const docB = "00000000-0000-0000-0000-0000000000d2";
+    await client`DELETE FROM documents WHERE id IN (${docA}, ${docB})`;
+    if (userARow && userBRow) {
+      const now = new Date().toISOString();
+      await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                   VALUES (${docA}, ${userARow.id}, '2026-01.PDF', '/tmp/a.pdf', 'application/pdf', 100, ${now}, ${now})`;
+      await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                   VALUES (${docB}, ${userBRow.id}, '2026-02.PDF', '/tmp/b.pdf', 'application/pdf', 200, ${now}, ${now})`;
+    }
+
+    // unauthenticated -> 401
+    const anonDocs = await documentsRoute.loader({ request: authedRequest("GET", "") } as never);
+    ok(anonDocs.status === 401, "W2-9: unauthenticated GET /api/v1/documents rejected (401)");
+
+    if (tokenA) {
+      const resA = await documentsRoute.loader({ request: authedRequest("GET", tokenA) } as never);
+      ok(resA.status === 200, "W2-9: USER A documents list succeeds (200)");
+      const bodyA = await resA.json() as { data?: { id: string; originalName: string }[] };
+      const idsA = (bodyA.data ?? []).map((d) => d.id);
+      ok(idsA.includes(docA), "W2-9: USER A sees their own document");
+      ok(!idsA.includes(docB), "W2-9: USER A does NOT see USER B's document");
+      const aDoc = (bodyA.data ?? []).find((d) => d.id === docA);
+      ok(aDoc?.originalName === "2026-01.PDF", "W2-9: document metadata exposes original name");
+    }
+
+    if (tokenB) {
+      const resB = await documentsRoute.loader({ request: authedRequest("GET", tokenB) } as never);
+      const bodyB = await resB.json() as { data?: { id: string }[] };
+      const idsB = (bodyB.data ?? []).map((d) => d.id);
+      ok(!idsB.includes(docA), "W2-9: USER B cannot see USER A's document");
+      ok(idsB.includes(docB), "W2-9: USER B sees their own document");
+    }
+
+    // clean up the two test documents
+    await client`DELETE FROM documents WHERE id IN (${docA}, ${docB})`;
   }
 
   // admin authorization: USER accessing admin route -> denied

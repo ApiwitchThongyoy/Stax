@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router";
 import {
   LayoutDashboard,
@@ -31,9 +31,12 @@ import SettingsPage from "./SettingsPage";
 import NotificationBell from "./NotificationBell";
 import StatementArchivePage from "./StatementArchivePage";
 import FxAiPage from "./FxAiPage";
-import type { ExtractedTransaction } from "../../lib/pdfStatementParser";
 import type { Transaction } from "../../lib/Financeutils";
-import { formatMoney, toDisplayDate, parseRateString } from "../../lib/Financeutils";
+import { parseRateString } from "../../lib/Financeutils";
+import {
+  fetchCapitalLedger,
+  capitalLedgerToTransactions,
+} from "../../lib/server-api";
 
 // ไม่มีข้อมูลตัวอย่างแล้ว — สมุดบัญชีเริ่มต้นว่างเปล่า รอผู้ใช้ import ไฟล์ statement จริง
 const initialTransactions: Transaction[] = [];
@@ -100,25 +103,27 @@ export default function Dashboard({ userEmail }: DashboardProps) {
     navigate("/login", { replace: true }); // เด้งกลับไปหน้า Login
   };
 
-  const handleImportFromPdf = (imported: ExtractedTransaction[]) => {
-    const mapped: Transaction[] = imported.map((t) => ({
-      id: t.id,
-      date: toDisplayDate(t.date),
-      description: t.description,
-      subLabel: t.subLabel,
-      income: t.amount >= 0 ? formatMoney(t.amount, t.currency) : null,
-      expense: t.amount < 0 ? formatMoney(t.amount, t.currency) : null,
-      rate: t.rate ?? "-",
-      category: t.category,
-      pnlAmount: t.pnlAmount,
-      amount: t.amount,
-      currency: t.currency,
-    }));
+  const refreshFromServer = useCallback(async () => {
+    if (!user?.accessToken) return;
+    try {
+      const rows = await fetchCapitalLedger(user.accessToken);
+      setTransactions(capitalLedgerToTransactions(rows));
+    } catch {
+      // Server is authoritative; on transient failure keep the last known state.
+    }
+  }, [user?.accessToken]);
 
-    // รายการใหม่ล่าสุดอยู่บนสุด
-    setTransactions((prev) =>
-      [...mapped, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1))
-    );
+  // Load + refresh the ledger from the server (authoritative). This runs on
+  // mount and again whenever a document is (re)imported, so the dashboard never
+  // accumulates a second independent copy of the imported session.
+  useEffect(() => {
+    void refreshFromServer();
+  }, [refreshFromServer, docsRefreshKey]);
+
+  // After an import the server is authoritative; refresh rather than append the
+  // locally parsed copy into persistent UI state.
+  const handleImportFromPdf = () => {
+    setDocsRefreshKey((k) => k + 1);
   };
 
   const sortedTransactions = [...transactions].sort((a, b) =>
