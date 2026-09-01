@@ -1,8 +1,15 @@
 import type { Route } from "./+types/upload";
+import { eq, and } from "drizzle-orm";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
-import { saveStatementPdf, findExistingDocumentByHash } from "~/lib/storage/statement-storage";
+import {
+  saveStatementPdf,
+  findExistingDocumentByHash,
+  deleteStoredFile,
+} from "~/lib/storage/statement-storage";
+import { db } from "~/lib/drizzle-db";
+import { documents } from "~/db/schema";
 import { computeContentHash, buildDuplicatePayload } from "~/lib/statement-hash";
-import { extractTextFromPdf } from "~/lib/pdf-text-extractor";
+import { extractTextFromPdfBytes } from "~/lib/pdf-text-extractor";
 import {
   buildStatementTransactions,
   insertStatementTransactions,
@@ -219,12 +226,13 @@ export async function action({ request }: Route.ActionArgs) {
   });
 
   try {
-    // 2. Server-side text extraction from the stored file path.
+    // 2. Server-side text extraction from the stored object bytes (never a
+    //    client-supplied path; works for Supabase Storage and local dev).
     let extraction;
     try {
-      extraction = await extractTextFromPdf(stored.document.filePath);
+      extraction = await extractTextFromPdfBytes(stored.document.bytes);
     } catch (extractError) {
-      console.error("Statement upload: extractTextFromPdf threw", extractError);
+      console.error("Statement upload: extractTextFromPdfBytes threw", extractError);
       return Response.json(
         { success: false, message: "Failed to extract text from the PDF" },
         { status: 500 }
@@ -313,6 +321,28 @@ export async function action({ request }: Route.ActionArgs) {
     });
   } catch (error) {
     console.error("Statement upload: processing failed", error);
+    // Best-effort cleanup: an upload whose DB/import pipeline failed should not
+    // leave an orphaned storage object or a metadata row that would later block
+    // a clean re-upload via content-hash dedup. Both removals are best-effort —
+    // failures are logged, never surfaced to the client.
+    try {
+      await deleteStoredFile(stored.document.filePath);
+    } catch {
+      // best-effort object cleanup only
+    }
+    try {
+      await db
+        .delete(documents)
+        .where(
+          and(
+            eq(documents.id, stored.document.id),
+            eq(documents.userId, auth.userId)
+          )
+        )
+        .execute();
+    } catch {
+      // best-effort row cleanup only
+    }
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }

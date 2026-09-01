@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { FileText, Download, Trash2 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
-import { fetchUserDocuments } from "../../lib/server-api";
+import {
+  fetchUserDocuments,
+  downloadUserDocument,
+} from "../../lib/server-api";
 import {
   getLocalDocumentByName,
-  getLocalBlobById,
   deleteDocument,
   type StoredDocumentMeta,
 } from "../../lib/Documentstorage";
@@ -29,6 +31,7 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
   const { user } = useAuth();
   const [docs, setDocs] = useState<StoredDocumentMeta[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
   const refresh = async () => {
     try {
@@ -56,17 +59,25 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
   }, [refreshTrigger, user?.accessToken]);
 
   const handleDownload = async (doc: StoredDocumentMeta) => {
-    if (!user?.id) return;
-    const local = await getLocalDocumentByName(user.id, doc.fileName);
-    if (!local) return;
-    const blob = await getLocalBlobById(user.id, local.id);
-    if (!blob) return;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = doc.fileName;
-    a.click();
-    URL.revokeObjectURL(url);
+    // The server is the source of truth for the file bytes (GET
+    // /api/v1/documents/:id/download). IndexedDB is no longer authoritative.
+    if (!user?.accessToken) return;
+    setError("");
+    try {
+      const { blob, filename } = await downloadUserDocument(
+        user.accessToken,
+        doc.id,
+        doc.fileName
+      );
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError("ไม่สามารถดาวน์โหลดไฟล์ได้ กรุณาลองใหม่อีกครั้ง");
+    }
   };
 
   const handleDelete = async (id: string, fileName: string) => {
@@ -92,6 +103,10 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
           เก็บในเครื่องนี้เท่านั้น
         </span>
       </div>
+
+      {error && (
+        <p className="text-[11px] text-red-600 mb-2">{error}</p>
+      )}
 
       {docs.length === 0 ? (
         <p className="text-xs text-gray-400 text-center py-4">

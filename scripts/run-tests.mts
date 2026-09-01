@@ -29,6 +29,7 @@ process.env.USE_TEST_DATABASE = "1";
 
 // Imported after the TEST_DATABASE_URL guard so drizzle-db picks the TEST URL.
 const loginRoute = await import("../app/routes/api/auth/login");
+const sessionRoute = await import("../app/routes/api/auth/session");
 const ledgersRoute = await import("../app/routes/api/capital-ledgers");
 const ledgerRoute = await import("../app/routes/api/capital-ledgers.$id");
 const adminUsersRoute = await import("../app/routes/api/admin/users");
@@ -36,6 +37,7 @@ const adminUserRoute = await import("../app/routes/api/admin/users.$id");
 const uploadRoute = await import("../app/routes/api/statements/upload");
 const documentsRoute = await import("../app/routes/api/documents");
 const documentRoute = await import("../app/routes/api/documents.$id");
+const documentDownloadRoute = await import("../app/routes/api/documents.$id.download");
 const taxCalculateRoute = await import("../app/routes/api/tax/calculate");
 
 const { AuditAction } = await import("../app/lib/audit-log");
@@ -150,6 +152,8 @@ async function main() {
 
   const startTime = new Date().toISOString();
   console.log(`\nTest window starts at ${startTime}\n`);
+
+  const smokeUserIds: string[] = [];
 
   // ================= W2-9 TESTS =================
   console.log("=== W2-9: TEST ENVIRONMENT ===");
@@ -331,6 +335,157 @@ async function main() {
     await client`DELETE FROM documents WHERE id IN (${docX}, ${docY})`;
   }
 
+  // ================= SERVER-AUTHORITATIVE STATEMENT DOWNLOAD =================
+  // GET /api/v1/documents/:id/download serves the actual stored PDF for the
+  // caller's OWN document only, with safe headers and file-system containment.
+  {
+    const { STATEMENTS_DIR, safeResolveStoredPath } = await import(
+      "../app/lib/storage/statement-path"
+    );
+    const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+    const path = await import("node:path");
+    const crypto = await import("node:crypto");
+
+    const downloadRequest = (token: string, id: string) =>
+      new Request(`http://test.local/api/v1/documents/${id}/download`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+    // Isolated real temp PDFs inside the scratch statements dir (UUID names,
+    // removed afterward). Never touches live Statement rows.
+    mkdirSync(STATEMENTS_DIR, { recursive: true });
+    const tempFiles: string[] = [];
+    const makeTempPdf = () => {
+      const full = path.join(STATEMENTS_DIR, `${crypto.randomUUID()}.pdf`);
+      writeFileSync(
+        full,
+        Buffer.from([
+          ...[..."%PDF-1.4\n"].map((c) => c.charCodeAt(0)),
+          ...new Array(200).fill(0x42),
+        ])
+      );
+      tempFiles.push(full);
+      return full;
+    };
+
+    const pdfBytes = Buffer.from([
+      ...[..."%PDF-1.4\n"].map((c) => c.charCodeAt(0)),
+      ...new Array(200).fill(0x42),
+    ]);
+    const storedPath = makeTempPdf();
+    const now = new Date().toISOString();
+
+    const ownDoc = "00000000-0000-0000-0000-0000000000fa"; // USER A's doc
+    const otherDoc = "00000000-0000-0000-0000-0000000000fb"; // USER B's doc
+    const unsafeDoc = "00000000-0000-0000-0000-0000000000fc"; // outside path
+    const ghostDoc = "00000000-0000-0000-0000-0000000000fd"; // no physical file
+
+    await client`DELETE FROM documents WHERE id IN (${ownDoc}, ${otherDoc}, ${unsafeDoc}, ${ghostDoc})`;
+    if (userARow && userBRow) {
+      await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                   VALUES (${ownDoc}, ${userARow.id}, 'My Statement.PDF', ${storedPath}, 'application/pdf', ${pdfBytes.length}, ${now}, ${now})`;
+      await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                   VALUES (${otherDoc}, ${userBRow.id}, 'Other.PDF', ${storedPath}, 'application/pdf', ${pdfBytes.length}, ${now}, ${now})`;
+      const outsidePath = path.resolve(path.join(STATEMENTS_DIR, "..", "outside-secret.txt"));
+      await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                   VALUES (${unsafeDoc}, ${userARow.id}, 'unsafe.pdf', ${outsidePath}, 'application/pdf', 10, ${now}, ${now})`;
+      await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                   VALUES (${ghostDoc}, ${userARow.id}, 'ghost.pdf', ${path.join(STATEMENTS_DIR, "missing-uuid.pdf")}, 'application/pdf', 100, ${now}, ${now})`;
+    }
+
+    // 1. unauthenticated -> 401
+    const anonDownload = await documentDownloadRoute.loader({
+      request: downloadRequest("", ownDoc),
+      params: { id: ownDoc },
+    } as never);
+    ok(anonDownload.status === 401, "DL: unauthenticated download rejected (401)");
+
+    if (tokenA) {
+      // 2. USER A downloads OWN document -> success, exact bytes, attachment
+      const ownRes = await documentDownloadRoute.loader({
+        request: downloadRequest(tokenA, ownDoc),
+        params: { id: ownDoc },
+      } as never);
+      ok(ownRes.status === 200, "DL: USER A downloads own document (200)");
+      const ownBuf = Buffer.from(await ownRes.arrayBuffer());
+      ok(ownBuf.equals(pdfBytes), "DL: response body is exactly the stored PDF bytes");
+      ok(
+        ownRes.headers.get("Content-Type") === "application/pdf",
+        "DL: Content-Type is application/pdf"
+      );
+      const ownDisp = ownRes.headers.get("Content-Disposition") ?? "";
+      ok(
+        ownDisp.startsWith("attachment; filename=") && ownDisp.includes("My Statement.PDF"),
+        "DL: attachment header carries the original filename"
+      );
+
+      // 3. missing document -> safe 404
+      const missingId = "00000000-0000-0000-0000-0000000000f9";
+      const missing = await documentDownloadRoute.loader({
+        request: downloadRequest(tokenA, missingId),
+        params: { id: missingId },
+      } as never);
+      ok(missing.status === 404, "DL: missing document returns safe 404");
+
+      // 4. unsafe / outside file_path -> rejected, no path leak
+      const unsafe = await documentDownloadRoute.loader({
+        request: downloadRequest(tokenA, unsafeDoc),
+        params: { id: unsafeDoc },
+      } as never);
+      ok(unsafe.status === 404, "DL: outside file_path rejected (no arbitrary read)");
+      const unsafeText = await unsafe.text();
+      ok(
+        !unsafeText.includes("outside-secret") && !unsafeText.includes(STATEMENTS_DIR),
+        "DL: rejected response does not leak the filesystem path"
+      );
+
+      // 5. missing physical file -> safe 404/410, metadata untouched
+      const ghost = await documentDownloadRoute.loader({
+        request: downloadRequest(tokenA, ghostDoc),
+        params: { id: ghostDoc },
+      } as never);
+      ok(
+        ghost.status === 404 || ghost.status === 410,
+        "DL: missing physical file returns safe 404/410 (no crash)"
+      );
+      const ghostRow = await client`SELECT * FROM documents WHERE id = ${ghostDoc}`;
+      ok(ghostRow.length === 1, "DL: missing physical file does not remove/auto-recreate metadata");
+
+      // 6. contained path helper agrees at the pure level
+      ok(
+        safeResolveStoredPath(storedPath, STATEMENTS_DIR) !== null &&
+          safeResolveStoredPath(path.join(STATEMENTS_DIR, "..", "x"), STATEMENTS_DIR) === null,
+        "DL: pure path containment matches route behavior"
+      );
+    }
+
+    if (tokenB) {
+      // 7. USER B cannot download USER A's document -> same safe 404
+      const cross = await documentDownloadRoute.loader({
+        request: downloadRequest(tokenB, ownDoc),
+        params: { id: ownDoc },
+      } as never);
+      ok(cross.status === 404, "DL: USER B cannot download USER A's document (safe 404)");
+      const crossBody = (await cross.json()) as { message?: string };
+      ok(
+        crossBody.message === "Document not found",
+        "DL: cross-user failure is the same safe message as a missing doc"
+      );
+
+      // 8. USER B CAN download their own document (authorization is per-owner)
+      const bOwn = await documentDownloadRoute.loader({
+        request: downloadRequest(tokenB, otherDoc),
+        params: { id: otherDoc },
+      } as never);
+      ok(bOwn.status === 200, "DL: USER B downloads own document (200)");
+    }
+
+    // cleanup
+    await client`DELETE FROM documents WHERE id IN (${ownDoc}, ${otherDoc}, ${unsafeDoc}, ${ghostDoc})`;
+    for (const f of tempFiles) rmSync(f, { force: true });
+  }
+
   // ================= W2-9: ADMIN STATUS LOCK (only USER may be toggled) =================
   {
     const adminBEmail = "w1adminb@test.local";
@@ -396,6 +551,129 @@ async function main() {
     await client`DELETE FROM "User" WHERE id = ${adminBId}`;
   }
 
+  // ================= REG: UPLOAD VALIDATION (MIME / magic / size) =================
+  {
+    const uploadAs = (token: string, file: File) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return uploadRoute.action({
+        request: new Request("http://test.local/api/v1/statements/upload", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }),
+      } as never);
+    };
+    const magicPdf = new Uint8Array([
+      ...[..."%PDF-1.4\n"].map((c) => c.charCodeAt(0)),
+      ...new Array(64).fill(0x20),
+    ]);
+
+    if (tokenA) {
+      // Missing file field -> 400
+      const noFileRes = await uploadRoute.action({
+        request: new Request("http://test.local/api/v1/statements/upload", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${tokenA}` },
+          body: (() => {
+            const f = new FormData();
+            return f;
+          })(),
+        }),
+      } as never);
+      ok(
+        noFileRes.status === 400,
+        "REG: upload without a file field is rejected (400)"
+      );
+
+      // Content that is NOT a PDF (wrong magic bytes, .pdf name) -> 400
+      const fakePdf = new File(
+        [new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00])],
+        "evil.pdf",
+        { type: "application/pdf" }
+      );
+      const fakeRes = await uploadAs(tokenA, fakePdf);
+      ok(
+        fakeRes.status === 400,
+        "REG: non-PDF content with .pdf name is rejected (magic bytes)"
+      );
+
+      // MIME type mismatch -> 400
+      const mimeMismatch = new File([magicPdf as BlobPart], "x.pdf", {
+        type: "image/png",
+      });
+      const mimeRes = await uploadAs(tokenA, mimeMismatch);
+      ok(
+        mimeRes.status === 400,
+        "REG: mismatched MIME type is rejected (400)"
+      );
+
+      // Oversized file (over 20 MB) -> 400
+      const oversized = new File(
+        [
+          new Uint8Array([
+            ...[..."%PDF-1.4\n"].map((c) => c.charCodeAt(0)),
+            ...new Array(20 * 1024 * 1024 + 1).fill(0x20),
+          ]),
+        ],
+        "big.pdf",
+        { type: "application/pdf" }
+      );
+      const bigRes = await uploadAs(tokenA, oversized);
+      ok(
+        bigRes.status === 400,
+        "REG: upload exceeding the 20 MB size limit is rejected (400)"
+      );
+    }
+  }
+
+  // ================= REG: REGISTER -> LOGIN -> SESSION SMOKE =================
+  {
+    const { randomUUID } = await import("node:crypto");
+    const registerRoute = await import("../app/routes/api/auth/register");
+    const smokeEmail = `smoke-${randomUUID()}@test.local`;
+    const smokePassword = "SmokePass!234";
+    const post = (email: string, password: string) =>
+      registerRoute.action({
+        request: new Request("http://test.local/api/v1/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password }),
+        }),
+      } as never);
+
+    const regRes = await post(smokeEmail, smokePassword);
+    const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
+    ok(regRes.status === 201, "REG: register creates a new USER (201)");
+    if (regJson.data?.user?.id) {
+      smokeUserIds.push(regJson.data.user.id);
+
+      const smokeLogin = await loginAs(smokeEmail, smokePassword);
+      ok(
+        smokeLogin.success === true && !!smokeLogin.data?.accessToken,
+        "REG: registered user can log in with their credentials"
+      );
+
+      const sessionRes = await sessionRoute.loader({
+        request: authedRequest("GET", smokeLogin.data.accessToken),
+      } as never);
+      ok(
+        sessionRes.status === 200,
+        "REG: session endpoint validates the new user's token"
+      );
+
+      const dupRes = await post(smokeEmail, smokePassword);
+      const dupJson = (await dupRes.json()) as { code?: string };
+      ok(
+        dupRes.status === 409 && dupJson.code === "EMAIL_ALREADY_EXISTS",
+        "REG: duplicate registration rejected (409 EMAIL_ALREADY_EXISTS)"
+      );
+
+      const shortRes = await post("short@test.local", "short");
+      ok(shortRes.status === 400, "REG: short password rejected (400)");
+    }
+  }
+
   // ================= W2-10 TESTS =================
   console.log("\n=== W2-10: TELEMETRY + SECURITY ===");
 
@@ -430,6 +708,14 @@ async function main() {
   const pdfFile = new File([pdfBytes], "w2-telemetry-test.pdf", {
     type: "application/pdf",
   });
+
+  // Purge any identical prior upload from previous runs so content-hash dedup
+  // can never make this run resolve to a stale document row (and its old
+  // absolute-path file_path) instead of exercising the current storage path.
+  if (userARow) {
+    await client`DELETE FROM documents WHERE user_id = ${userARow.id} AND original_name = 'w2-telemetry-test.pdf'`;
+  }
+
   const uploadForm = new FormData();
   uploadForm.append("file", pdfFile);
   let uploadedDocId: string | null = null;
@@ -444,6 +730,27 @@ async function main() {
   })();
   const uploadBody = (await uploadRes.json()) as { data?: { documentId?: string } };
   uploadedDocId = uploadBody.data?.documentId ?? null;
+
+  // Duplicate rejection: re-uploading identical PDF bytes must return the
+  // stable duplicate payload instead of storing anything again.
+  if (tokenA) {
+    const dupForm = new FormData();
+    dupForm.append("file", pdfFile);
+    const dupReq = new Request("http://test.local/api/v1/statements/upload", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${tokenA}` },
+      body: dupForm,
+    });
+    const dupRes = await uploadRoute.action({ request: dupReq } as never);
+    const dupBody = (await dupRes.json()) as {
+      data?: { duplicate?: boolean; code?: string };
+    };
+    ok(
+      dupBody.data?.duplicate === true &&
+        dupBody.data?.code === "STATEMENT_ALREADY_IMPORTED",
+      "REG: re-uploading the same PDF bytes is rejected as a duplicate"
+    );
+  }
   const statementUpload = await execAuditQuery(AuditAction.STATEMENT_UPLOAD);
   ok(
     statementUpload.some((r) => r.user_id === userARow?.id),
@@ -454,6 +761,54 @@ async function main() {
     statementImport.length >= 0,
     "W2-10: statement import audit check executed (present if parse succeeded)"
   );
+
+  // Storage-driver assertions: the uploaded statement persists under the
+  // server-side object key statements/<userId>/<documentId>.pdf (never a
+  // client path), the object exists in the local test store, and the download
+  // route round-trips the exact uploaded bytes.
+  let uploadedKey: string | null = null;
+  const uploadedRows = userARow
+    ? await client`SELECT id, file_path FROM documents
+                   WHERE user_id = ${userARow.id} AND original_name = 'w2-telemetry-test.pdf'
+                   ORDER BY created_at DESC LIMIT 1`
+    : [];
+  const uploadedRow = uploadedRows[0] ?? null;
+  if (uploadedRow && userARow) {
+    uploadedDocId = uploadedRow.id;
+    uploadedKey = uploadedRow.file_path;
+    const expectedKey = `statements/${userARow.id}/${uploadedRow.id}.pdf`;
+    ok(
+      uploadedRow.file_path === expectedKey,
+      "W2-10: uploaded statement persisted under server-side object key"
+    );
+    const { STATEMENTS_DIR } = await import("../app/lib/storage/statement-path");
+    const { join } = await import("node:path");
+    const { existsSync } = await import("node:fs");
+    const physical = join(STATEMENTS_DIR, uploadedRow.file_path);
+    ok(
+      existsSync(physical),
+      "W2-10: local test storage object exists on disk under STATEMENTS_DIR"
+    );
+    if (tokenA) {
+      const dlReq = new Request(
+        `http://test.local/api/v1/documents/${uploadedRow.id}/download`,
+        { method: "GET", headers: { Authorization: `Bearer ${tokenA}` } }
+      );
+      const dlRes = await documentDownloadRoute.loader({
+        request: dlReq,
+        params: { id: uploadedRow.id },
+      } as never);
+      ok(
+        dlRes.status === 200,
+        "W2-10: uploaded statement downloads through the route"
+      );
+      const dlBytes = Buffer.from(await dlRes.arrayBuffer());
+      ok(
+        dlBytes.equals(Buffer.from(pdfBytes)),
+        "W2-10: downloaded bytes match the uploaded PDF bytes"
+      );
+    }
+  }
 
   // 4. USER CRUD transactions -> audit rows
   const createRes = await ledgersRoute.action({
@@ -545,20 +900,34 @@ async function main() {
     }
     targetStatusRow = userBRow.id;
 
-    // SUSPENDED USER: login succeeds but protected access is denied
+    // SUSPENDED USER: login is REJECTED — the login route itself enforces the
+    // suspended status, so a suspended account must not receive an access token.
     const suspendedLogin = await loginAs(USER_B.email, USER_B.password);
     ok(
-      suspendedLogin.success === true,
-      "W2-10: SUSPENDED user can still authenticate per current login behavior"
+      suspendedLogin.success === false &&
+        suspendedLogin.code === "ACCOUNT_SUSPENDED",
+      "W2-10: SUSPENDED user cannot authenticate (rejected with ACCOUNT_SUSPENDED)"
     );
-    const suspendedToken = suspendedLogin.data?.accessToken;
-    if (suspendedToken) {
+    ok(
+      suspendedLogin.data?.accessToken === undefined,
+      "W2-10: suspended login response carries no access token"
+    );
+
+    // verifyAuth (protection middleware) must still reject the suspended account
+    // even if a JWT is forged for it — a valid token alone is never enough.
+    if (suspendedLogin.code === "ACCOUNT_SUSPENDED" && userBRow) {
+      const jwt = (await import("jsonwebtoken")).default;
+      const forged = jwt.sign(
+        { userId: userBRow.id, email: USER_B.email, role: "USER" },
+        process.env.JWT_SECRET ?? "",
+        { expiresIn: "5m" }
+      );
       const deniedRes = await ledgersRoute.loader({
-        request: authedRequest("GET", suspendedToken),
+        request: authedRequest("GET", forged),
       } as never);
       ok(
         deniedRes.status === 403,
-        "W2-10: SUSPENDED user protected access denied (403)"
+        "W2-10: SUSPENDED user protected access denied (403) even with a forged JWT"
       );
     }
 
@@ -577,11 +946,19 @@ async function main() {
   // 10. audit user_id correctness across A / B / Admin
   const userIds = new Set(allAudit.map((r) => r.user_id));
   const allOwned = allAudit.every((r) => {
-    if (!r.user_id) return r.action === AuditAction.LOGIN_FAILED; // unknown-email failures
+    if (!r.user_id) {
+      // Unknown-email login failures and duplicate-email register failures are
+      // deliberately not tied to a user record.
+      return (
+        r.action === AuditAction.LOGIN_FAILED ||
+        r.action === AuditAction.REGISTER_FAILED
+      );
+    }
     return (
       r.user_id === userARow?.id ||
       r.user_id === userBRow?.id ||
-      r.user_id === adminRow?.id
+      r.user_id === adminRow?.id ||
+      smokeUserIds.includes(r.user_id)
     );
   });
   ok(allOwned, "W2-10: every audit row's user_id belongs to a known test account");
@@ -687,8 +1064,17 @@ async function main() {
   if (uploadedDocId) {
     await client`DELETE FROM documents WHERE id = ${uploadedDocId}`;
   }
+  if (uploadedKey) {
+    const { deleteStoredFile } = await import(
+      "../app/lib/storage/statement-storage"
+    );
+    await deleteStoredFile(uploadedKey);
+  }
   await client`DELETE FROM audit_logs WHERE created_at >= ${startTime}`;
-  console.log("  Removed test audit rows and transient records.");
+  for (const sid of smokeUserIds) {
+    await client`DELETE FROM "User" WHERE id = ${sid}`;
+  }
+  console.log("  Removed test audit rows, transient records, and smoke-test users.");
   console.log("  Kept the intentional seed accounts (USER A, USER B, ADMIN) and their sample data.");
 
   await client.end();
