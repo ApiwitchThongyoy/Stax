@@ -12,10 +12,10 @@ import { useAuth } from "../../lib/auth";
 import {
   fetchUserDocuments,
   deleteUserDocument,
+  downloadUserDocument,
 } from "../../lib/server-api";
 import {
   getLocalDocumentByName,
-  getLocalBlobById,
   deleteDocument,
   type StoredDocumentMeta,
 } from "../../lib/Documentstorage";
@@ -54,6 +54,7 @@ export default function StatementArchivePage({
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState("");
+  const [downloadError, setDownloadError] = useState("");
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set()
   );
@@ -88,17 +89,26 @@ export default function StatementArchivePage({
   }, [user?.accessToken]);
 
   const handleDownload = async (doc: StoredDocumentMeta) => {
-    if (!user?.id) return;
-    const local = await getLocalDocumentByName(user.id, doc.fileName);
-    if (!local) return;
-    const blob = await getLocalBlobById(user.id, local.id);
-    if (!blob) return;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = doc.fileName;
-    a.click();
-    URL.revokeObjectURL(url);
+    // The server is authoritative for the file bytes: we fetch the PDF from
+    // GET /api/v1/documents/:id/download and save the returned Blob. IndexedDB
+    // is no longer the source of truth for download.
+    if (!user?.accessToken) return;
+    setDownloadError("");
+    try {
+      const { blob, filename } = await downloadUserDocument(
+        user.accessToken,
+        doc.id,
+        doc.fileName
+      );
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setDownloadError("ไม่สามารถดาวน์โหลดไฟล์ได้ กรุณาลองใหม่อีกครั้ง");
+    }
   };
 
   const handleDelete = async (id: string, fileName: string) => {
@@ -161,6 +171,12 @@ export default function StatementArchivePage({
           <div className="mb-4 flex items-center gap-2 px-3 py-2.5 rounded-lg bg-red-50 text-red-600 text-sm">
             <span aria-hidden="true">!</span>
             <span>{deleteError}</span>
+          </div>
+        )}
+        {downloadError && (
+          <div className="mb-4 flex items-center gap-2 px-3 py-2.5 rounded-lg bg-red-50 text-red-600 text-sm">
+            <span aria-hidden="true">!</span>
+            <span>{downloadError}</span>
           </div>
         )}
         {loading ? (

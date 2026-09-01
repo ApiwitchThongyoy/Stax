@@ -1,20 +1,22 @@
-import { mkdirSync } from "node:fs";
-import { writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { db } from "../drizzle-db";
 import { documents } from "../../db/schema";
 import { computeContentHash } from "../statement-hash";
-
-// Persistent storage root for uploaded statement PDFs.
-// Files live on the filesystem only — PostgreSQL keeps metadata/path rows (documents table).
-export const STATEMENTS_DIR = path.resolve(process.cwd(), "storage", "statements");
+import {
+  STATEMENTS_DIR,
+  sanitizeDownloadFilename,
+  safeResolveStoredPath,
+} from "./statement-path";
+import {
+  buildObjectKey,
+  getStorageDriver,
+} from "./storage-driver";
 
 // No size limit existed in the previous system; 20 MB is a safe default for statement PDFs.
 export const MAX_PDF_SIZE_BYTES = 20 * 1024 * 1024;
 
 const PDF_MIME_TYPE = "application/pdf";
-const PDF_EXTENSION = ".pdf";
 const PDF_MAGIC = "%PDF-";
 const MAX_ORIGINAL_NAME_LENGTH = 200;
 
@@ -32,15 +34,12 @@ export interface StoredStatementMeta {
   mimeType: string;
   fileSize: number;
   createdAt: string;
+  bytes: Uint8Array;
 }
 
 export type SaveStatementResult =
   | { ok: true; document: StoredStatementMeta }
   | { ok: false; status: number; message: string };
-
-function ensureStatementsDir(): void {
-  mkdirSync(STATEMENTS_DIR, { recursive: true });
-}
 
 // Never trust the client filename for storage paths. Keep a sanitized copy
 // of the original name for display purposes in the documents table only.
@@ -52,6 +51,15 @@ export function sanitizeOriginalName(name: string): string {
   }
   return cleaned.slice(0, MAX_ORIGINAL_NAME_LENGTH);
 }
+
+/**
+ * Header-safe filename + strict path containment for downloads.
+ *
+ * Implemented in the DB-free `./statement-path` module; re-exported here for the
+ * routes that consume them so download logic stays cherry-picked, testable
+ * without a database, and out of the storage write path.
+ */
+export { sanitizeDownloadFilename, safeResolveStoredPath, STATEMENTS_DIR };
 
 export function validatePdfFile(file: File): { ok: true } | { ok: false; message: string } {
   if (!file || typeof file.size !== "number" || file.size <= 0) {
@@ -66,7 +74,7 @@ export function validatePdfFile(file: File): { ok: true } | { ok: false; message
   }
 
   const lowerName = (file.name ?? "").toLowerCase();
-  if (!lowerName.endsWith(PDF_EXTENSION)) {
+  if (!lowerName.endsWith(".pdf")) {
     return { ok: false, message: "Only .pdf files are supported" };
   }
 
@@ -128,89 +136,95 @@ export async function saveStatementPdf(
       return { ok: false, status: 400, message: "File content is not a valid PDF" };
     }
 
-    ensureStatementsDir();
+    // SHA-256 of the file bytes, computed BEFORE storage so dedup can never
+    // assign the hash to an object that was not actually persisted.
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const contentHash = computeContentHash(new Uint8Array(buffer));
 
-    // Stored under a random UUID name to prevent path traversal, collisions,
-    // and overwriting other users' files. Original name is kept in the DB.
-    const storedFileName = `${randomUUID()}${PDF_EXTENSION}`;
-    const destination = path.join(STATEMENTS_DIR, storedFileName);
+    // The document id is generated BEFORE storage so the object key is fully
+    // server-side and deterministic: statements/<userId>/<documentId>.pdf.
+    // Never derived from a client-supplied path.
+    const documentId = randomUUID();
+    const objectKey = buildObjectKey(userId, documentId);
 
-    if (!path.resolve(destination).startsWith(STATEMENTS_DIR)) {
-      return { ok: false, status: 400, message: "Invalid storage path" };
+    const driver = getStorageDriver();
+    const stored = await driver.storePdf({ key: objectKey, bytes: buffer });
+    if (!stored.ok) {
+      return { ok: false, status: stored.status, message: stored.message };
     }
 
-    const buffer = Buffer.from(await file.arrayBuffer());
-    await writeFile(destination, buffer);
-
-    // Deterministic SHA-256 of the file bytes, used for user-scoped dedup.
-    const contentHash = computeContentHash(buffer);
-
     const now = new Date().toISOString();
-    const documentId = randomUUID();
+    const originalName = sanitizeOriginalName(file.name);
 
-    await db
-      .insert(documents)
-      .values({
-        id: documentId,
-        userId,
-        originalName: sanitizeOriginalName(file.name),
-        contentHash,
-        filePath: destination,
-        mimeType: PDF_MIME_TYPE,
-        fileSize: file.size,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .execute();
+    try {
+      await db
+        .insert(documents)
+        .values({
+          id: documentId,
+          userId,
+          originalName,
+          contentHash,
+          filePath: objectKey,
+          mimeType: PDF_MIME_TYPE,
+          fileSize: file.size,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .execute();
+    } catch (error) {
+      // The object was persisted but the DB insert failed — best-effort object
+      // cleanup so no orphaned/unreferenced PDF is left behind. A concurrent
+      // duplicate (postgres 23505) is rethrown so the route can report it as a
+      // duplicate rather than a server failure.
+      try {
+        await driver.deletePdf(objectKey);
+      } catch {
+        // best-effort only
+      }
+      throw error;
+    }
 
     return {
       ok: true,
       document: {
         id: documentId,
         userId,
-        originalName: sanitizeOriginalName(file.name),
+        originalName,
         contentHash,
-        filePath: destination,
+        filePath: objectKey,
         mimeType: PDF_MIME_TYPE,
         fileSize: file.size,
         createdAt: now,
+        bytes: new Uint8Array(buffer),
       },
     };
   } catch (error) {
+    if ((error as { code?: unknown })?.code === "23505") {
+      throw error;
+    }
     console.error("saveStatementPdf: failed to store document", error);
     return { ok: false, status: 500, message: "Internal server error" };
   }
 }
 
 /**
- * Remove the physical statement PDF for a deleted document, safely.
+ * Remove the stored Statement PDF object for a deleted document, safely.
  *
- * Only paths that resolve strictly INSIDE STATEMENTS_DIR are ever touched, so a
- * corrupted/malicious file_path can never delete an arbitrary file. ENOENT is
- * tolerated (the file may already be absent) — this is best-effort cleanup that
- * MUST NOT fail the request. Returns `true` when removal succeeded or the file
- * was already gone, `false` on any other error (caller logs a warning).
+ * Delegates to the active storage driver (Supabase Storage in production, the
+ * filesystem store in local dev/tests). ENOENT / not-found is tolerated (the
+ * object may already be absent) — this is best-effort cleanup that MUST NOT
+ * fail the request. Returns `true` when removal succeeded or the object was
+ * already gone, `false` on any other error (caller logs a warning).
  */
 export async function deleteStoredFile(filePath: string): Promise<boolean> {
   if (!filePath || typeof filePath !== "string") {
     console.warn("deleteStoredFile: empty or invalid stored path");
     return true;
   }
-  const resolved = path.resolve(filePath);
-  if (!resolved.startsWith(STATEMENTS_DIR)) {
-    console.warn(
-      "deleteStoredFile: refusing to delete path outside STATEMENTS_DIR"
-    );
-    return true;
-  }
   try {
-    await unlink(resolved);
-    return true;
+    return await getStorageDriver().deletePdf(filePath);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-      return true;
-    }
-    console.warn("deleteStoredFile: failed to remove file", error);
+    console.warn("deleteStoredFile: failed to remove object", error);
     return false;
   }
 }

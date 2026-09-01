@@ -141,6 +141,42 @@ function main() {
     "Statement Archive no longer lists from IndexedDB"
   );
 
+  // 7. Download wiring: the frontend must get file bytes from the server
+  // endpoint (GET /api/v1/documents/:id/download), NOT IndexedDB as authority.
+  const dlBody = (src: string) => {
+    const s = src.indexOf("const handleDownload");
+    const e = src.indexOf("\n  };", s);
+    return s >= 0 && e >= 0 ? src.slice(s, e + 4) : "";
+  };
+  const archiveSrc = readFileSync(join(process.cwd(), "app/component/DashboardUser/StatementArchivePage.tsx"), "utf8");
+  ok(
+    archiveSrc.includes("downloadUserDocument"),
+    "Statement Archive download uses the server download helper"
+  );
+  ok(
+    archiveSrc.includes("/download") || archiveSrc.includes("downloadUserDocument("),
+    "Statement Archive download reaches the :id/download endpoint"
+  );
+  const archiveDl = dlBody(archiveSrc);
+  ok(
+    archiveDl.includes("downloadUserDocument") &&
+      !archiveDl.includes("getLocalBlobById") &&
+      !archiveDl.includes("getLocalDocumentByName"),
+    "Statement Archive download handler fetches from server (IndexedDB not authoritative)"
+  );
+  const listSrc = readFileSync(join(process.cwd(), "app/component/DashboardUser/Storeddocumentslist.tsx"), "utf8");
+  ok(
+    listSrc.includes("downloadUserDocument"),
+    "Stored Documents List download uses the server download helper"
+  );
+  const listDl = dlBody(listSrc);
+  ok(
+    listDl.includes("downloadUserDocument") &&
+      !listDl.includes("getLocalBlobById") &&
+      !listDl.includes("getLocalDocumentByName"),
+    "Stored Documents List download handler fetches from server (IndexedDB not authoritative)"
+  );
+
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);
   if (failures.length) {

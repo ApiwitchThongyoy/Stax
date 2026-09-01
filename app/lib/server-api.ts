@@ -107,6 +107,50 @@ export async function deleteUserDocument(
   return out.data.id;
 }
 
+// Self-contained fetch used when the response body is NOT JSON (a PDF Blob).
+async function okBlob(
+  res: Response
+): Promise<{ ok: boolean; status: number; blob?: Blob; message?: string }> {
+  if (!res.ok) {
+    let message = "Failed to download the statement";
+    try {
+      const body = (await res.json()) as { message?: string };
+      if (body?.message) message = body.message;
+    } catch {
+      /* non-JSON error body */
+    }
+    return { ok: false, status: res.status, message };
+  }
+  return { ok: true, status: res.status, blob: await res.blob() };
+}
+
+/**
+ * Download one of the authenticated user's Statements as a PDF Blob from the
+ * server (the source of truth for file bytes).
+ *
+ * `documentId` must be the server document UUID; `originalName` is only used as
+ * the download filename in the browser (never sent as the source of truth). The
+ * server enforces ownership, so a document that is not the caller's fails here.
+ * Returns { blob, filename } where filename is the safe server-provided original
+ * name fallback, or throws with a stable message on failure.
+ */
+export async function downloadUserDocument(
+  accessToken: string,
+  documentId: string,
+  originalName: string
+): Promise<{ blob: Blob; filename: string }> {
+  const res = await fetch(`/api/v1/documents/${documentId}/download`, {
+    headers: authHeaders(accessToken),
+  });
+  const out = await okBlob(res);
+  if (!out.ok || !out.blob) {
+    throw new Error(out.message || "Failed to download the statement");
+  }
+  const fallback = originalName || "statement.pdf";
+  return { blob: out.blob, filename: fallback };
+}
+
+
 /**
  * Map a server Capital_Transactions row into the frontend Transaction shape
  * used by the Dashboard, FX page and Calendar.

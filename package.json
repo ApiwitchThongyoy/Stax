@@ -13,12 +13,13 @@
     "db:seed": "node scripts/seed.mjs",
     "db:seed:test": "node scripts/seed-test.mjs",
     "test:w2": "tsx scripts/run-tests.mts",
-    "test": "tsx scripts/test-tax-engine.mts && tsx scripts/test-gemini-parser.mts && tsx scripts/test-gemini-analysis-storage.mts && tsx scripts/test-statement-dedup.mts && tsx scripts/test-server-api.mts && tsx scripts/test-ui-placeholders.mts && tsx scripts/test-portal-access.mts"
+    "test": "tsx scripts/test-tax-engine.mts && tsx scripts/test-gemini-parser.mts && tsx scripts/test-gemini-analysis-storage.mts && tsx scripts/test-statement-dedup.mts && tsx scripts/test-server-api.mts && tsx scripts/test-ui-placeholders.mts && tsx scripts/test-portal-access.mts && tsx scripts/test-document-download.mts"
   },
   "dependencies": {
     "@google/genai": "^2.19.0",
     "@react-router/node": "8.0.0",
     "@react-router/serve": "8.0.0",
+    "@supabase/supabase-js": "^2.112.4",
     "bcryptjs": "^3.0.3",
     "decimal.js": "^10.6.0",
     "dotenv": "^17.4.2",
