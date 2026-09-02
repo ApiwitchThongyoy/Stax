@@ -39,6 +39,9 @@ const documentsRoute = await import("../app/routes/api/documents");
 const documentRoute = await import("../app/routes/api/documents.$id");
 const documentDownloadRoute = await import("../app/routes/api/documents.$id.download");
 const taxCalculateRoute = await import("../app/routes/api/tax/calculate");
+const exportRoute = await import("../app/routes/api/export");
+const exchangeRatesRoute = await import("../app/routes/api/exchange-rates");
+const analysisRoute = await import("../app/routes/api/analysis");
 
 const { AuditAction } = await import("../app/lib/audit-log");
 
@@ -88,6 +91,39 @@ function authedRequest(method: string, token: string) {
     method,
     headers: { Authorization: `Bearer ${token}` },
   });
+}
+
+// Minimal single-page PDF builder used to feed the REAL upload route with
+// extractable statement text (pdfjs-text-readable, correct xref table).
+function makePdf(lines: string[]): Uint8Array {
+  const esc = (s: string) => s.replace(/([()\\])/g, "\\$1");
+  const content =
+    "BT\n/F1 10 Tf\n" +
+    lines
+      .map((l, i) => `${i === 0 ? "72 720 Td" : "0 -14 Td"} (${esc(l)}) Tj`)
+      .join("\n") +
+    "\nET\n";
+  const objs = [
+    "<</Type/Catalog/Pages 2 0 R>>",
+    "<</Type/Pages/Kids[3 0 R]/Count 1>>",
+    "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>",
+    `<</Length ${Buffer.byteLength(content, "latin1")}>>\nstream\n${content}endstream`,
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+  ];
+  const chunks: Buffer[] = [Buffer.from("%PDF-1.4\n", "latin1")];
+  const offsets: number[] = [0];
+  let pos = chunks[0].length;
+  for (let i = 0; i < objs.length; i++) {
+    offsets.push(pos);
+    const c = Buffer.from(`${i + 1} 0 obj\n${objs[i]}\nendobj\n`, "latin1");
+    chunks.push(c);
+    pos += c.length;
+  }
+  let xref = `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`;
+  for (const off of offsets) xref += `${String(off).padStart(10, "0")} 00000 n \n`;
+  const trailer = `trailer\n<</Size ${objs.length + 1}/Root 1 0 R>>\nstartxref\n${pos}\n%%EOF\n`;
+  chunks.push(Buffer.from(xref, "latin1"), Buffer.from(trailer, "latin1"));
+  return Buffer.concat(chunks);
 }
 
 async function loginAs(email: string, password: string) {
@@ -627,6 +663,173 @@ async function main() {
     }
   }
 
+  // ================= REG: RE-IMPORT AFTER LEDGER DELETION =================
+  // The reported bug: a user deletes their imported financial/ledger rows but the
+  // document row (and its stored PDF) remains; re-uploading the SAME PDF was
+  // wrongly rejected as a duplicate (hash-only detection), so ZERO rows were
+  // restored. Fix contract: when the document exists WITHOUT its derived rows,
+  // the import pipeline re-runs under the SAME document id — no new document, no
+  // duplicate rows, cost-basis cache rebuilt.
+  {
+    const statementLines = [
+      "TRADE RECORDS",
+      "Currency: USD",
+      "USD/THB = 35.42",
+      "VRMAX",
+      "02/01/2026 10:00:00,GMT+07 02/01/2026 BUY 100 10.00 1000.00 1000.00 1.00 0.07 NASDAQ",
+      "VRMAX",
+      "03/01/2026 10:00:00,GMT+07 03/01/2026 BUY 100 20.00 2000.00 2000.00 1.50 0.10 NYSE",
+      "VRMAX",
+      "04/01/2026 10:00:00,GMT+07 04/01/2026 SELL 50 30.00 1500.00 1497.93 1.00 0.07 NASDAQ",
+      "PORTFOLIO SUMMARY",
+    ];
+    const reimportFile = new File([makePdf(statementLines) as BlobPart], "w2-reimport-test.pdf", {
+      type: "application/pdf",
+    });
+    const reimportAs = (token: string, file: File) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return uploadRoute.action({
+        request: new Request("http://test.local/api/v1/statements/upload", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }),
+      } as never);
+    };
+    if (tokenA && userARow) {
+      const countRowsFor = (documentId: string) =>
+        client`SELECT COUNT(*)::int AS n FROM "Capital_Transactions" WHERE source_document_id = ${documentId} AND user_id = ${userARow.id}`;
+      // purge any leftover doc/rows/cache from earlier runs so the fixture is clean
+      const priorDocs = await client`SELECT id FROM documents WHERE user_id = ${userARow.id} AND original_name = 'w2-reimport-test.pdf'`;
+      for (const d of priorDocs) {
+        await client`DELETE FROM "Capital_Transactions" WHERE source_document_id = ${d.id} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM documents WHERE id = ${d.id} AND user_id = ${userARow.id}`;
+      }
+      await client`DELETE FROM cost_basis_state WHERE user_id = ${userARow.id}`;
+
+      // 1. First upload: rows are imported under a NEW document.
+      const first = await reimportAs(tokenA, reimportFile);
+      const firstBody = (await first.json()) as {
+        data?: { documentId?: string; saved?: number; duplicateDecision?: string };
+      };
+      ok(
+        first.status === 200 && (firstBody.data?.saved ?? 0) > 0,
+        "REG-reimport: first upload imports rows (saved > 0)"
+      );
+      const reimportDocId = firstBody.data?.documentId;
+      ok(!!reimportDocId, "REG-reimport: first upload returns a document id");
+      const importedFirstCount = reimportDocId
+        ? (await countRowsFor(reimportDocId))[0]?.n ?? 0
+        : 0;
+      ok(
+        importedFirstCount === firstBody.data?.saved,
+        "REG-reimport: DB row count matches the reported saved count"
+      );
+      const basisAfterFirst = await client`SELECT symbol FROM cost_basis_state WHERE user_id = ${userARow.id}`;
+      ok(
+        basisAfterFirst.some((b) => b.symbol === "VRMAX"),
+        "REG-reimport: first import persisted the running-average cost basis (VRMAX)"
+      );
+
+      // 2. Re-upload with rows PRESENT -> duplicate protection still holds.
+      const dup = await reimportAs(tokenA, reimportFile);
+      const dupBody = (await dup.json()) as {
+        data?: { duplicate?: boolean; code?: string };
+      };
+      ok(
+        dupBody.data?.duplicate === true &&
+          dupBody.data?.code === "STATEMENT_ALREADY_IMPORTED",
+        "REG-reimport: re-upload WITH derived rows present is still rejected as a duplicate"
+      );
+      const cntAfterDup = reimportDocId ? ((await countRowsFor(reimportDocId))[0]?.n ?? 0) : 0;
+      ok(
+        cntAfterDup === importedFirstCount,
+        "REG-reimport: duplicate upload does NOT change the row count"
+      );
+
+      // 3. USER DELETES their financial data: derived ledger rows + cost-basis
+      //    cache are removed, but the documents row (and stored PDF) remain.
+      if (reimportDocId) {
+        await client`DELETE FROM "Capital_Transactions" WHERE source_document_id = ${reimportDocId} AND user_id = ${userARow.id}`;
+      }
+      await client`DELETE FROM cost_basis_state WHERE user_id = ${userARow.id}`;
+      const docRowStill = reimportDocId
+        ? await client`SELECT id FROM documents WHERE id = ${reimportDocId} AND user_id = ${userARow.id}`
+        : [];
+      ok(
+        docRowStill.length === 1,
+        "REG-reimport: documents row survives the ledger deletion (the bug's precondition)"
+      );
+
+      // 4. Re-upload the SAME PDF -> the document is REBUILT (not rejected),
+      //    restoring every row under the SAME document id.
+      const rebuilt = await reimportAs(tokenA, reimportFile);
+      const rebuiltBody = (await rebuilt.json()) as {
+        data?: {
+          documentId?: string;
+          saved?: number;
+          rebuilt?: boolean;
+          duplicateDecision?: string;
+        };
+      };
+      ok(
+        rebuilt.status === 200 && rebuiltBody.data?.rebuilt === true,
+        "REG-reimport: re-upload after deletion REBUILDS the document (not a duplicate)"
+      );
+      ok(
+        !!reimportDocId && rebuiltBody.data?.documentId === reimportDocId,
+        "REG-reimport: rebuild reuses the SAME document id (no duplicate document row)"
+      );
+      ok(
+        rebuiltBody.data?.saved === importedFirstCount,
+        "REG-reimport: rebuild restores the same number of rows as the original import"
+      );
+      const cntAfterRebuild = reimportDocId ? ((await countRowsFor(reimportDocId))[0]?.n ?? 0) : 0;
+      ok(
+        cntAfterRebuild === importedFirstCount,
+        "REG-reimport: rebuilt ledger row count matches the original"
+      );
+      const basisAfterRebuild = await client`SELECT symbol FROM cost_basis_state WHERE user_id = ${userARow.id}`;
+      ok(
+        basisAfterRebuild.some((b) => b.symbol === "VRMAX"),
+        "REG-reimport: rebuild re-persists the running-average cost basis (VRMAX)"
+      );
+
+      // 5. Statement DELETE must reconcile the derived cache: removing the whole
+      //    statement also removes its BUY contribution from cost_basis_state.
+      const delRes = reimportDocId
+        ? await documentRoute.action({
+            request: authedRequest("DELETE", tokenA),
+            params: { id: reimportDocId },
+          } as never)
+        : null;
+      ok(delRes?.status === 200, "REG-reimport: statement delete succeeds after rebuild");
+      const docGone = reimportDocId
+        ? await client`SELECT id FROM documents WHERE id = ${reimportDocId} AND user_id = ${userARow.id}`
+        : [];
+      const txsGone = reimportDocId
+        ? await client`SELECT transaction_id FROM "Capital_Transactions" WHERE source_document_id = ${reimportDocId} AND user_id = ${userARow.id}`
+        : [];
+      ok(
+        docGone.length === 0 && txsGone.length === 0,
+        "REG-reimport: statement delete removes the document AND its derived rows"
+      );
+      const basisAfterDelete = await client`SELECT symbol FROM cost_basis_state WHERE user_id = ${userARow.id}`;
+      ok(
+        basisAfterDelete.every((b) => b.symbol !== "VRMAX"),
+        "REG-reimport: statement delete reconciles cost_basis_state (no stale VRMAX cache)"
+      );
+
+      // defensive cleanup for any partial state (audit rows are removed globally)
+      if (reimportDocId) {
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${userARow.id} AND source_document_id = ${reimportDocId}`;
+        await client`DELETE FROM documents WHERE id = ${reimportDocId} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM notifications WHERE entity_id = ${reimportDocId}`;
+      }
+    }
+  }
+
   // ================= REG: REGISTER -> LOGIN -> SESSION SMOKE =================
   {
     const { randomUUID } = await import("node:crypto");
@@ -1053,6 +1256,268 @@ async function main() {
   const tooMany = await taxFor(tokenA, Array.from({ length: 501 }, (_, i) => `id-${i}`));
   ok(tooMany.status === 400, "W1-2: oversized transactionIds rejected (400)");
 
+  // === W2-11: EXPORT + NOTIFICATIONS + HISTORICAL FX PROVIDER (MOCKED) + ANALYSIS ===
+  console.log("\n=== W2-11: EXPORT / NOTIFICATIONS / HISTORICAL FX (MOCKED) / ANALYSIS ===");
+  {
+    const { randomUUID } = await import("node:crypto");
+
+    // ---- 1. Export: auth + user scoping + validation ----
+    if (tokenA) {
+      // unauthenticated -> 401
+      const anonExport = await exportRoute.action({
+        request: new Request("http://test.local/api/v1/export", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ format: "csv" }),
+        }),
+      } as never);
+      ok(anonExport.status === 401, "W2-11: unauthenticated export rejected (401)");
+
+      // USER A CSV export -> 200 + attachment headers + own rows only
+      const aCsv = await exportRoute.action({
+        request: jsonBody({ format: "csv" }, "POST", tokenA),
+      } as never);
+      ok(aCsv.status === 200, "W2-11: USER A CSV export succeeds (200)");
+      ok(
+        (aCsv.headers.get("Content-Type") ?? "").includes("text/csv"),
+        "W2-11: CSV export has text/csv content type"
+      );
+      const aCsvBody = Buffer.from(await aCsv.arrayBuffer()).toString("utf-8");
+      ok(
+        aCsvBody.includes("35420") && aCsvBody.includes("17550"),
+        "W2-11: USER A CSV contains A's seeded amounts"
+      );
+      ok(
+        !aCsvBody.includes("8800") && !aCsvBody.includes("35.2"),
+        "W2-11: USER A CSV does NOT contain USER B's data"
+      );
+
+      // date format validation -> 400
+      const badDate = await exportRoute.action({
+        request: jsonBody({ format: "csv", dateFrom: "2026/01/01" }, "POST", tokenA),
+      } as never);
+      ok(badDate.status === 400, "W2-11: malformed dateFrom rejected (400)");
+    }
+
+    if (tokenB) {
+      const bCsv = await exportRoute.action({
+        request: jsonBody({ format: "csv" }, "POST", tokenB),
+      } as never);
+      ok(bCsv.status === 200, "W2-11: USER B CSV export succeeds (200)");
+      const bCsvBody = Buffer.from(await bCsv.arrayBuffer()).toString("utf-8");
+      ok(bCsvBody.includes("8800"), "W2-11: USER B CSV contains B's amount");
+      ok(
+        !bCsvBody.includes("35420"),
+        "W2-11: USER B CSV does NOT contain USER A's data"
+      );
+    }
+
+    // ---- 2. Notifications: idempotency + opt-out (service level, DB-backed) ----
+    if (userARow && userBRow) {
+      const hidePath = await import("../app/lib/notification-service");
+      const entityKey = "00000000-0000-0000-0000-00000000nt1";
+      await client`DELETE FROM notifications WHERE entity_id = ${entityKey}`;
+      await hidePath.notifyStatementUploaded(userARow.id, "dup.pdf", entityKey);
+      await hidePath.notifyStatementUploaded(userARow.id, "dup.pdf", entityKey);
+      const notifRows = await client`SELECT * FROM notifications WHERE entity_id = ${entityKey}`;
+      ok(notifRows.length === 1, "W2-11: repeated notify for same entity creates ONE notification (idempotent)");
+      ok(
+        notifRows[0].type === "STATEMENT_UPLOAD" && notifRows[0].user_id === userARow.id,
+        "W2-11: notification row carries correct user + type"
+      );
+      await client`DELETE FROM notifications WHERE entity_id = ${entityKey}`;
+
+      // opt-out: notificationEnabled=false -> no notification row created
+      const settingsId = "00000000-0000-0000-0000-00000000s1";
+      const now = new Date().toISOString();
+      await client`DELETE FROM user_settings WHERE id = ${settingsId}`;
+      await client`INSERT INTO user_settings (id, user_id, notification_enabled, email_notification_enabled, created_at, updated_at)
+                   VALUES (${settingsId}, ${userBRow.id}, false, false, ${now}, ${now})`;
+      const optEntity = "00000000-0000-0000-0000-00000000nt2";
+      await client`DELETE FROM notifications WHERE entity_id = ${optEntity}`;
+      await hidePath.notifyStatementDuplicate(userBRow.id, "off.pdf", optEntity);
+      const optRows = await client`SELECT * FROM notifications WHERE entity_id = ${optEntity}`;
+      ok(optRows.length === 0, "W2-11: disabled notifications produce no rows (opt-out honored)");
+      await client`DELETE FROM notifications WHERE entity_id = ${optEntity}`;
+      await client`DELETE FROM user_settings WHERE id = ${settingsId}`;
+    }
+
+    // ---- 3. Historical FX provider with MOCKED HTTP (never a live call) ----
+    {
+      const savedFetch = globalThis.fetch;
+      const botEnv = process.env.BOT_API_KEY;
+      delete process.env.BOT_API_KEY;
+      const fxDate = "2025-07-07";
+      const fxDateFail = "2025-07-08";
+      const fxDateWeekend = "2025-07-09";
+      await client`DELETE FROM exchange_rate_cache WHERE rate_date IN (${fxDate}, ${fxDateFail}, ${fxDateWeekend})`;
+
+      const fxRequest = (token: string | undefined, query: string) =>
+        exchangeRatesRoute.loader({
+          request: new Request(`http://test.local/api/v1/exchange-rates?${query}`, {
+            method: "GET",
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+          }),
+        } as never);
+
+      // no BOT-specific runtime dependency: the endpoint works with no key at all
+      ok(process.env.BOT_API_KEY === undefined, "W2-11: BOT_API_KEY is not required (deprecated)");
+
+      // unauthenticated -> 401 even before any fetch happens
+      const anonRates = await fxRequest("", "currency=USD");
+      ok(anonRates.status === 401, "W2-11: unauthenticated exchange-rate access rejected (401)");
+
+      // success path: intercept the provider request with a canned ECB response
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = String(input);
+        ok(
+          url.includes("api.frankfurter.app") && url.includes("from=USD") && url.includes("to=THB"),
+          "W2-11: FX provider fetch targets the keyless historical endpoint (from=USD,to=THB)"
+        );
+        ok(!url.includes("apigw1.bot.or.th"), "W2-11: no BOT endpoint is ever contacted");
+        return new Response(
+          JSON.stringify({
+            amount: 1,
+            base: "USD",
+            date: fxDate,
+            rates: { THB: 34.5 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        ) as Response;
+      }) as typeof fetch;
+
+      if (tokenA) {
+        const okRes = await fxRequest(tokenA, "currency=USD&date=" + fxDate);
+        const okBody = (await okRes.json()) as {
+          data?: { available?: boolean; rate?: number; currency?: string; source?: string };
+        };
+        ok(okRes.status === 200 && okBody.data?.available === true, "W2-11: provider success -> available true");
+        ok(okBody.data?.rate === 34.5, "W2-11: provider rate parsed exactly (34.5)");
+        ok(okBody.data?.currency === "USD", "W2-11: provider response echoes the requested currency");
+        ok(okBody.data?.source === "historical-fx-provider", "W2-11: provider source label is historical-fx-provider");
+      }
+
+      // failure path: provider returns 404 -> available false, never a rate
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ message: "not found" }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        }) as Response) as typeof fetch;
+
+      if (tokenA) {
+        const failRes = await fxRequest(tokenA, "currency=USD&date=" + fxDateFail);
+        const failBody = (await failRes.json()) as {
+          data?: { available?: boolean; rate?: number; reason?: string };
+        };
+        ok(failBody.data?.available === false && failBody.data?.rate === undefined,
+          "W2-11: provider failure -> available false, no invented rate");
+      }
+
+      // THB is always 1 (base currency) without calling anything
+      let providerCalledForThb = false;
+      globalThis.fetch = (async () => {
+        providerCalledForThb = true;
+        return new Response(JSON.stringify({ rates: {} }), { status: 200 });
+      }) as typeof fetch;
+      if (tokenA) {
+        const thbRes = await fxRequest(tokenA, "currency=THB&date=" + fxDateWeekend);
+        const thbBody = (await thbRes.json()) as {
+          data?: { available?: boolean; rate?: number };
+        };
+        ok(thbBody.data?.available === true && thbBody.data?.rate === 1,
+          "W2-11: THB is base currency -> rate 1, no network needed");
+        ok(providerCalledForThb === false, "W2-11: THB lookup never touches the provider");
+      }
+
+      // cached fallback: a cached rate is served without any provider call
+      await client`INSERT INTO exchange_rate_cache (id, rate_date, currency, rate, source, created_at)
+                   VALUES ('00000000-0000-0000-0000-00000000fx1', ${fxDateFail}, 'USD', '34.7500', 'historical-fx-provider', now())`;
+      let providerCalledForCache = false;
+      globalThis.fetch = (async () => {
+        providerCalledForCache = true;
+        return new Response(JSON.stringify({ message: "boom" }), { status: 500 });
+      }) as typeof fetch;
+      if (tokenA) {
+        const cacheRes = await fxRequest(tokenA, "currency=USD&date=" + fxDateFail);
+        const cacheBody = (await cacheRes.json()) as {
+          data?: { available?: boolean; rate?: number; source?: string };
+        };
+        ok(cacheBody.data?.available === true && cacheBody.data?.rate === 34.75,
+          "W2-11: cached rate served even though the provider is down (34.75)");
+        ok(providerCalledForCache === false, "W2-11: cache hit never reaches the provider");
+      }
+
+      // restore environment + real fetch; cleanup cache rows written above
+      if (botEnv === undefined) delete process.env.BOT_API_KEY;
+      else process.env.BOT_API_KEY = botEnv;
+      globalThis.fetch = savedFetch;
+      await client`DELETE FROM exchange_rate_cache WHERE rate_date IN (${fxDate}, ${fxDateFail}, ${fxDateWeekend})`;
+    }
+
+    // ---- 4. Analysis endpoint: auth + graceful unavailable (no live Gemini) ----
+    {
+      const savedGemini = process.env.GEMINI_API_KEY;
+      const savedGeminiModel = process.env.GEMINI_MODEL;
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.GEMINI_MODEL;
+
+      const anonAnalysis = await analysisRoute.action({
+        request: jsonBody({}, "POST", undefined),
+      } as never);
+      ok(anonAnalysis.status === 401, "W2-11: unauthenticated analysis rejected (401)");
+
+      if (tokenA) {
+        const aAnalysis = await analysisRoute.action({
+          request: jsonBody({}, "POST", tokenA),
+        } as never);
+        const aBody = (await aAnalysis.json()) as {
+          success?: boolean;
+          data?: { available?: boolean; code?: string | null };
+        };
+        ok(
+          aAnalysis.status === 200 && aBody.success === true,
+          "W2-11: analysis returns a graceful response (200)"
+        );
+        ok(
+          aBody.data?.available === false && aBody.data?.code === "gemini_not_configured",
+          "W2-11: analysis is unavailable when Gemini not configured (no crash)"
+        );
+      }
+
+      // restore
+      if (savedGemini === undefined) delete process.env.GEMINI_API_KEY;
+      else process.env.GEMINI_API_KEY = savedGemini;
+      if (savedGeminiModel === undefined) delete process.env.GEMINI_MODEL;
+      else process.env.GEMINI_MODEL = savedGeminiModel;
+    }
+
+    // ---- 5. users.created_at set on registration ----
+    {
+      const registerRoute = await import("../app/routes/api/auth/register");
+      const email = `join-${randomUUID()}@test.local`;
+      const res = await registerRoute.action({
+        request: new Request("http://test.local/api/v1/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, password: "JoinPass!234" }),
+        }),
+      } as never);
+      const body = (await res.json()) as { data?: { user?: { id?: string } } };
+      const newId = body.data?.user?.id;
+      if (newId) {
+        const row = await client`SELECT created_at FROM "User" WHERE id = ${newId}`;
+        ok(
+          row.length === 1 && row[0]?.created_at !== null,
+          "W2-11: newly-registered user has a non-null created_at"
+        );
+        // Cleaned up in the CLEANUP block (audit rows deleted first, then user).
+        smokeUserIds.push(newId);
+      } else {
+        ok(false, "W2-11: register created_user_id missing (created_at not checked)");
+      }
+    }
+  }
+
   // ================= CLEANUP =================
   console.log("\n=== CLEANUP ===");
   const cleanIds: string[] = [];
@@ -1071,6 +1536,7 @@ async function main() {
     await deleteStoredFile(uploadedKey);
   }
   await client`DELETE FROM audit_logs WHERE created_at >= ${startTime}`;
+  await client`DELETE FROM notifications WHERE created_at >= ${startTime}`;
   for (const sid of smokeUserIds) {
     await client`DELETE FROM "User" WHERE id = ${sid}`;
   }

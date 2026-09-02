@@ -4,6 +4,7 @@ import { useAuth } from "../../lib/auth";
 import {
   fetchUserDocuments,
   downloadUserDocument,
+  deleteUserDocument,
 } from "../../lib/server-api";
 import {
   getLocalDocumentByName,
@@ -22,7 +23,6 @@ function formatDate(iso: string): string {
   return d.toLocaleDateString("th-TH", { year: "numeric", month: "short", day: "numeric" });
 }
 
-// รายการนี้เก็บไฟล์ไว้แค่ในเบราว์เซอร์เครื่องนี้เท่านั้น (IndexedDB) — ไม่ใช่การเก็บบน cloud/server จริง
 interface StoredDocumentsListProps {
   refreshTrigger?: number;
 }
@@ -81,13 +81,22 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
   };
 
   const handleDelete = async (id: string, fileName: string) => {
-    if (!user?.id) return;
-    const local = await getLocalDocumentByName(user.id, fileName);
-    if (local) {
-      await deleteDocument(user.id, local.id);
+    if (!user?.accessToken) return;
+    setError("");
+    try {
+      // Server-authoritative delete: removes the document row AND its
+      // originating transactions (user-scoped, atomic).
+      await deleteUserDocument(user.accessToken, id);
+      // Best-effort cleanup of the optional local IndexedDB copy.
+      if (user.id) {
+        const local = await getLocalDocumentByName(user.id, fileName);
+        if (local) {
+          await deleteDocument(user.id, local.id);
+        }
+      }
+    } catch {
+      setError("ไม่สามารถลบไฟล์ได้ กรุณาลองใหม่อีกครั้ง");
     }
-    // Server-authoritative document row is not deleted here (no user-scoped
-    // server delete endpoint yet); only the optional local IndexedDB copy.
     refresh();
   };
 
@@ -99,8 +108,8 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
         <h3 className="text-sm font-semibold text-gray-800">
           ไฟล์ Statement ที่จัดเก็บไว้
         </h3>
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 font-medium">
-          เก็บในเครื่องนี้เท่านั้น
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-600 font-medium">
+          บนเซิร์ฟเวอร์
         </span>
       </div>
 

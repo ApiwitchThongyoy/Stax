@@ -39,8 +39,8 @@ function formatDate(dateStr: string): string {
   return dateStr;
 }
 
-function toNumber(value: string | number): number {
-  const num = typeof value === "number" ? value : parseFloat(value);
+function toNumber(value: string | number | null | undefined): number {
+  const num = typeof value === "number" ? value : parseFloat(value ?? "");
   return Number.isNaN(num) ? 0 : num;
 }
 
@@ -82,7 +82,7 @@ function buildExportRows(
     ประเภท: TYPE_LABELS[row.type] ?? row.type,
     สกุลเงิน: row.currency,
     "จำนวนเงิน (ต่างชาติ)": toNumber(row.amountForeign),
-    "อัตราแลกเปลี่ยน": toNumber(row.fxRateBot),
+    "อัตราแลกเปลี่ยน": toNumber(row.fxRateEffective ?? row.fxRateBot),
     "จำนวนเงิน (บาท)": toNumber(row.amountThb),
     "แหล่งที่มา": row.sourceType,
   }));

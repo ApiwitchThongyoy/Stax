@@ -3,6 +3,7 @@ import type { Route } from "./+types/capital-ledgers.$id";
 import { db } from "~/lib/drizzle-db";
 import { capitalTransactions } from "~/db/schema";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
+import { rebuildCostBasisStateFromLedger } from "~/lib/statement-pipeline";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"];
@@ -155,6 +156,8 @@ async function handleUpdate(
       return Response.json({ success: false, message: err }, { status: 400 });
     }
     setValues.fxRateBot = String(updates.fxRateBot);
+    // Keep the effective rate in sync so consumers read it uniformly.
+    setValues.fxRateEffective = String(updates.fxRateBot);
   }
 
   if ("amountThb" in updates) {
@@ -300,6 +303,15 @@ async function handleDelete(
         )
       )
       .execute();
+
+    // Reconcile the derived cost-basis cache with the rows that remain, so a
+    // deleted BUY/SELL can never leave a double-counted cache for re-imports.
+    // Best-effort: an import re-seeds from the authoritative ledger/statement.
+    try {
+      await rebuildCostBasisStateFromLedger(userId);
+    } catch (error) {
+      console.warn("CapitalLedgers DELETE: cost_basis_state rebuild failed", error);
+    }
 
     await insertAuditLog({
       userId,

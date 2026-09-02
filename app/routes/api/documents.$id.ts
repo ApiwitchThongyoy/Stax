@@ -4,6 +4,7 @@ import { db } from "~/lib/drizzle-db";
 import { documents, capitalTransactions } from "~/db/schema";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import { deleteStoredFile } from "~/lib/storage/statement-storage";
+import { rebuildCostBasisStateFromLedger } from "~/lib/statement-pipeline";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 const UUID_REGEX =
@@ -120,6 +121,16 @@ export async function action({ request, params }: Route.ActionArgs) {
       result: "success",
     },
   });
+
+  // Reconcile the derived cost-basis cache with the rows that REMAIN (the
+  // deleted statement's rows are gone). Without this, a later re-import could
+  // double-count the deleted statement's buys. Best-effort: if it fails, an
+  // import re-seeds from the authoritative ledger/statement on the next upload.
+  try {
+    await rebuildCostBasisStateFromLedger(auth.userId);
+  } catch (error) {
+    console.warn("DocumentDelete: cost_basis_state rebuild failed", error);
+  }
 
   // Best-effort physical file cleanup AFTER the DB commit succeeded. A failure
   // here is logged (sanitized) but does NOT recreate DB rows — the document is

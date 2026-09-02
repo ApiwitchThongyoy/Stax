@@ -104,10 +104,10 @@ async function hasPdfMagicBytes(file: File): Promise<boolean> {
 export async function findExistingDocumentByHash(
   userId: string,
   contentHash: string
-): Promise<{ id: string } | null> {
+): Promise<{ id: string; originalName?: string } | null> {
   const { eq, and } = await import("drizzle-orm");
   const rows = await db
-    .select({ id: documents.id })
+    .select({ id: documents.id, originalName: documents.originalName })
     .from(documents)
     .where(
       and(eq(documents.userId, userId), eq(documents.contentHash, contentHash))
