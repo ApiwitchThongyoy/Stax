@@ -102,7 +102,13 @@ interface AdminStatsPayload {
     last7Days: number;
     perDay?: { date: string; files: number }[];
   };
-  uploadStatus?: { available: boolean; reason?: string };
+  apiStatus?: {
+    connected: number;
+    total: number;
+    fxProvider?: { configured: boolean };
+    gemini?: { configured: boolean };
+    taxEngine?: { configured: boolean };
+  };
 }
 
 const adminNavItems: { id: AdminSection; label: string; icon: typeof LayoutDashboard }[] = [
@@ -134,6 +140,14 @@ function displayNameFromEmail(email: string): string {
   return prefix.charAt(0).toUpperCase() + prefix.slice(1);
 }
 
+function formatJoinedAt(iso: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const thaiYear = d.getFullYear() + 543;
+  return `${d.getDate()} ${THAI_MONTHS_ABBR[d.getMonth()] ?? ""} ${thaiYear}`;
+}
+
 function rowToAdminUserRow(u: AdminUsersApiRow): AdminUserRow {
   return {
     id: u.id,
@@ -142,7 +156,7 @@ function rowToAdminUserRow(u: AdminUsersApiRow): AdminUserRow {
     role: ROLE_LABEL[u.role] ?? u.role,
     rawRole: u.role,
     status: u.status === "SUSPENDED" ? "suspended" : "active",
-    joinedAt: "",
+    joinedAt: u.createdAt ?? "",
     lastSeenAt: u.lastSeenAt ?? null,
     lastLoginAt: u.lastLoginAt ?? null,
     filesUploaded: u.documentCount ?? 0,
@@ -292,6 +306,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
         documentCount?: number;
         lastSeenAt?: string | null;
         lastLoginAt?: string | null;
+        createdAt?: string | null;
       }[];
 
       void setUsers(
@@ -301,12 +316,12 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
           email: u.email,
           role: ROLE_LABEL[u.role] ?? u.role,
           rawRole: u.role,
-          status: u.status === "SUSPENDED" ? "suspended" : "active",
-          joinedAt: "",
-          lastSeenAt: u.lastSeenAt ?? null,
-          lastLoginAt: u.lastLoginAt ?? null,
-          filesUploaded: u.documentCount ?? 0,
-        }))
+        status: u.status === "SUSPENDED" ? "suspended" : "active",
+        joinedAt: u.createdAt ?? "",
+        lastSeenAt: u.lastSeenAt ?? null,
+        lastLoginAt: u.lastLoginAt ?? null,
+        filesUploaded: u.documentCount ?? 0,
+      }))
       );
 
       void setStats(statsJson?.data ?? null);
@@ -429,8 +444,17 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   const suspendedUsers = stats?.userCounts?.suspended ?? 0;
   const totalUploadsThisWeek = stats?.documents?.last7Days ?? uploadLog.length;
   const failedUploads: number | null = null;
-  const connectedApis: number | null = null;
-  const apiTotal: number | null = null;
+  const connectedApis = stats?.apiStatus?.connected ?? null;
+  const apiTotal = stats?.apiStatus?.total ?? null;
+  const fxProviderConfigured = stats?.apiStatus?.fxProvider?.configured ?? null;
+  const geminiConfigured = stats?.apiStatus?.gemini?.configured ?? null;
+  const taxEngineConfigured = stats?.apiStatus?.taxEngine?.configured ?? null;
+
+  const apiRows: { key: string; label: string; ok: boolean | null }[] = [
+    { key: "fx", label: "Historical FX Provider (อัตราแลกเปลี่ยนย้อนหลัง)", ok: fxProviderConfigured },
+    { key: "gemini", label: "Gemini API (การวิเคราะห์ Statement)", ok: geminiConfigured },
+    { key: "tax", label: "Tax Core Engine (ในตัว)", ok: taxEngineConfigured },
+  ];
 
   const visibleUploads = showAllUploads ? uploadLog : uploadLog.slice(0, 4);
   const visibleAccessLogs = showAllAccessLogs ? accessLog : accessLog.slice(0, 4);
@@ -605,7 +629,9 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                   </div>
                   <p className="text-xl font-semibold text-gray-800">{totalUploadsThisWeek}</p>
                   <p className="text-[11px] text-gray-400 mt-3">
-                    <span className="text-gray-400">สถานะการตรวจสอบ: NOT AVAILABLE</span>
+                    <span className="text-gray-400">
+                      ทั้งหมด {stats?.documents?.total ?? uploadLog.length} ไฟล์ที่จัดเก็บบนเซิร์ฟเวอร์
+                    </span>
                   </p>
                 </div>
 
@@ -615,10 +641,14 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     <Wifi className="w-4 h-4 text-gray-300" />
                   </div>
                   <p className="text-xl font-semibold text-gray-800">
-                    {connectedApis === null || apiTotal === null ? "NOT AVAILABLE" : `${connectedApis}/${apiTotal} เชื่อมต่อปกติ`}
+                    {connectedApis === null || apiTotal === null
+                      ? "กำลังโหลด..."
+                      : `${connectedApis}/${apiTotal} เชื่อมต่อปกติ`}
                   </p>
                   <p className="text-[11px] text-gray-400 mt-3">
-                    BOT API ยังไม่ได้เชื่อมต่อกับ backend
+                    Historical FX Provider {fxProviderConfigured ? "พร้อมใช้งาน" : "ยังไม่ได้ตั้งค่า"}
+                    {" · "}
+                    Gemini {geminiConfigured ? "พร้อมใช้งาน" : "ยังไม่ได้ตั้งค่าคีย์"}
                   </p>
                 </div>
               </div>
@@ -672,14 +702,14 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                   <h2 className="text-sm font-semibold text-gray-800 mb-1">
                     สถานะไฟล์ที่อัปโหลด
                   </h2>
-                  <p className="text-xs text-gray-400 mb-2">แบ่งตามผลการตรวจสอบล่าสุด</p>
+                  <p className="text-xs text-gray-400 mb-2">ข้อมูลจริงจากฐานข้อมูล</p>
                   <div className="h-52 flex flex-col items-center justify-center">
-                    <div className="flex items-center gap-2 text-sm text-gray-400">
-                      <WifiOff className="w-4 h-4" />
-                      <span>NOT AVAILABLE</span>
+                    <div className="flex items-center gap-2 text-sm text-emerald-600 font-medium">
+                      <CheckCircle2 className="w-4 h-4" />
+                      {stats?.documents?.total ?? 0} ไฟล์จัดเก็บสำเร็จ
                     </div>
-                    <p className="text-[11px] text-gray-400 mt-2 text-center max-w-[220px]">
-                      ตาราง documents ไม่มีฟิลด์สถานะการตรวจสอบไฟล์
+                    <p className="text-[11px] text-gray-400 mt-2 text-center max-w-[240px]">
+                      ไม่มีระบบตรวจสอบสถานะไฟล์ (scan status) — เอกสารจะจัดเก็บเมื่ออัปโหลดสำเร็จเท่านั้น
                     </p>
                   </div>
                 </div>
@@ -690,11 +720,34 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                 <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
                   <h2 className="text-sm font-semibold text-gray-800">การเชื่อมต่อ API ภายนอก</h2>
                 </div>
-                <div className="px-5 py-8 flex flex-col items-center justify-center text-center">
-                  <WifiOff className="w-7 h-7 text-gray-300 mb-2" />
-                  <p className="text-sm font-medium text-gray-600">NOT AVAILABLE</p>
-                  <p className="text-xs text-gray-400 mt-1 max-w-[320px]">
-                    การเชื่อมต่อ API ภายนอก (BOT API, Tax Engine ฯลฯ) ยังไม่ถูกนำมาเชื่อมต่อกับ backend
+                <div className="divide-y divide-gray-50">
+                  {apiRows.map((row) => (
+                    <div key={row.key} className="flex items-center justify-between px-5 py-3.5">
+                      <div className="flex items-center gap-2.5">
+                        {row.ok ? (
+                          <Wifi className="w-4 h-4 text-emerald-500" />
+                        ) : (
+                          <WifiOff className="w-4 h-4 text-gray-300" />
+                        )}
+                        <span className="text-sm font-medium text-gray-700">{row.label}</span>
+                      </div>
+                      <span
+                        className={`text-xs font-medium px-2 py-1 rounded-md ${
+                          row.ok === null
+                            ? "bg-gray-50 text-gray-400"
+                            : row.ok
+                            ? "bg-emerald-50 text-emerald-600"
+                            : "bg-amber-50 text-amber-600"
+                        }`}
+                      >
+                        {row.ok === null ? "กำลังตรวจสอบ" : row.ok ? "เชื่อมต่อแล้ว" : "ยังไม่ได้ตั้งค่า"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="px-5 py-3 border-t border-gray-50">
+                  <p className="text-[11px] text-gray-400">
+                    สถานะนี้แสดงการตั้งค่า server-side เท่านั้น ไม่ใช่การทดสอบการเรียก API จริง
                   </p>
                 </div>
               </div>
@@ -766,7 +819,9 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                             </div>
                           </td>
                           <td className="px-5 py-3.5 text-gray-500 whitespace-nowrap">{u.role}</td>
-                          <td className="px-5 py-3.5 text-gray-400 whitespace-nowrap text-xs">NOT AVAILABLE</td>
+                          <td className="px-5 py-3.5 text-gray-400 whitespace-nowrap text-xs">
+  {u.joinedAt ? formatJoinedAt(u.joinedAt) : "ไม่มีข้อมูล"}
+</td>
                           <td className="px-5 py-3.5 whitespace-nowrap">
                             <div className="flex items-center gap-2">
                               <span

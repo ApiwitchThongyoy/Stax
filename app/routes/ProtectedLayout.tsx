@@ -17,19 +17,13 @@ export default function ProtectedLayout() {
   // Mounted here at the protected shell so it runs for EVERY protected route
   // (dashboard tabs, settings, ledger, archive) regardless of the active tab.
   // Exactly one instance; Dashboard must NOT start a second one.
-  console.log("[ACCOUNT_STATUS] ProtectedLayout mounted", {
-    isAuthenticated,
-    hasToken: !!user?.accessToken,
-  });
   useAccountStatusPolling({
     enabled: !!user?.accessToken && isAuthenticated,
     accessToken: user?.accessToken ?? null,
     onSuspended: () => {
-      console.log("[ACCOUNT_STATUS] markSuspended called");
       markSuspended();
     },
     onActive: () => {
-      console.log("[ACCOUNT_STATUS] markReactivated called");
       markReactivated();
     },
   });

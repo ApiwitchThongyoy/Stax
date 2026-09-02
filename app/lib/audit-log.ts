@@ -74,16 +74,23 @@ export async function insertAuditLog(input: AuditLogInput): Promise<void> {
   const id = randomUUID();
   const now = new Date().toISOString();
 
-  await db
-    .insert(auditLogs)
-    .values({
-      id,
-      userId: input.userId ?? null,
-      action: input.action,
-      entityType: input.entityType ?? null,
-      entityId: input.entityId ?? null,
-      details: sanitizeDetails(input.details),
-      createdAt: now,
-    })
-    .execute();
+  try {
+    await db
+      .insert(auditLogs)
+      .values({
+        id,
+        userId: input.userId ?? null,
+        action: input.action,
+        entityType: input.entityType ?? null,
+        entityId: input.entityId ?? null,
+        details: sanitizeDetails(input.details),
+        createdAt: now,
+      })
+      .execute();
+  } catch (error) {
+    // Best-effort by design: an audit write failure must never turn a successful
+    // login/import/delete into a 500, nor trigger error/cleanup paths. Log and
+    // move on — the audit trail is observability, not a source of truth.
+    console.error("insertAuditLog: failed to persist audit entry", error);
+  }
 }

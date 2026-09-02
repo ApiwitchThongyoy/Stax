@@ -159,6 +159,11 @@ async function handleCreate(
         currency: currency.trim(),
         transactionDate: transactionDate.trim(),
         fxRateBot: String(fxRateBot),
+        // Manual entries carry the user-entered rate as the effective rate so
+        // consumers read fxRateEffective uniformly (imported rows use the
+        // statement/provider rate there; fxRateBot is a legacy compatibility
+        // column and stays null for imported rows).
+        fxRateEffective: String(fxRateBot),
         amountThb: String(amountThb),
         type,
         sourceType,
@@ -191,6 +196,7 @@ async function handleCreate(
           currency: currency.trim(),
           transactionDate: transactionDate.trim(),
           fxRateBot: String(fxRateBot),
+          fxRateEffective: String(fxRateBot),
           amountThb: String(amountThb),
           type,
           sourceType,

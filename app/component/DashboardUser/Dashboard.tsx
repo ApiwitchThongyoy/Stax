@@ -32,10 +32,21 @@ import NotificationBell from "./NotificationBell";
 import StatementArchivePage from "./StatementArchivePage";
 import FxAiPage from "./FxAiPage";
 import type { Transaction } from "../../lib/Financeutils";
-import { parseRateString } from "../../lib/Financeutils";
+import {
+  sumAuthoritativeGainThb,
+  countComputableGainRows,
+  hasNonComputableGain,
+  pickRelevantRate,
+} from "../../lib/Financeutils";
 import {
   fetchCapitalLedger,
   capitalLedgerToTransactions,
+  fetchExchangeRate,
+  fetchAiAnalysis,
+  fetchTaxRecon,
+  type ExchangeRateEntry,
+  type AiAnalysisResponse,
+  type TaxReconSummary,
 } from "../../lib/server-api";
 
 // ไม่มีข้อมูลตัวอย่างแล้ว — สมุดบัญชีเริ่มต้นว่างเปล่า รอผู้ใช้ import ไฟล์ statement จริง
@@ -64,6 +75,9 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const [docsRefreshKey, setDocsRefreshKey] = useState(0);
   const [sortOrder, setSortOrder] = useState<"newest" | "oldest">("newest");
   const [showAllTransactions, setShowAllTransactions] = useState(false);
+  const [fxRateEntry, setFxRateEntry] = useState<ExchangeRateEntry | null>(null);
+  const [taxRecon, setTaxRecon] = useState<TaxReconSummary | null>(null);
+  const [aiInsight, setAiInsight] = useState<AiAnalysisResponse | null>(null);
   const location = useLocation();
 
   // Identity must come from the authenticated user only. Never fabricate a
@@ -120,6 +134,71 @@ export default function Dashboard({ userEmail }: DashboardProps) {
     void refreshFromServer();
   }, [refreshFromServer, docsRefreshKey]);
 
+  // Fetch today's real external USD/THB exchange rate as a FALLBACK for the
+  // "อัตราแลกเปลี่ยน" card. Statement-sourced rates (fxRateStatement) inside the
+  // ledger take priority in pickRelevantRate(); this external entry is only used
+  // when the ledger has no statement rate. The server is authoritative: on
+  // failure/weekend/holiday it returns { available: false }, never a fabricated
+  // rate, and the UI never blames the external rate provider.
+  useEffect(() => {
+    if (!user?.accessToken) return;
+    let cancelled = false;
+    fetchExchangeRate(user.accessToken, "USD")
+      .then((entry) => {
+        if (!cancelled) setFxRateEntry(entry);
+      })
+      .catch(() => {
+        if (!cancelled) setFxRateEntry({ available: false, date: "", reason: "network error" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.accessToken]);
+
+  // Fetch the Tax Core Engine result for the user's transactions. The tax base
+  // (ฐานภาษี) card renders the authoritative totalTaxableAmountThb only; when
+  // the engine reports nothing computable the card stays truthful (NOT
+  // AVAILABLE) instead of inventing an estimate.
+  useEffect(() => {
+    if (!user?.accessToken) return;
+    if (transactions.length === 0) {
+      setTaxRecon(null);
+      return;
+    }
+    let cancelled = false;
+    fetchTaxRecon(
+      user.accessToken,
+      transactions.map((t) => t.id)
+    )
+      .then((summary) => {
+        if (!cancelled) setTaxRecon(summary);
+      })
+      .catch(() => {
+        if (!cancelled) setTaxRecon(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.accessToken, transactions]);
+
+  // Fetch neutral AI insights about imported activity (best-effort). Falls back
+  // to a truthful unavailable state when Gemini is not configured.
+  useEffect(() => {
+    if (!user?.accessToken) return;
+    let cancelled = false;
+    fetchAiAnalysis(user.accessToken)
+      .then((data) => {
+        if (!cancelled) setAiInsight(data);
+      })
+      .catch(() => {
+        if (!cancelled)
+          setAiInsight({ available: false, code: "NETWORK_ERROR", errors: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.accessToken]);
+
   // After an import the server is authoritative; refresh rather than append the
   // locally parsed copy into persistent UI state.
   const handleImportFromPdf = () => {
@@ -144,25 +223,44 @@ export default function Dashboard({ userEmail }: DashboardProps) {
     setSortOrder((prev) => (prev === "newest" ? "oldest" : "newest"));
   };
 
-  // คำนวณ "กำไร/ขาดทุนสุทธิ" แบบเรียลไทม์ตามหลักบัญชี:
-  // นับเฉพาะรายการที่เป็น "กำไร/ขาดทุนจริง" (pnlAmount) เช่น เงินปันผล ดอกเบี้ย กำไรจากการขายหุ้น ค่าธรรมเนียม ภาษี
-  // ไม่นับเงินฝาก/ถอน (equity) และเงินต้นที่ใช้ซื้อ-ขายหุ้น (asset) เพราะไม่ใช่กำไรขาดทุน
-  // ค่านี้จะอัปเดตทันทีทุกครั้งที่ transactions เปลี่ยน ไม่ว่าจะเพิ่มเองหรือ import จากไฟล์ PDF
-  const fxGainLoss = transactions.reduce((sum, t) => {
-    const rate = parseRateString(t.rate);
-    return sum + t.pnlAmount * rate;
-  }, 0);
+  // คำนวณ "กำไร/ขาดทุนสุทธิ" แบบเรียลไทม์จากค่า authoritative ของ Backend เท่านั้น:
+  // pnlAmount == realizedGainLossThb (บาท) ของ SELL ที่คำนวณได้จริง — ไม่มีการ
+  // คูณอัตราแลกเปลี่ยนซ้ำ และไม่มีการปรุงตัวเลขขึ้นเอง รายการที่คำนวณไม่ได้
+  // (pnlAmount null) จะไม่ถูกนับรวม แต่จะแสดงคำเตือนอย่างตรงไปตรงมา
+  const netRealizedThb = sumAuthoritativeGainThb(transactions);
+  const computableGainRows = countComputableGainRows(transactions);
+  const hasNonComputablePnl = hasNonComputableGain(transactions);
 
-  const totalIncomeTHB = transactions.reduce((sum, t) => {
+  // กำไรรวม (เฉพาะรายการบวก) ใช้เป็นตัวหารสำหรับเปอร์เซ็นต์เท่านั้น
+  const positiveGainThb = transactions.reduce((sum, t) => {
+    if (t.pnlAmount === undefined || t.pnlAmount === null) return sum;
     if (t.pnlAmount <= 0) return sum;
-    const rate = parseRateString(t.rate);
-    return sum + t.pnlAmount * rate;
+    return sum + t.pnlAmount;
   }, 0);
 
-  const fxGainLossPercent =
-    totalIncomeTHB > 0 ? (fxGainLoss / totalIncomeTHB) * 100 : 0;
+  const pnlPercent =
+    positiveGainThb > 0 ? (netRealizedThb / positiveGainThb) * 100 : 0;
 
-  const isGain = fxGainLoss >= 0;
+  const isGain = netRealizedThb >= 0;
+
+  // อัตราแลกเปลี่ยนที่ใช้จริง — ลำดับ: fxRateStatement (จาก Statement) →
+  // Historical FX Provider (ภายนอก) → THB = 1 (ฐานสกุลเงิน) ไม่มีอัตราปลอม
+  const rateInfo = pickRelevantRate(
+    transactions,
+    fxRateEntry?.available && fxRateEntry.rate != null
+      ? { rate: fxRateEntry.rate, date: fxRateEntry.date }
+      : null
+  );
+
+  const taxBaseComputable =
+    taxRecon?.computable === true &&
+    taxRecon.totalTaxableAmountThb != null;
+
+  // จำนวน SELL ที่ไม่มีต้นทุนอ้างอิงจริง ๆ (ไม่นับเงินฝาก/ถอน หรือ BUY ซึ่งไม่ใช่
+  // รายการที่ "ควร" คำนวณกำไร) สำหรับข้อความเตือนบนการ์ดฐานภาษี
+  const genuinelyNonComputableSells = (taxRecon?.transactions ?? []).filter(
+    (t) => t.classification === "non-computable"
+  ).length;
 
   return (
     <div
@@ -290,39 +388,64 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                 <div className="bg-white rounded-xl border border-gray-100 p-4">
                   <div className="flex items-center justify-between mb-3">
                     <span className="text-xs text-gray-400">
-                      กำไร/ขาดทุนสุทธิ (แปลงเป็นบาท)
+                      กำไร/ขาดทุนสุทธิ (realized, บาท)
                     </span>
                     <span
                       className={`text-xs font-medium px-1.5 py-0.5 rounded ${
-                        isGain
-                          ? "bg-emerald-50 text-emerald-500"
-                          : "bg-red-50 text-red-500"
+                        computableGainRows > 0
+                          ? isGain
+                            ? "bg-emerald-50 text-emerald-500"
+                            : "bg-red-50 text-red-500"
+                          : "bg-gray-100 text-gray-500"
                       }`}
                     >
-                      {isGain ? "กำไร" : "ขาดทุน"}
-                      {totalIncomeTHB > 0 &&
-                        ` ${isGain ? "+" : ""}${fxGainLossPercent.toFixed(1)}%`}
+                      {computableGainRows > 0
+                        ? `${isGain ? "กำไร" : "ขาดทุน"}${
+                            pnlPercent !== 0
+                              ? ` ${isGain ? "+" : ""}${pnlPercent.toFixed(1)}%`
+                              : ""
+                          }`
+                        : "คำนวณไม่ได้"}
                     </span>
                   </div>
                   <p
                     className={`text-xl font-semibold ${
-                      isGain ? "text-gray-800" : "text-red-600"
+                      computableGainRows > 0
+                        ? isGain
+                          ? "text-gray-800"
+                          : "text-red-600"
+                        : "text-gray-400"
                     }`}
                   >
-                    {isGain ? "+" : "-"}฿
-                    {Math.abs(fxGainLoss).toLocaleString(undefined, {
-                      minimumFractionDigits: 2,
-                      maximumFractionDigits: 2,
-                    })}
+                    {computableGainRows > 0 ? (
+                      <>
+                        {isGain ? "+" : "-"}฿
+                        {Math.abs(netRealizedThb).toLocaleString(undefined, {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })}
+                      </>
+                    ) : (
+                      "ยังไม่มีการคำนวณ"
+                    )}
+                  </p>
+                  <p className="text-[11px] text-gray-400 mt-3 leading-relaxed">
+                    {computableGainRows > 0 ? (
+                      hasNonComputablePnl ? (
+                        "มีบางรายการที่ยังคำนวณไม่ได้ (ไม่นับรวมในยอด)"
+                      ) : (
+                        "อ้างอิงจากรายการกำไร/ขาดทุนที่คำนวณได้จริง"
+                      )
+                    ) : (
+                      "ยังไม่มีรายการกำไร/ขาดทุนที่คำนวณได้ในสมุดบัญชี"
+                    )}
                   </p>
                   <div className="h-1.5 bg-gray-100 rounded-full mt-3 overflow-hidden">
                     <div
                       className={`h-full rounded-full ${
                         isGain ? "bg-emerald-400" : "bg-red-400"
                       }`}
-                      style={{
-                        width: `${Math.min(Math.abs(fxGainLossPercent), 100)}%`,
-                      }}
+                      style={{ width: `${Math.min(Math.abs(pnlPercent), 100)}%` }}
                     />
                   </div>
                 </div>
@@ -330,36 +453,89 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                 <div className="bg-white rounded-xl border border-gray-100 p-4">
                   <div className="flex items-center justify-between mb-3">
                     <span className="text-xs text-gray-400">
-                      อัตราแลกเปลี่ยนแบบเรียลไทม์ (USD/THB)
+                      อัตราแลกเปลี่ยนที่ใช้จริง
                     </span>
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium">
-                      NOT AVAILABLE
+                    <span
+                      className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                        rateInfo.rate != null
+                          ? "bg-emerald-50 text-emerald-600"
+                          : "bg-amber-50 text-amber-600"
+                      }`}
+                    >
+                      {rateInfo.source === "statement"
+                        ? "จาก Statement"
+                        : rateInfo.source === "external"
+                          ? "จาก Historical FX Provider"
+                          : rateInfo.source === "base"
+                            ? "ฐานสกุลเงิน"
+                            : "ไม่พร้อมใช้งาน"}
                     </span>
                   </div>
                   <p className="text-xl font-semibold text-gray-800">
-                    ยังไม่ได้เชื่อมต่อ BOT API
+                    {rateInfo.rate != null ? (
+                      <>
+                        {rateInfo.base}/THB ฿
+                        {rateInfo.rate.toLocaleString(undefined, {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 4,
+                        })}
+                      </>
+                    ) : (
+                      "ยังไม่มีข้อมูลอัตราแลกเปลี่ยน"
+                    )}
                   </p>
-                  <p className="text-[11px] text-gray-400 mt-3">
-                    อัตราแบบเรียลไทม์จะแสดงที่นี่เมื่อเชื่อมต่อ BOT API กับ
-                    backend แล้ว
+                  <p className="text-[11px] text-gray-400 mt-3 leading-relaxed">
+                    {rateInfo.source === "statement"
+                      ? `แหล่งที่มา: Statement${
+                          rateInfo.date ? ` (วันที่ ${rateInfo.date})` : ""
+                        }`
+                      : rateInfo.source === "external"
+                        ? `แหล่งที่มา: Historical FX Provider${
+                            rateInfo.date ? ` (วันที่ ${rateInfo.date})` : ""
+                          }`
+                        : rateInfo.source === "base"
+                          ? "อัตรา THB/THB = 1 (ใช้บาทเป็นฐาน)"
+                          : "ยังไม่มีข้อมูลอัตราแลกเปลี่ยนสำหรับรายการที่นำเข้า"}
+                  </p>
+                  <p className="text-[10px] text-gray-300 mt-1">
+                    อัตราในแต่ละธุรกรรมอาจแตกต่างจากค่าที่แสดง
                   </p>
                 </div>
 
                 <div className="bg-white rounded-xl border border-gray-100 p-4">
                   <div className="flex items-center justify-between mb-3">
                     <span className="text-xs text-gray-400">
-                      ประมาณการภาษีที่ต้องชำระ
+                      ฐานภาษีที่คำนวณได้
                     </span>
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium">
-                      NOT AVAILABLE
+                      {taxBaseComputable
+                        ? "คำนวณได้"
+                        : taxRecon === null
+                          ? "กำลังโหลด..."
+                          : "NOT AVAILABLE"}
                     </span>
                   </div>
                   <p className="text-xl font-semibold text-gray-800">
-                    ยังไม่สามารถคำนวณภาษีได้
+                    {taxBaseComputable ? (
+                      <>฿{taxRecon!.totalTaxableAmountThb}</>
+                    ) : (
+                      <span className="text-gray-400">
+                        {taxRecon === null
+                          ? "กำลังโหลด..."
+                          : "ยังไม่มีฐานภาษีที่คำนวณได้"}
+                      </span>
+                    )}
                   </p>
-                  <p className="text-[11px] text-gray-400 mt-3">
-                    Tax Core Engine พร้อมใช้งาน แต่ข้อมูลธุรกรรมปัจจุบันยังไม่
-                    สามารถคำนวณภาษีได้
+                  <p className="text-[11px] text-gray-400 mt-3 leading-relaxed">
+                    {taxBaseComputable
+                      ? `Tax Core Engine คำนวณจากรายการขายที่ยืนยันได้${
+                          genuinelyNonComputableSells > 0
+                            ? ` (SELL ${genuinelyNonComputableSells} รายการยังไม่มีต้นทุนอ้างอิง)`
+                            : ""
+                        }`
+                      : taxRecon === null
+                        ? "กำลังติดต่อ Tax Core Engine..."
+                        : "ไม่มีรายการกำไร/ขาดทุนที่คำนวณได้เพียงพอ (ข้อมูลต้นทุนไม่ครบถ้วน)"}
                   </p>
                 </div>
               </div>
@@ -504,9 +680,26 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                     <p className="text-xs text-emerald-700 font-medium mb-1.5">
                       ข้อเสนอแนะจาก AI
                     </p>
-                    <p className="text-sm text-emerald-900 leading-relaxed">
-                      ยังไม่มีคำแนะนำจาก AI (NOT AVAILABLE)
-                    </p>
+                    {aiInsight === null ? (
+                      <p className="text-sm text-emerald-900 leading-relaxed">
+                        กำลังโหลดข้อสรุปจาก AI...
+                      </p>
+                    ) : aiInsight.available && aiInsight.result ? (
+                      <>
+                        <p className="text-sm text-emerald-900 leading-relaxed">
+                          {aiInsight.result.summary}
+                        </p>
+                        {aiInsight.result.patterns.length > 0 && (
+                          <p className="text-xs text-emerald-800/90 mt-2">
+                            รูปแบบ: {aiInsight.result.patterns[0]}
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-sm text-emerald-900 leading-relaxed">
+                        ยังไม่มีคำแนะนำจาก AI
+                      </p>
+                    )}
                     <p className="text-xs text-emerald-700/80 mt-2">
                       AI ใช้วิเคราะห์โครงสร้างของ Statement เท่านั้น
                       ไม่ใช่การคาดการณ์คำแนะนำด้านการเงิน

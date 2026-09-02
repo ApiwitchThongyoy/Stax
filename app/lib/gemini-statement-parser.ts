@@ -257,10 +257,13 @@ function buildPrompt(statementText: string): string {
     "- currency must be an uppercase ISO 4217 code (2-3 letters).",
     "- transactionType must be one of: income, expense, equity, asset.",
     "- amount is the cash amount as a decimal string (can be negative).",
-    "- exchangeRate is the FX rate to THB if derivable, else null.",
-    "- amountThb is the THB-converted amount if derivable, else null.",
+    "- exchangeRate is the FX rate to THB ONLY if that rate is EXPLICITLY printed " +
+      "in the statement; NEVER infer, guess, or fetch it from memory or market data.",
+    "- amountThb is the THB-converted amount ONLY if that value is EXPLICITLY " +
+      "printed in the statement; never compute or invent it.",
     "- confidence is a number from 0 to 1 reflecting how confident you are.",
     "- If part of the statement is unclear, record a warning string rather than inventing data.",
+    "- NEVER guess, estimate, or fabricate exchange rates or THB amounts — use null.",
     "Return only JSON matching the provided schema.",
     "\n--- STATEMENT TEXT ---\n",
     statementText,

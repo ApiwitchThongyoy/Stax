@@ -162,7 +162,7 @@ export default function StatementArchivePage({
         <p className="text-xs text-blue-300 mb-1">Statement Archive</p>
         <h1 className="text-xl font-semibold mb-1.5">คลัง Statement ทั้งหมด</h1>
         <p className="text-sm text-blue-200">
-          ทั้งหมด {docs.length} ไฟล์ จัดกลุ่มตามปี/เดือน · จัดเก็บไว้ในเครื่องนี้เท่านั้น
+          ทั้งหมด {docs.length} ไฟล์ จัดกลุ่มตามปี/เดือน · จัดเก็บบนเซิร์ฟเวอร์อย่างปลอดภัย
         </p>
       </div>
 

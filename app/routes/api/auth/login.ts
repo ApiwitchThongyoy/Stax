@@ -69,8 +69,18 @@ export async function action({ request }: Route.ActionArgs) {
 
   let user;
   try {
+    // Auth-critical select: pin to columns that are guaranteed to exist on every
+    // environment. Optional metadata fields (e.g. created_at from migration 0007)
+    // must NEVER be implicitly selected here, or a not-yet-migrated database
+    // would make authentication fail with PostgreSQL 42703 (undefined column).
     const rows = await db
-      .select()
+      .select({
+        id: users.id,
+        email: users.email,
+        passwordHash: users.passwordHash,
+        role: users.role,
+        status: users.status,
+      })
       .from(users)
       .where(eq(users.email, normalizedEmail))
       .limit(1);

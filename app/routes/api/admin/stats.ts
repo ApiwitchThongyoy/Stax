@@ -3,6 +3,7 @@ import type { Route } from "./+types/stats";
 import { db } from "~/lib/drizzle-db";
 import { users, documents } from "~/db/schema";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
+import { isGeminiConfigured } from "~/lib/gemini-statement-parser";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
   return (
@@ -65,6 +66,12 @@ export async function loader({ request }: Route.LoaderArgs) {
       .orderBy(sql`to_char(${documents.createdAt}::date, 'YYYY-MM-DD')`)
       .execute();
 
+    const fxProviderOk = true; // keyless built-in historical FX provider
+    const geminiOk = isGeminiConfigured();
+    const taxEngineOk = true;
+    const connectedApis = [fxProviderOk, geminiOk, taxEngineOk].filter(Boolean).length;
+    const totalApis = 3;
+
     return Response.json(
       {
         success: true,
@@ -78,10 +85,12 @@ export async function loader({ request }: Route.LoaderArgs) {
               files: row.files,
             })),
           },
-          uploadStatus: {
-            available: false,
-            reason:
-              "documents table has no status/result field — file status is NOT AVAILABLE",
+          apiStatus: {
+            connected: connectedApis,
+            total: totalApis,
+            fxProvider: { configured: fxProviderOk },
+            gemini: { configured: geminiOk },
+            taxEngine: { configured: taxEngineOk },
           },
         },
       },

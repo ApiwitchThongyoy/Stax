@@ -151,14 +151,51 @@ export function signedTransactionAmountThb(
   }
 }
 
+/**
+ * UI-facing row classification that distinguishes "genuinely non-computable"
+ * (SELL without a usable cost basis) from "not a realized-gain event at all"
+ * (deposits, withdrawals, fees, FX conversions) and BUY rows that merely build
+ * cost basis. `status` keeps its original meaning (computable / not-computable);
+ * `classification` refines HOW the frontend labels a row without fabricating
+ * numbers.
+ */
+export type TaxRowClassification =
+  | "realized-gain"
+  | "non-computable"
+  | "buy-basis"
+  | "not-applicable";
+
+export function classifyCapitalTransaction(row: {
+  side?: string | null;
+  type?: string | null;
+}): TaxRowClassification {
+  const side = row.side?.trim().toUpperCase();
+  if (side === "SELL") return "non-computable";
+  if (side === "BUY") return "buy-basis";
+  return "not-applicable";
+}
+
 export interface TaxRowReconResult {
   transactionId: string;
   transactionAmountThb: string;
   realizedGainLossThb: string | null;
   taxableAmountThb: string | null;
   isTaxable: boolean | null;
-  status: "not-computable";
+  status: "computable" | "not-computable";
+  classification: TaxRowClassification;
   reason: string;
+  symbol?: string | null;
+  side?: string | null;
+  quantity?: string | null;
+  unitPrice?: string | null;
+  grossAmount?: string | null;
+  fees?: string | null;
+  proceeds?: string | null;
+  costBasis?: string | null;
+  realizedGainLoss?: string | null;
+  fxRateStatement?: string | null;
+  fxRateEffective?: string | null;
+  exchange?: string | null;
 }
 
 export interface TaxReconSummary {
@@ -171,18 +208,24 @@ export interface TaxReconSummary {
 function notComputableReason(reasonValue: TaxNonComputableReasonValue): string {
   return (
     reasonValue +
-    ": schema lacks cost basis / proceeds data to derive true realized gain/loss for this transaction"
+    ": no stored realized gain/loss for this transaction (only SELL rows with a known running-average cost basis carry one)"
   );
 }
 
 /**
  * Build a per-transaction reconstruction result that makes the limitation
  * explicit instead of pretending CASH_IN/CASH_OUT is realized gain/loss.
+ *
+ * `classification` defaults to the row's category: SELL => "non-computable",
+ * BUY => "buy-basis", everything else (deposits/withdrawals/fees/FX) =>
+ * "not-applicable". Pass an explicit value to override.
  */
 export function reconResultWithoutRealizedGainLoss(
   row: CapitalTransactionLike,
-  reasonValue: TaxNonComputableReasonValue = TaxNonComputableReason.REALIZED_GAIN_LOSS_NOT_COMPUTABLE
+  reasonValue: TaxNonComputableReasonValue = TaxNonComputableReason.REALIZED_GAIN_LOSS_NOT_COMPUTABLE,
+  classification?: TaxRowClassification
 ): TaxRowReconResult {
+  const detail = row as TaxReconDetailRow;
   return {
     transactionId: row.transactionId,
     transactionAmountThb: signedTransactionAmountThb(row),
@@ -190,7 +233,20 @@ export function reconResultWithoutRealizedGainLoss(
     taxableAmountThb: null,
     isTaxable: null,
     status: "not-computable",
+    classification: classification ?? classifyCapitalTransaction(detail),
     reason: notComputableReason(reasonValue),
+    symbol: detail.symbol ?? null,
+    side: detail.side ?? null,
+    quantity: detail.quantity ?? null,
+    unitPrice: detail.unitPrice ?? null,
+    grossAmount: detail.grossAmount ?? null,
+    fees: detail.fees ?? null,
+    proceeds: detail.proceeds ?? null,
+    costBasis: detail.costBasis ?? null,
+    realizedGainLoss: detail.realizedGainLoss ?? null,
+    fxRateStatement: detail.fxRateStatement ?? null,
+    fxRateEffective: detail.fxRateEffective ?? null,
+    exchange: detail.exchange ?? null,
   };
 }
 
@@ -209,5 +265,131 @@ export function buildNonComputableTaxRecon(
       reconResultWithoutRealizedGainLoss(row)
     ),
     totalTaxableAmountThb: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Authoritative tax reconstruction (migration 0009)
+//
+// When Capital_Transactions rows carry a stored realizedGainLossThb (persisted
+// deterministically by the statement pipeline for SELL trades with a known
+// running-average cost basis), the engine computes the REAL taxable amount. All
+// arithmetic is Decimal. Rows without that value remain explicitly
+// "not-computable" — the engine never converts CASH_IN/CASH_OUT into gain/loss.
+// ---------------------------------------------------------------------------
+
+export interface TaxReconDetailRow extends CapitalTransactionLike {
+  realizedGainLossThb?: string | null;
+  symbol?: string | null;
+  side?: string | null;
+  quantity?: string | null;
+  unitPrice?: string | null;
+  grossAmount?: string | null;
+  fees?: string | null;
+  proceeds?: string | null;
+  costBasis?: string | null;
+  realizedGainLoss?: string | null;
+  fxRateStatement?: string | null;
+  fxRateEffective?: string | null;
+  exchange?: string | null;
+  transactionDate?: string | null;
+  currency?: string | null;
+}
+
+export interface ComputableTaxRow extends TaxRowReconResult {
+  status: "computable";
+  classification: "realized-gain";
+  realizedGainLossThb: string;
+  taxableAmountThb: string;
+  isTaxable: boolean;
+  symbol?: string | null;
+  side?: string | null;
+  quantity?: string | null;
+  unitPrice?: string | null;
+  grossAmount?: string | null;
+  fees?: string | null;
+  proceeds?: string | null;
+  costBasis?: string | null;
+  realizedGainLoss?: string | null;
+  fxRateStatement?: string | null;
+  fxRateEffective?: string | null;
+  exchange?: string | null;
+}
+
+export interface TaxReconSummaryV2 {
+  computable: boolean;
+  computedCount: number;
+  nonComputableCount: number;
+  reason: string;
+  transactions: (TaxRowReconResult | ComputableTaxRow)[];
+  totalTaxableAmountThb: string | null;
+}
+
+/**
+ * Build an authoritative tax reconstruction from stored, real realized
+ * gain/loss values. Rows without realizedGainLossThb are reported as explicitly
+ * not-computable (and never contribute to the taxable total).
+ */
+export function buildTaxRecon(rows: TaxReconDetailRow[]): TaxReconSummaryV2 {
+  const computableRows = rows.filter(
+    (r) =>
+      r.realizedGainLossThb !== undefined &&
+      r.realizedGainLossThb !== null &&
+      r.realizedGainLossThb.trim() !== ""
+  );
+
+  const engine = calculateTax(
+    computableRows.map((r) => ({
+      transactionId: r.transactionId,
+      realizedGainLossThb: r.realizedGainLossThb as string,
+    }))
+  );
+  const engineByTxn = new Map(
+    engine.transactions.map((t) => [t.transactionId, t])
+  );
+
+  const transactions: (TaxRowReconResult | ComputableTaxRow)[] = rows.map(
+    (row) => {
+      const eng = engineByTxn.get(row.transactionId);
+      if (eng) {
+        return {
+          transactionId: row.transactionId,
+          transactionAmountThb: signedTransactionAmountThb(row),
+          realizedGainLossThb: eng.realizedGainLossThb,
+          taxableAmountThb: eng.taxableAmountThb,
+          isTaxable: eng.isTaxable,
+          status: "computable",
+          classification: "realized-gain",
+          reason: eng.reason,
+          symbol: row.symbol ?? null,
+          side: row.side ?? null,
+          quantity: row.quantity ?? null,
+          unitPrice: row.unitPrice ?? null,
+          grossAmount: row.grossAmount ?? null,
+          fees: row.fees ?? null,
+          proceeds: row.proceeds ?? null,
+          costBasis: row.costBasis ?? null,
+          realizedGainLoss: row.realizedGainLoss ?? null,
+          fxRateStatement: row.fxRateStatement ?? null,
+          fxRateEffective: row.fxRateEffective ?? null,
+          exchange: row.exchange ?? null,
+        };
+      }
+      return reconResultWithoutRealizedGainLoss(row);
+    }
+  );
+
+  const computable = computableRows.length > 0;
+  return {
+    computable,
+    computedCount: computableRows.length,
+    nonComputableCount: rows.length - computableRows.length,
+    reason: computable
+      ? "Realized gain/loss computed deterministically from trade rows with a known running-average cost basis."
+      : notComputableReason(
+          TaxNonComputableReason.REALIZED_GAIN_LOSS_NOT_COMPUTABLE
+        ),
+    transactions,
+    totalTaxableAmountThb: computable ? engine.totalTaxableAmountThb : null,
   };
 }
