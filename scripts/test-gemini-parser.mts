@@ -13,6 +13,7 @@ import {
   isGeminiConfigured,
   GeminiError,
   GeminiErrorCode,
+  classifyGeminiRequestFailure,
   DEFAULT_GEMINI_MODEL,
 } from "../app/lib/gemini-statement-parser";
 
@@ -271,6 +272,72 @@ async function main() {
       (numericResult as { statement: { transactions: unknown[] } }).statement
         .transactions.length === 1,
     "validateGeminiResponseText accepts the numeric JSON representation"
+  );
+
+  // 15. REQUEST_FAILURE CLASSIFICATION — the real fetch/SDK cause must be
+  // surfaced as sanitized (type/status/code) fields so the app log can show why
+  // a request failed without leaking secrets/URLs/headers. This is the fix for
+  // the previously-opaque "fetch failed" with no causal detail.
+  // 15a. Native Node fetch failure (undici): TypeError with a networked cause.
+  const nativeFetch = Object.assign(new TypeError("fetch failed"), {
+    cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:443"), {
+      code: "ECONNREFUSED",
+      errno: -111,
+      syscall: "connect",
+      address: "127.0.0.1",
+      port: 443,
+    }),
+  });
+  const nc = classifyGeminiRequestFailure(nativeFetch);
+  ok(
+    nc.type === "TypeError" &&
+      nc.code === "ECONNREFUSED" &&
+      nc.status === undefined,
+    "15a: native fetch failure classified as TypeError + ECONNREFUSED cause code"
+  );
+  const nativeJson = JSON.stringify(nc);
+  ok(
+    !nativeJson.includes("127.0.0.1") &&
+      !nativeJson.includes("connect ECONNREFUSED"),
+    "15a: classification never includes raw network addresses/messages"
+  );
+
+  // 15b. DNS failure cause chain.
+  const dnsFetch = Object.assign(new TypeError("fetch failed"), {
+    cause: Object.assign(new Error("getaddrinfo ENOTFOUND host"), {
+      code: "ENOTFOUND",
+    }),
+  });
+  ok(
+    classifyGeminiRequestFailure(dnsFetch).code === "ENOTFOUND",
+    "15b: ENOTFOUND cause code is surfaced"
+  );
+
+  // 15c. HTTP status-style failure (SDKStatusError carries a status).
+  const statusErr = Object.assign(new Error("429 Too Many Requests"), {
+    status: 429,
+  });
+  const sc = classifyGeminiRequestFailure(statusErr);
+  ok(sc.type === "Error" && sc.status === 429, "15c: HTTP status 429 surfaced");
+
+  // 15d. Non-object / primitive error never crashes and yields Unknown.
+  ok(
+    classifyGeminiRequestFailure(null).type === "Unknown" &&
+      classifyGeminiRequestFailure(undefined).code === undefined,
+    "15d: nullish errors classify without throwing"
+  );
+
+  // 15e. A GeminiError thrown after a failure carries the sanitized cause.
+  const wrapped = new GeminiError(
+    GeminiErrorCode.REQUEST_FAILED,
+    "Gemini request failed",
+    nc
+  );
+  ok(
+    wrapped.code === GeminiErrorCode.REQUEST_FAILED &&
+      wrapped.cause?.type === "TypeError" &&
+      wrapped.cause?.code === "ECONNREFUSED",
+    "15e: thrown GeminiError preserves the sanitized REQUEST_FAILED cause"
   );
 
   console.log(`\n================ SUMMARY ================`);

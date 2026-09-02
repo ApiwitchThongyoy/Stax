@@ -9,10 +9,13 @@ import {
   ChevronRight,
 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
-import { fetchUserDocuments } from "../../lib/server-api";
+import {
+  fetchUserDocuments,
+  deleteUserDocument,
+  downloadUserDocument,
+} from "../../lib/server-api";
 import {
   getLocalDocumentByName,
-  getLocalBlobById,
   deleteDocument,
   type StoredDocumentMeta,
 } from "../../lib/Documentstorage";
@@ -39,10 +42,19 @@ function monthFolderKey(iso: string): string {
   return `${y}/${m}`;
 }
 
-export default function StatementArchivePage() {
+interface StatementArchivePageProps {
+  onDocumentDeleted?: () => void;
+}
+
+export default function StatementArchivePage({
+  onDocumentDeleted,
+}: StatementArchivePageProps) {
   const { user } = useAuth();
   const [docs, setDocs] = useState<StoredDocumentMeta[]>([]);
   const [loading, setLoading] = useState(true);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState("");
+  const [downloadError, setDownloadError] = useState("");
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set()
   );
@@ -77,29 +89,54 @@ export default function StatementArchivePage() {
   }, [user?.accessToken]);
 
   const handleDownload = async (doc: StoredDocumentMeta) => {
-    if (!user?.id) return;
-    const local = await getLocalDocumentByName(user.id, doc.fileName);
-    if (!local) return;
-    const blob = await getLocalBlobById(user.id, local.id);
-    if (!blob) return;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = doc.fileName;
-    a.click();
-    URL.revokeObjectURL(url);
+    // The server is authoritative for the file bytes: we fetch the PDF from
+    // GET /api/v1/documents/:id/download and save the returned Blob. IndexedDB
+    // is no longer the source of truth for download.
+    if (!user?.accessToken) return;
+    setDownloadError("");
+    try {
+      const { blob, filename } = await downloadUserDocument(
+        user.accessToken,
+        doc.id,
+        doc.fileName
+      );
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setDownloadError("ไม่สามารถดาวน์โหลดไฟล์ได้ กรุณาลองใหม่อีกครั้ง");
+    }
   };
 
   const handleDelete = async (id: string, fileName: string) => {
-    if (!user?.id) return;
-    const local = await getLocalDocumentByName(user.id, fileName);
-    if (local) {
-      await deleteDocument(user.id, local.id);
+    if (!user?.accessToken) return;
+    setDeletingId(id);
+    setDeleteError("");
+    try {
+      // The server is authoritative: it removes the document row AND the
+      // transactions that originate from that exact document (user-scoped).
+      await deleteUserDocument(user.accessToken, id);
+      // Remove the optional local IndexedDB cache copy as cleanup only, not as
+      // authority — the server deletion already succeeded.
+      if (user?.id) {
+        const local = await getLocalDocumentByName(user.id, fileName);
+        if (local) {
+          await deleteDocument(user.id, local.id).catch(() => {});
+        }
+      }
+      await refresh();
+      // Signal the Dashboard to refresh its server-driven ledger (and the stored
+      // documents list) so FX/Calendar/ledger drop the deleted source's rows.
+      onDocumentDeleted?.();
+    } catch {
+      setDeleteError("ไม่สามารถลบไฟล์ได้ กรุณาลองใหม่อีกครั้ง");
+      refresh();
+    } finally {
+      setDeletingId(null);
     }
-    // The server-authoritative document row is not deleted here: no user-scoped
-    // server document delete endpoint is wired yet. Only the optional local
-    // IndexedDB cache copy is removed.
-    refresh();
   };
 
   const toggleFolder = (key: string) => {
@@ -125,11 +162,23 @@ export default function StatementArchivePage() {
         <p className="text-xs text-blue-300 mb-1">Statement Archive</p>
         <h1 className="text-xl font-semibold mb-1.5">คลัง Statement ทั้งหมด</h1>
         <p className="text-sm text-blue-200">
-          ทั้งหมด {docs.length} ไฟล์ จัดกลุ่มตามปี/เดือน · จัดเก็บไว้ในเครื่องนี้เท่านั้น
+          ทั้งหมด {docs.length} ไฟล์ จัดกลุ่มตามปี/เดือน · จัดเก็บบนเซิร์ฟเวอร์อย่างปลอดภัย
         </p>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-5">
+        {deleteError && (
+          <div className="mb-4 flex items-center gap-2 px-3 py-2.5 rounded-lg bg-red-50 text-red-600 text-sm">
+            <span aria-hidden="true">!</span>
+            <span>{deleteError}</span>
+          </div>
+        )}
+        {downloadError && (
+          <div className="mb-4 flex items-center gap-2 px-3 py-2.5 rounded-lg bg-red-50 text-red-600 text-sm">
+            <span aria-hidden="true">!</span>
+            <span>{downloadError}</span>
+          </div>
+        )}
         {loading ? (
           <p className="text-sm text-gray-400 text-center py-8">กำลังโหลด...</p>
         ) : folderKeys.length === 0 ? (
@@ -201,10 +250,15 @@ export default function StatementArchivePage() {
                           <button
                             type="button"
                             onClick={() => handleDelete(doc.id, doc.fileName)}
-                            className="text-gray-400 hover:text-red-600 transition shrink-0"
+                            disabled={deletingId !== null}
+                            className="text-gray-400 hover:text-red-600 transition shrink-0 disabled:opacity-50 disabled:cursor-wait"
                             aria-label="ลบไฟล์"
                           >
-                            <Trash2 className="w-3.5 h-3.5" />
+                            {deletingId === doc.id ? (
+                              <span className="inline-block w-3.5 h-3.5 border-2 border-gray-300 border-t-gray-500 rounded-full animate-spin" />
+                            ) : (
+                              <Trash2 className="w-3.5 h-3.5" />
+                            )}
                           </button>
                         </div>
                       ))}

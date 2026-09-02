@@ -135,6 +135,7 @@ export async function action({ request }: Route.ActionArgs) {
   }
 
   const id = randomUUID();
+  const now = new Date();
 
   try {
     await db
@@ -145,6 +146,7 @@ export async function action({ request }: Route.ActionArgs) {
         passwordHash,
         role,
         status,
+        createdAt: now,
       })
       .execute();
   } catch (error) {

@@ -31,8 +31,22 @@ export default [
   route("api/v1/statements/upload", "routes/api/statements/upload.ts"),
 
   route("api/v1/documents", "routes/api/documents.ts"),
+  route("api/v1/documents/:id", "routes/api/documents.$id.ts"),
+  route(
+    "api/v1/documents/:id/download",
+    "routes/api/documents.$id.download.ts"
+  ),
 
   route("api/v1/tax/calculate", "routes/api/tax/calculate.ts"),
+
+  route("api/v1/exchange-rates", "routes/api/exchange-rates.ts"),
+  route("api/v1/exchange-rates/status", "routes/api/exchange-rates/status.ts"),
+
+  route("api/v1/export", "routes/api/export.ts"),
+
+  route("api/v1/analysis", "routes/api/analysis.ts"),
+
+  route("api/v1/aggregation/daily", "routes/api/aggregation/daily.ts"),
 
   route("api/v1/admin/users", "routes/api/admin/users.ts"),
   route("api/v1/admin/users/:id", "routes/api/admin/users.$id.ts"),

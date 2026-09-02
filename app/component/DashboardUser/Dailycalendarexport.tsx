@@ -3,7 +3,7 @@
 // ฟีเจอร์ "Daily Calendar & Export"
 // - แสดงยอดเงินสุทธิรายวันและกำไรสะสม (cumulative P&L) ในรูปแบบปฏิทินรายเดือน
 // - คลิกวันที่เพื่อดูรายการย่อยของวันนั้น
-// - ส่งออกสรุปรายเดือนเป็น CSV หรือ Excel (.xlsx)
+// - ส่งออกธุรกรรมทั้งเดือนผ่าน backend (server-authoritative) เป็น CSV หรือ Excel (.xlsx)
 
 import { useMemo, useState } from "react";
 import {
@@ -17,6 +17,8 @@ import {
 } from "lucide-react";
 import type { Transaction } from "../../lib/Financeutils";
 import { parseRateString, formatTHB } from "../../lib/Financeutils";
+import { useAuth } from "../../lib/auth";
+import { exportUserTransactions } from "../../lib/server-api";
 
 interface DailyCalendarExportProps {
   transactions: Transaction[];
@@ -57,12 +59,8 @@ function dateKeyOf(year: number, month0: number, day: number): string {
   return `${year}-${pad2(month0 + 1)}-${pad2(day)}`;
 }
 
-function escapeCsvCell(value: string | number): string {
-  const str = String(value);
-  if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
+function lastDayOfMonth(year: number, month0: number): number {
+  return new Date(year, month0 + 1, 0).getDate();
 }
 
 export default function DailyCalendarExport({
@@ -73,6 +71,7 @@ export default function DailyCalendarExport({
   const [viewMonth0, setViewMonth0] = useState(today.getMonth()); // 0-indexed
   const [selectedDateKey, setSelectedDateKey] = useState<string | null>(null);
   const [exportBusy, setExportBusy] = useState<"csv" | "xlsx" | null>(null);
+  const { user } = useAuth();
 
   // รวมรายการต่อวัน (คำนวณเป็นหน่วยบาท เพื่อให้เทียบกันได้ข้ามสกุลเงิน)
   const dayMap = useMemo(() => {
@@ -88,7 +87,12 @@ export default function DailyCalendarExport({
     for (const t of sorted) {
       const rate = parseRateString(t.rate);
       const amountTHB = t.amount * rate;
-      const pnlTHB = t.pnlAmount * rate;
+      // pnlAmount เป็นกำไร/ขาดทุนรับรู้ (realized) เป็นบาทจาก Backend แล้ว
+      // (realizedGainLossThb) — ห้ามคูณอัตราแลกเปลี่ยนซ้ำ (double conversion)
+      // pnlAmount เป็น null เมื่อคำนวณกำไร/ขาดทุนไม่ได้ (SELL ที่ไม่มีต้นทุน)
+      // รายการแบบนั้นไม่นำมารวม dailyPnl (อย่าแสดงเป็น ฿0.00 ปลอม)
+      const pnlTHB =
+        t.pnlAmount === undefined || t.pnlAmount === null ? 0 : t.pnlAmount;
 
       const entry = map.get(t.date) ?? {
         income: 0,
@@ -190,79 +194,45 @@ export default function DailyCalendarExport({
     }
   }
 
-  function buildExportRows() {
-    return monthDays.map((d) => ({
-      วันที่: d.dateKey,
-      เงินเข้า: Number(d.income.toFixed(2)),
-      เงินออก: Number(d.expense.toFixed(2)),
-      ยอดสุทธิรายวัน: Number(d.netFlow.toFixed(2)),
-      "กำไร/ขาดทุนรายวัน": Number(d.dailyPnl.toFixed(2)),
-      กำไรสะสม: Number(d.cumulativePnl.toFixed(2)),
-    }));
-  }
-
-  function handleExportCsv() {
-    setExportBusy("csv");
+  // Server-authoritative export: POST /api/v1/export with the currently viewed
+  // month's date range. The server builds the file from the user's OWN rows in
+  // Capital_Transactions (no client-side fabrication).
+  async function handleServerExport(format: "csv" | "xlsx") {
+    if (!user?.accessToken) {
+      alert("กรุณาเข้าสู่ระบบก่อนส่งออกข้อมูล");
+      return;
+    }
+    setExportBusy(format);
     try {
-      const rows = buildExportRows();
-      const headers = Object.keys(rows[0] ?? {
-        วันที่: "",
-        เงินเข้า: "",
-        เงินออก: "",
-        ยอดสุทธิรายวัน: "",
-        "กำไร/ขาดทุนรายวัน": "",
-        กำไรสะสม: "",
-      });
-      const lines = [
-        headers.map(escapeCsvCell).join(","),
-        ...rows.map((row) =>
-          headers.map((h) => escapeCsvCell((row as Record<string, unknown>)[h] as string | number)).join(",")
-        ),
-      ];
-      // ใส่ BOM เพื่อให้ Excel เปิดภาษาไทยได้ถูกต้อง
-      const csvContent = "\uFEFF" + lines.join("\r\n");
-      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+      const { blob, filename } = await exportUserTransactions(
+        user.accessToken,
+        format,
+        {
+          dateFrom: `${viewYear}-${pad2(viewMonth0 + 1)}-01`,
+          dateTo: `${viewYear}-${pad2(viewMonth0 + 1)}-${pad2(lastDayOfMonth(viewYear, viewMonth0))}`,
+        }
+      );
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `รายงานรายวัน_${viewYear}-${pad2(viewMonth0 + 1)}.csv`;
+      link.download = filename;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
+    } catch {
+      alert("ไม่สามารถส่งออกข้อมูลได้กรุณาลองใหม่อีกครั้ง");
     } finally {
       setExportBusy(null);
     }
   }
 
-  async function handleExportExcel() {
-    setExportBusy("xlsx");
-    try {
-      // ต้องติดตั้งไลบรารี xlsx ในโปรเจกต์: npm install xlsx
-      const XLSX = await import("xlsx");
-      const rows = buildExportRows();
-      const worksheet = XLSX.utils.json_to_sheet(rows);
-      worksheet["!cols"] = [
-        { wch: 12 },
-        { wch: 14 },
-        { wch: 14 },
-        { wch: 16 },
-        { wch: 18 },
-        { wch: 14 },
-      ];
-      const workbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(
-        workbook,
-        worksheet,
-        `${viewYear}-${pad2(viewMonth0 + 1)}`
-      );
-      XLSX.writeFile(
-        workbook,
-        `รายงานรายวัน_${viewYear}-${pad2(viewMonth0 + 1)}.xlsx`
-      );
-    } finally {
-      setExportBusy(null);
-    }
+  function handleExportCsv() {
+    void handleServerExport("csv");
+  }
+
+  function handleExportExcel() {
+    void handleServerExport("xlsx");
   }
 
   // ตำแหน่งของ cell ว่างก่อนวันที่ 1 ของเดือน

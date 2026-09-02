@@ -1,10 +1,13 @@
 import { useEffect, useState } from "react";
 import { FileText, Download, Trash2 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
-import { fetchUserDocuments } from "../../lib/server-api";
+import {
+  fetchUserDocuments,
+  downloadUserDocument,
+  deleteUserDocument,
+} from "../../lib/server-api";
 import {
   getLocalDocumentByName,
-  getLocalBlobById,
   deleteDocument,
   type StoredDocumentMeta,
 } from "../../lib/Documentstorage";
@@ -20,7 +23,6 @@ function formatDate(iso: string): string {
   return d.toLocaleDateString("th-TH", { year: "numeric", month: "short", day: "numeric" });
 }
 
-// รายการนี้เก็บไฟล์ไว้แค่ในเบราว์เซอร์เครื่องนี้เท่านั้น (IndexedDB) — ไม่ใช่การเก็บบน cloud/server จริง
 interface StoredDocumentsListProps {
   refreshTrigger?: number;
 }
@@ -29,6 +31,7 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
   const { user } = useAuth();
   const [docs, setDocs] = useState<StoredDocumentMeta[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
   const refresh = async () => {
     try {
@@ -56,27 +59,44 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
   }, [refreshTrigger, user?.accessToken]);
 
   const handleDownload = async (doc: StoredDocumentMeta) => {
-    if (!user?.id) return;
-    const local = await getLocalDocumentByName(user.id, doc.fileName);
-    if (!local) return;
-    const blob = await getLocalBlobById(user.id, local.id);
-    if (!blob) return;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = doc.fileName;
-    a.click();
-    URL.revokeObjectURL(url);
+    // The server is the source of truth for the file bytes (GET
+    // /api/v1/documents/:id/download). IndexedDB is no longer authoritative.
+    if (!user?.accessToken) return;
+    setError("");
+    try {
+      const { blob, filename } = await downloadUserDocument(
+        user.accessToken,
+        doc.id,
+        doc.fileName
+      );
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError("ไม่สามารถดาวน์โหลดไฟล์ได้ กรุณาลองใหม่อีกครั้ง");
+    }
   };
 
   const handleDelete = async (id: string, fileName: string) => {
-    if (!user?.id) return;
-    const local = await getLocalDocumentByName(user.id, fileName);
-    if (local) {
-      await deleteDocument(user.id, local.id);
+    if (!user?.accessToken) return;
+    setError("");
+    try {
+      // Server-authoritative delete: removes the document row AND its
+      // originating transactions (user-scoped, atomic).
+      await deleteUserDocument(user.accessToken, id);
+      // Best-effort cleanup of the optional local IndexedDB copy.
+      if (user.id) {
+        const local = await getLocalDocumentByName(user.id, fileName);
+        if (local) {
+          await deleteDocument(user.id, local.id);
+        }
+      }
+    } catch {
+      setError("ไม่สามารถลบไฟล์ได้ กรุณาลองใหม่อีกครั้ง");
     }
-    // Server-authoritative document row is not deleted here (no user-scoped
-    // server delete endpoint yet); only the optional local IndexedDB copy.
     refresh();
   };
 
@@ -88,10 +108,14 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
         <h3 className="text-sm font-semibold text-gray-800">
           ไฟล์ Statement ที่จัดเก็บไว้
         </h3>
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 font-medium">
-          เก็บในเครื่องนี้เท่านั้น
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-600 font-medium">
+          บนเซิร์ฟเวอร์
         </span>
       </div>
+
+      {error && (
+        <p className="text-[11px] text-red-600 mb-2">{error}</p>
+      )}
 
       {docs.length === 0 ? (
         <p className="text-xs text-gray-400 text-center py-4">

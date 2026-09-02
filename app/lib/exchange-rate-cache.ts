@@ -119,7 +119,7 @@ export async function upsertCachedRate(
 
 /**
  * Bulk upsert multiple exchange rates for the same date.
- * Used when fetching from the BOT API which returns all currencies for a date.
+ * Used after fetching multiple date rates from the historical FX provider.
  */
 export async function upsertCachedRates(
   rates: UpsertRateInput[]

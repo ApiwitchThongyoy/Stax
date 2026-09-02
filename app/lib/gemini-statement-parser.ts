@@ -25,13 +25,67 @@ export const GeminiErrorCode = {
 export type GeminiErrorCodeValue =
   (typeof GeminiErrorCode)[keyof typeof GeminiErrorCode];
 
+/**
+ * Sanitized downstream failure summary attached to a request failure so the
+ * real cause is preserved for server logs without leaking secrets. Only
+ * whitelisted fields are kept (never the API key, auth headers, or request URL).
+ */
+export interface GeminiRequestFailure {
+  /** Upstream error constructor name, e.g. "TypeError" or "SDKStatusError". */
+  type: string;
+  /** HTTP status when the upstream error carries one (e.g. 429, 400). */
+  status?: number;
+  /** Low-level cause code, e.g. ENOTFOUND / ECONNRESET / ETIMEDOUT. */
+  code?: string;
+}
+
 export class GeminiError extends Error {
   readonly code: GeminiErrorCodeValue;
-  constructor(code: GeminiErrorCodeValue, message: string) {
+  readonly cause?: GeminiRequestFailure;
+  constructor(
+    code: GeminiErrorCodeValue,
+    message: string,
+    cause?: GeminiRequestFailure
+  ) {
     super(message);
     this.name = "GeminiError";
     this.code = code;
+    this.cause = cause;
   }
+}
+
+/**
+ * Walk an unknown upstream error and extract ONLY the whitelisted, sanitized
+ * fields we are safe to log: the error type name, an HTTP status if present, and
+ * the lowest-level cause code (ENOTFOUND / ECONNRESET / ETIMEDOUT / UND_ERR_*).
+ * Never includes raw messages, URLs, headers, or credentials.
+ */
+export function classifyGeminiRequestFailure(error: unknown): GeminiRequestFailure {
+  const failure: GeminiRequestFailure = {
+    type: error instanceof Error ? error.constructor.name : "Unknown",
+  };
+
+  if (typeof error === "object" && error !== null) {
+    const status = (error as Record<string, unknown>).status;
+    if (typeof status === "number" && status >= 100 && status <= 599) {
+      failure.status = status;
+    }
+  }
+
+  // undici / Node fetch attach the real network error under `cause.code`
+  // (e.g. ENOTFOUND, ECONNRESET, ETIMEDOUT, UND_ERR_HEADERS_TIMEOUT).
+  let cursor: unknown = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (!(typeof cursor === "object" && cursor !== null)) break;
+    const code = (cursor as Record<string, unknown>).code;
+    if (typeof code === "string" && code.length > 0) {
+      failure.code = code;
+      break;
+    }
+    cursor = (cursor as Record<string, unknown>).cause;
+  }
+
+  return failure;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,10 +257,13 @@ function buildPrompt(statementText: string): string {
     "- currency must be an uppercase ISO 4217 code (2-3 letters).",
     "- transactionType must be one of: income, expense, equity, asset.",
     "- amount is the cash amount as a decimal string (can be negative).",
-    "- exchangeRate is the FX rate to THB if derivable, else null.",
-    "- amountThb is the THB-converted amount if derivable, else null.",
+    "- exchangeRate is the FX rate to THB ONLY if that rate is EXPLICITLY printed " +
+      "in the statement; NEVER infer, guess, or fetch it from memory or market data.",
+    "- amountThb is the THB-converted amount ONLY if that value is EXPLICITLY " +
+      "printed in the statement; never compute or invent it.",
     "- confidence is a number from 0 to 1 reflecting how confident you are.",
     "- If part of the statement is unclear, record a warning string rather than inventing data.",
+    "- NEVER guess, estimate, or fabricate exchange rates or THB amounts — use null.",
     "Return only JSON matching the provided schema.",
     "\n--- STATEMENT TEXT ---\n",
     statementText,
@@ -283,13 +340,19 @@ export async function parseStatementWithGemini(
       },
     });
   } catch (error) {
-    console.error(
-      "parseStatementWithGemini: request failed",
-      error instanceof Error ? error.message : error
-    );
+    // Log ONLY sanitized fields (error type, optional HTTP status, low-level
+    // cause code). Never log raw upstream messages/URLs, the API key, auth
+    // headers, or the statement text.
+    const failure = classifyGeminiRequestFailure(error);
+    console.error("parseStatementWithGemini: request failed (GEMINI_REQUEST_FAILED)", {
+      upstreamType: failure.type,
+      upstreamStatus: failure.status ?? undefined,
+      causeCode: failure.code ?? undefined,
+    });
     throw new GeminiError(
       GeminiErrorCode.REQUEST_FAILED,
-      "Gemini request failed"
+      "Gemini request failed",
+      failure
     );
   }
 

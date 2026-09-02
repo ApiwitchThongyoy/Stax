@@ -10,6 +10,7 @@ export interface AdminUsersApiRow {
   status: string;
   lastLoginAt?: string | null;
   lastSeenAt?: string | null;
+  createdAt?: string | null;
   documentCount?: number;
 }
 

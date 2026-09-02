@@ -34,7 +34,9 @@ interface ApiTransaction {
   amountForeign: string;
   currency: string;
   transactionDate: string;
-  fxRateBot: string;
+  fxRateBot: string | null;
+  fxRateEffective?: string | null;
+  fxRateStatement?: string | null;
   amountThb: string;
   type: ApiTransactionType;
   sourceType: string;
@@ -168,7 +170,10 @@ export default function CapitalLedgerPage() {
       type: entry.type === "CASH_OUT" ? "out" : "in",
       amount: entry.amountForeign,
       currency: entry.currency,
-      rate: entry.fxRateBot,
+      // Imported rows carry fx_rate_bot = null; fall back to the rate actually
+      // applied (fx_rate_effective) so editing never silently resets FX to 1.
+      rate:
+        entry.fxRateBot ?? entry.fxRateEffective ?? entry.fxRateStatement ?? "1",
     });
     setFormError("");
     setIsModalOpen(true);

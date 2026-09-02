@@ -46,6 +46,8 @@ const uploadRoute = read("app/routes/api/statements/upload.ts");
 const dbSchema = read("app/db/schema.ts");
 const statementHash = read("app/lib/statement-hash.ts");
 const migration = read("drizzle/0006_add_document_content_hash.sql");
+const exchangeRatesRoute = read("app/routes/api/exchange-rates.ts");
+const envExample = read(".env.example");
 
 // ---------------------------------------------------------------------------
 // 1. No stale fake placeholder values anywhere in the user UI.
@@ -73,19 +75,58 @@ for (const frag of forbidden) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Truthful NOT-AVAILABLE states on the user Dashboard.
+// 2. Truthful NOT-AVAILABLE / summary states on the user Dashboard.
 // ---------------------------------------------------------------------------
 ok(
   dashboard.includes("NOT AVAILABLE"),
-  "Dashboard shows a NOT AVAILABLE state"
+  "Dashboard keeps a NOT AVAILABLE state for a genuinely non-computable tax base"
 );
 ok(
-  dashboard.includes("ยังไม่ได้เชื่อมต่อ BOT API"),
-  "Dashboard exchange-rate card is truthful (BOT API not connected)"
+  dashboard.includes("ยังไม่มีข้อมูลอัตราแลกเปลี่ยน"),
+  "Dashboard exchange-rate card has a truthful no-rate state"
 );
 ok(
-  dashboard.includes("ยังไม่สามารถคำนวณภาษีได้"),
-  "Dashboard tax card is truthful (tax not computable)"
+  !dashboard.includes("BOT API"),
+  "Dashboard never blames BOT API for a missing exchange rate"
+);
+ok(
+  dashboard.includes("จาก Historical FX Provider") &&
+    dashboard.includes("แหล่งที่มา: Historical FX Provider"),
+  "Dashboard FX card labels the external fallback as 'Historical FX Provider' (no BOT wording)"
+);
+ok(
+  !dashboard.includes("อ้างอิงจากภายนอก"),
+  "Dashboard drops the old generic external-rate label in favor of Historical FX Provider"
+);
+ok(
+  !fx.includes("BOT"),
+  "FxAiPage has zero BOT references (retired provider wording fully removed)"
+);
+ok(
+  exchangeRatesRoute.includes("historical-fx-provider") &&
+    !exchangeRatesRoute.includes("bot-exchange-rate") &&
+    !exchangeRatesRoute.includes("apigw1.bot.or.th"),
+  "exchange-rates route uses the keyless historical FX provider (BOT module removed)"
+);
+ok(
+  !envExample.includes("BOT_API_KEY"),
+  ".env.example no longer documents a BOT_API_KEY requirement"
+);
+ok(
+  dashboard.includes("แหล่งที่มา: Statement"),
+  "Dashboard exchange-rate card cites the Statement as the FX source when available"
+);
+ok(
+  dashboard.includes("ฐานภาษีที่คำนวณได้"),
+  "Dashboard tax card shows the computable tax base (not 'tax payable')"
+);
+ok(
+  dashboard.includes("ยังไม่มีฐานภาษีที่คำนวณได้"),
+  "Dashboard tax card is truthful when nothing is computable"
+);
+ok(
+  dashboard.includes("มีบางรายการที่ยังคำนวณไม่ได้"),
+  "Dashboard P&L card warns about non-computable rows without blanking the whole card"
 );
 ok(
   dashboard.includes("ยังไม่มีคำแนะนำจาก AI"),
@@ -113,15 +154,24 @@ ok(
 );
 
 // ---------------------------------------------------------------------------
-// 3b. Regression: a Statement that already produces deterministic rows must
+// 3b. Regression: a fresh Statement that already produces deterministic rows must
 //     still be eligible for Gemini analysis when Gemini is configured.
-//     Static guard on the upload route: runGeminiAnalysis is invoked BEFORE the
-//     deterministic row-count/duplicate gate, and every response path carries ai.
+//     Static guard on the upload route's FRESH-import path: runGeminiAnalysis is
+//     invoked BEFORE the deterministic row-count/duplicate gate, and every
+//     response path carries ai. The rebuild path (a deleted document's rows are
+//     restored) is structured separately and intentionally does NOT re-run the
+//     row-gate ordering here.
 // ---------------------------------------------------------------------------
 const geminiCallIdx = uploadRoute.indexOf("await runGeminiAnalysis(");
-const rowGateIdx = uploadRoute.indexOf("built.rows.length === 0");
+const rowBatch = uploadRoute.match(/built\.rows\.length === 0/g) ?? [];
+const rowGateIdx = rowBatch.length
+  ? uploadRoute.indexOf("built.rows.length === 0", geminiCallIdx)
+  : -1;
 ok(
-  geminiCallIdx !== -1 && rowGateIdx !== -1 && geminiCallIdx < rowGateIdx,
+  geminiCallIdx !== -1 &&
+    rowBatch.length >= 1 &&
+    rowGateIdx !== -1 &&
+    geminiCallIdx < rowGateIdx,
   "upload route runs Gemini analysis even when deterministic rows exist (call precedes row gate)"
 );
 const aiInResponseCount = uploadRoute.split("ai: aiResult").length - 1;

@@ -4,8 +4,8 @@ import { db } from "~/lib/drizzle-db";
 import { capitalTransactions } from "~/db/schema";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import {
-  buildNonComputableTaxRecon,
-  type CapitalTransactionLike,
+  buildTaxRecon,
+  type TaxReconDetailRow,
 } from "~/lib/tax-engine";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
@@ -35,13 +35,13 @@ const MAX_TRANSACTION_IDS = 500;
  * Fetches ONLY the current user's transactions from the DB (ownership is
  * enforced by the WHERE clause on userId).
  *
- * SEMANTIC NOTE: the Capital_Transactions schema stores raw cash only and does
- * not carry cost basis / proceeds, so true realized gain/loss (and hence a
- * taxable amount) CANNOT be computed here. The endpoint therefore returns the
- * neutral signed cash value (transactionAmountThb) per row and marks the tax
- * outcome as explicitly NOT computable — it never treats CASH_IN/CASH_OUT as
- * realized profit/loss. The deterministic Decimal engine is only used when an
- * authoritative upstream caller supplies a real realized gain/loss.
+ * SEMANTIC NOTE: rows that carry a stored realizedGainLossThb (persisted
+ * deterministically by the statement pipeline for SELL trades with a known
+ * running-average cost basis) are converted to REAL taxable amounts via the
+ * Decimal tax engine. Other rows (deposits, dividends, fees, currency
+ * exchanges, BUY rows, or SELL rows without computable history) are reported as
+ * explicitly NOT computable and NEVER contribute to the taxable total — raw
+ * cash flow is never substituted for gain/loss.
  *
  * All monetary values cross the API as strings.
  */
@@ -111,6 +111,19 @@ export async function action({ request }: Route.ActionArgs) {
         currency: capitalTransactions.currency,
         amountThb: capitalTransactions.amountThb,
         type: capitalTransactions.type,
+        symbol: capitalTransactions.symbol,
+        side: capitalTransactions.side,
+        quantity: capitalTransactions.quantity,
+        unitPrice: capitalTransactions.unitPrice,
+        grossAmount: capitalTransactions.grossAmount,
+        fees: capitalTransactions.fees,
+        proceeds: capitalTransactions.proceeds,
+        costBasis: capitalTransactions.costBasis,
+        realizedGainLoss: capitalTransactions.realizedGainLoss,
+        realizedGainLossThb: capitalTransactions.realizedGainLossThb,
+        fxRateStatement: capitalTransactions.fxRateStatement,
+        fxRateEffective: capitalTransactions.fxRateEffective,
+        exchange: capitalTransactions.exchange,
       })
       .from(capitalTransactions)
       .where(
@@ -122,14 +135,30 @@ export async function action({ request }: Route.ActionArgs) {
       .execute();
 
     // Only the user's own rows are used. Unknown/foreign ids are ignored.
-    // The reconstruction is explicitly "not computable" — no realized gain/loss
-    // and no taxable total is fabricated from raw cash flows.
-    const likeRows: CapitalTransactionLike[] = rows.map((row) => ({
+    // Rows with real stored realized gain/loss are computed; the rest stay
+    // explicitly "not computable" — no taxable number is fabricated.
+    const detailRows: TaxReconDetailRow[] = rows.map((row) => ({
       transactionId: row.transactionId,
       amountThb: row.amountThb,
       type: row.type,
+      transactionDate: row.transactionDate,
+      currency: row.currency,
+      symbol: row.symbol,
+      side: row.side,
+      quantity: row.quantity,
+      unitPrice: row.unitPrice,
+      grossAmount: row.grossAmount,
+      fees: row.fees,
+      proceeds: row.proceeds,
+      costBasis: row.costBasis,
+      realizedGainLoss: row.realizedGainLoss,
+      realizedGainLossThb: row.realizedGainLossThb,
+      fxRateStatement: row.fxRateStatement,
+      fxRateEffective: row.fxRateEffective,
+      exchange: row.exchange,
     }));
-    const summary = buildNonComputableTaxRecon(likeRows);
+
+    const summary = buildTaxRecon(detailRows);
 
     // Enrich each row with date/currency metadata from the authoritative DB row.
     const enriched = summary.transactions.map((t) => {
@@ -146,6 +175,8 @@ export async function action({ request }: Route.ActionArgs) {
         success: true,
         data: {
           computable: summary.computable,
+          computedCount: summary.computedCount,
+          nonComputableCount: summary.nonComputableCount,
           reason: summary.reason,
           transactions: enriched,
           totalTaxableAmountThb: summary.totalTaxableAmountThb,

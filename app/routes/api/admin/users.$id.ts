@@ -85,7 +85,33 @@ export async function action({ request, params }: Route.ActionArgs) {
     );
   }
 
-  if (auth.userId === id && status === "SUSPENDED") {
+  // Only role USER accounts may be suspended/reactivated by an admin. This
+  // protects the currently-logged-in admin AND every other admin account, and
+  // guarantees a non-USER target can never have its status mutated here.
+  let target;
+  try {
+    const rows = await db
+      .select({ id: users.id, role: users.role, status: users.status })
+      .from(users)
+      .where(eq(users.id, id))
+      .limit(1);
+    target = rows[0] ?? null;
+  } catch (error) {
+    console.error("AdminUsers PATCH: failed to query target", error);
+    return Response.json(
+      { success: false, message: "Internal server error" },
+      { status: 500 }
+    );
+  }
+
+  if (!target) {
+    return Response.json(
+      { success: false, message: "User not found" },
+      { status: 404 }
+    );
+  }
+
+  if (target.role !== "USER") {
     await insertAuditLog({
       userId: auth.userId,
       action: AuditAction.ADMIN_USER_STATUS_UPDATE,
@@ -95,32 +121,20 @@ export async function action({ request, params }: Route.ActionArgs) {
         route: `/api/v1/admin/users/${id}`,
         method: "PATCH",
         result: "rejected",
-        reason: "self_suspend_forbidden",
+        reason: "admin_account_status_locked",
+        targetRole: target.role,
       },
     });
     return Response.json(
       {
         success: false,
-        message: "ไม่สามารถระงับบัญชีผู้ดูแลระบบที่กำลังใช้งานอยู่ได้",
+        message: "ไม่สามารถระงับหรือเปิดใช้งานบัญชีผู้ดูแลระบบได้",
       },
       { status: 400 }
     );
   }
 
   try {
-    const existingRows = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.id, id))
-      .limit(1);
-
-    if (existingRows.length === 0) {
-      return Response.json(
-        { success: false, message: "User not found" },
-        { status: 404 }
-      );
-    }
-
     await db
       .update(users)
       .set({ status })

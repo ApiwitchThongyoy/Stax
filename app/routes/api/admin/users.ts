@@ -46,6 +46,7 @@ export async function loader({ request }: Route.LoaderArgs) {
         status: users.status,
         lastLoginAt: users.lastLoginAt,
         lastSeenAt: users.lastSeenAt,
+        createdAt: users.createdAt,
         documentCount: sql<number>`coalesce((SELECT count(*)::int FROM ${documents} WHERE ${documents}.user_id = ${users}.id), 0)`,
       })
       .from(users)

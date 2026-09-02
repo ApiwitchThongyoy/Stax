@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router";
 import { useAuth } from "../lib/auth";
 import { clearAllSessions } from "../lib/session";
+import { canUseUserPortal } from "../lib/portal-access";
 import { useSuspendedAccount } from "../lib/suspended-account";
 import { useAccountStatusPolling } from "../lib/useAccountStatusPolling";
 
@@ -16,19 +17,13 @@ export default function ProtectedLayout() {
   // Mounted here at the protected shell so it runs for EVERY protected route
   // (dashboard tabs, settings, ledger, archive) regardless of the active tab.
   // Exactly one instance; Dashboard must NOT start a second one.
-  console.log("[ACCOUNT_STATUS] ProtectedLayout mounted", {
-    isAuthenticated,
-    hasToken: !!user?.accessToken,
-  });
   useAccountStatusPolling({
     enabled: !!user?.accessToken && isAuthenticated,
     accessToken: user?.accessToken ?? null,
     onSuspended: () => {
-      console.log("[ACCOUNT_STATUS] markSuspended called");
       markSuspended();
     },
     onActive: () => {
-      console.log("[ACCOUNT_STATUS] markReactivated called");
       markReactivated();
     },
   });
@@ -47,6 +42,16 @@ export default function ProtectedLayout() {
     // ทางที่ถูกต้องเสมอ เพื่อให้ protected route ไม่รั่วหลัง logout
     if (!isAuthenticated) {
       navigate("/login", { replace: true, state: { from: location.pathname } });
+      return;
+    }
+
+    // Defense in depth: the normal USER portal only allows role USER. Even if a
+    // stale/manual ADMIN (or other non-USER) session somehow exists, clear it
+    // and redirect to the USER login — never render the Dashboard for it.
+    if (user && !canUseUserPortal(user.role)) {
+      clearAllSessions();
+      logout();
+      navigate("/login", { replace: true });
       return;
     }
 
@@ -81,6 +86,7 @@ export default function ProtectedLayout() {
   // a hydration mismatch.
   if (!isAuthenticated) return null;
   if (!mounted) return null;
+  if (user && !canUseUserPortal(user.role)) return null;
 
   return <Outlet />;
 }

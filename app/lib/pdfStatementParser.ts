@@ -30,6 +30,19 @@ export interface ExtractedTransaction {
   rate?: string;
   section: string; // ป้ายกำกับที่มาของรายการ เช่น "เงินฝาก", "เงินปันผล"
   included: boolean; // ติ๊กเลือกไว้ให้ตอน preview
+  // ---- Trade detail (จาก TRADE RECORDS) ใช้สำหรับ cost-basis/realized gain
+  // บน server เป็นหลัก (migration 0009) เป็น optional เพื่อไม่ให้กระทบ client เดิม ----
+  symbol?: string; // ticker เช่น "GLD"
+  side?: "BUY" | "SELL";
+  quantity?: number; // จำนวนหุ้น/หน่วย
+  unitPrice?: number; // ราคาต่อหน่วย สกุลเงินเดียวกับ currency
+  grossAmount?: number; // unitPrice * quantity (เงินต้นของรายการซื้อขาย)
+  fees?: number; // commission + VAT ของรายการซื้อขายนี้
+  proceeds?: number; // ยอดขายรวม gross (เฉพาะ SELL)
+  costBasis?: number; // ต้นทุนรวมของหุ้นที่ขาย = avgCost * quantity (เฉพาะ SELL)
+  realizedGainLoss?: number; // proceeds - costBasis (เฉพาะ SELL ที่คำนวณได้)
+  netAmount?: number; // ยอดเงินสุทธิที่โบรกเกอร์ระบุ (fees ถูกหัก/รวมแล้ว) — authoritative
+  exchange?: string; // ตลาดที่ซื้อขาย เช่น NASDAQ / NYSE / NYSEARCA
 }
 
 // ---------- ต้นทุนเฉลี่ยสะสม (running average cost) ต่อสัญลักษณ์หุ้น ----------
@@ -192,10 +205,14 @@ interface RawTradeEvent {
   qty: number;
   qtyStr: string;
   price: string;
-  net: number;
+  net: number; // authoritative net cash (fees already applied); BUY flips negative downstream
+  netStr: string;
   symbol: string;
   description: string;
   currency: string;
+  fees: number; // signed commission + VAT for this trade (may be a negative rebate)
+  gross: number; // gross = unit price * quantity
+  exchange: string;
 }
 
 // ตัดอักขระที่ไม่ใช่ตัวอักษร/ตัวเลขออก แล้วแปลงเป็นตัวพิมพ์ใหญ่ทั้งหมด เพื่อเทียบชื่อกองทุนแบบไม่สนช่องว่าง/สัญลักษณ์พิเศษ (®, -, ฯลฯ)
@@ -530,26 +547,72 @@ export function parseStatementRows(
     const lines = tradeBlock.split("\n");
     let currentCurrency = "USD";
 
+    // Ticker-like symbol line: an all-caps word (optionally with dots), short,
+    // no spaces. Things like "Currency: USD", "Symbol & Name Trade Date ..."
+    // (header), company names ("ALPHABET INC"), or page markers ("2 of 7") do
+    // NOT match, so they can never be mistaken for a symbol.
+    const tickerLine = /^[A-Z][A-Z.]{0,9}$/;
+
+    // Trade detail row. The inline symbol/name prefix is OPTIONAL to support the
+    // real Webull layout where the symbol sits on its own previous line:
+    //   GOOG                                <- symbol (own previous line)
+    //   30/01/2026 22:32:38,GMT+07 ... BUY  <- detail starts with the date
+    // Legacy format, where symbol+name precede the date on the SAME line
+    // ("GOOG ALPHABET INC 30/01/2026 ... BUY ..."), still matches via group 1.
     const tradeRowPattern =
-      /^(.+?)\s+(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}:\d{2},GMT[+-]\d{2}\s+\d{2}\/\d{2}\/\d{4}\s+(BUY|SELL)\s+([\d.]+)\s+([\d.]+)\s+([\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(\S.*)$/;
+      /^(?:(.+?)\s+)?(\d{2}\/\d{2}\/\d{4})\s+\d{2}:\d{2}:\d{2},GMT[+-]\d{2}\s+\d{2}\/\d{2}\/\d{4}\s+(BUY|SELL)\s+([\d.]+)\s+([\d.]+)\s+([\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(\S.*)$/;
+
+    // Reset at section start: nothing from before TRADE RECORDS can become a symbol.
+    let pendingSymbol: string | null = null;
 
     for (let i = 0; i < lines.length; i++) {
-      const currencyMatch = lines[i].match(/^Currency:\s*([A-Z]{3})$/);
+      const line = lines[i].trim();
+      if (!line) continue;
+
+      const currencyMatch = line.match(/^Currency:\s*([A-Z]{3})$/);
       if (currencyMatch) {
         currentCurrency = currencyMatch[1];
         continue;
       }
 
-      const m = lines[i].match(tradeRowPattern);
-      if (!m) continue;
+      const m = line.match(tradeRowPattern);
+      if (!m) {
+        // Not a trade row. A bare ticker line becomes the candidate symbol for
+        // the NEXT trade detail line only. Anything else (name, header, page
+        // marker) clears the candidate so it cannot be picked up later.
+        if (tickerLine.test(line)) {
+          pendingSymbol = line;
+        } else {
+          pendingSymbol = null;
+        }
+        continue;
+      }
 
-      const [, name, date, side, qtyStr, priceStr, , netAmt, commStr, vatStr] = m;
-      const symbolLine = i > 0 ? lines[i - 1].trim() : "";
+      const [, name, date, side, qtyStr, priceStr, , netAmt, commStr, vatStr, exchange] = m;
+      const inlineSymbol = name?.trim().split(/\s+/)[0] ?? "";
+      // Prefer an inline ticker (legacy format) when present; otherwise the
+      // symbol carried on its own previous line (real Webull layout). Fall back
+      // to the inline name token only if nothing else resolved.
+      let resolvedSymbol =
+        inlineSymbol !== "" && tickerLine.test(inlineSymbol)
+          ? inlineSymbol
+          : pendingSymbol ?? "";
+      if (!resolvedSymbol) {
+        resolvedSymbol = inlineSymbol;
+      }
 
-      feeTotal += toNumber(commStr);
-      vatTotal += toNumber(vatStr);
+      // Fees are SIGNED: negative = rebate (Net = Gross - Comm - VAT, so a
+      // negative Comm/VAT raises Net). Never Math.abs() them.
+      const comm = toNumber(commStr);
+      const vat = toNumber(vatStr);
+      const tradeFees = comm + vat;
+
+      feeTotal += comm;
+      vatTotal += vat;
       lastTradeDate = date;
       tradeCurrency = currentCurrency;
+
+      const gross = toNumber(priceStr) * toNumber(qtyStr);
 
       tradeEvents.push({
         date,
@@ -558,10 +621,18 @@ export function parseStatementRows(
         qtyStr,
         price: priceStr,
         net: toNumber(netAmt),
-        symbol: symbolLine,
-        description: `${symbolLine} ${name.trim()}`.trim(),
+        netStr: netAmt,
+        symbol: resolvedSymbol,
+        description: [resolvedSymbol, name?.trim()].filter(Boolean).join(" ").trim(),
         currency: currentCurrency,
+        fees: tradeFees,
+        gross,
+        exchange: exchange.trim(),
       });
+
+      // A trade row has consumed its symbol; the next line is the company name,
+      // so the pending symbol must NOT bleed into the following trade.
+      pendingSymbol = null;
     }
   }
 
@@ -574,6 +645,9 @@ export function parseStatementRows(
   for (const ev of chronological) {
     let pnlAmount = 0;
     let pnlNote = "";
+    // Filled only for computable SELL rows (authoritative basis + sufficient qty):
+    // proceeds = broker net, costBasis = avgCost*qty, realized gain/loss.
+    let realizedMeta: { proceeds: number; costBasis: number; realizedGainLoss: number } | undefined;
 
     if (ev.side === "BUY") {
       const existing = workingCostBasis[ev.symbol];
@@ -589,22 +663,50 @@ export function parseStatementRows(
       // ของไฟล์นี้เอง (กรณีไม่เคยมีประวัติสะสมของสัญลักษณ์นี้มาก่อนเลย)
       const existing = workingCostBasis[ev.symbol];
       const seed = portfolioSummary[ev.symbol];
-      const avgCostForSale = existing?.quantity ? existing.avgCost : seed?.avgCost;
-      const priceNum = toNumber(ev.price);
+      const availableQty = existing?.quantity ?? seed?.quantity ?? 0;
+      const saleAvgCost =
+        existing?.quantity !== undefined && existing?.quantity >= 0
+          ? existing.avgCost
+          : seed?.avgCost;
 
-      if (avgCostForSale !== undefined) {
-        pnlAmount = (priceNum - avgCostForSale) * ev.qty;
+      // จำนวนที่ขายต้องไม่เกินจำนวนที่ถืออยู่จริง (จากประวัติสะสมหรือ Portfolio Summary)
+      // ถ้าไม่มีต้นทุนเฉลี่ย หรือขายเกินจำนวนที่ถือ -> คำนวณไม่ได้ (non-computable)
+      const sufficient = availableQty > 0 && availableQty >= ev.qty;
+      if (saleAvgCost !== undefined && sufficient) {
+        // ใช้ "Net Amount" ที่โบรกเกอร์ระบุ (หักค่าธรรมเนียมแล้ว) เป็นยอดขายสุทธิ (authoritative)
+        // แทนการสร้างยอดใหม่เอง: realized  = netProceeds - avgCost*qty
+        pnlAmount = ev.net - saleAvgCost * ev.qty;
+        realizedMeta = {
+          proceeds: ev.net,
+          costBasis: saleAvgCost * ev.qty,
+          realizedGainLoss: pnlAmount,
+        };
       } else {
-        pnlNote = " (ไม่พบต้นทุนเฉลี่ย จึงไม่นับกำไร/ขาดทุนส่วนนี้)";
+        pnlNote = " (ไม่พบต้นทุนเฉลี่ย หรือจำนวนขายเกินจำนวนที่ถือ จึงไม่นับกำไร/ขาดทุนส่วนนี้)";
       }
 
-      const prevQty = existing?.quantity ?? seed?.quantity ?? 0;
-      const prevAvgCost = existing?.avgCost ?? avgCostForSale ?? priceNum;
+      const remainingQty = Math.max(availableQty - ev.qty, 0);
+      const prevAvgCost = existing?.avgCost ?? saleAvgCost ?? toNumber(ev.price);
       workingCostBasis[ev.symbol] = {
-        quantity: Math.max(prevQty - ev.qty, 0),
+        quantity: remainingQty,
         avgCost: prevAvgCost, // ต้นทุนเฉลี่ยไม่เปลี่ยนตอนขาย เปลี่ยนแค่ตอนซื้อเพิ่ม
       };
     }
+
+    const priceNum = toNumber(ev.price);
+    const qtyNum = ev.qty;
+    const grossTradeAmount = ev.gross;
+    const netAmount = ev.net; // authoritative net cash already includes fees
+    const tradeDetailBase = {
+      symbol: ev.symbol,
+      side: ev.side,
+      quantity: qtyNum,
+      unitPrice: priceNum,
+      grossAmount: grossTradeAmount,
+      fees: ev.fees,
+      netAmount: netAmount,
+      exchange: ev.exchange,
+    };
 
     results.push({
       id: nextId(),
@@ -619,6 +721,12 @@ export function parseStatementRows(
       rate: baseRates[ev.currency] ?? "-",
       section: ev.side === "BUY" ? "ซื้อหุ้น" : "ขายหุ้น",
       included: true,
+      // SELL: เก็บ proceeds/costBasis/realizedGainLoss เฉพาะตอนที่คำนวณได้จริง
+      // (มีต้นทุนเฉลี่ยเพียงพอ) เท่านั้น — ถ้าไม่รู้ต้นทุนหรือขายเกินจำนวนที่ถือ
+      // ปล่อยว่างไว้ = "ไม่สามารถคำนวณได้" (ไม่มีกำไร/ขาดทุนปลอมเป็น 0)
+      // proceeds ใช้ "Net Amount" ที่โบรกเกอร์ระบุ (authoritative, หักค่าธรรมเนียมแล้ว)
+      ...tradeDetailBase,
+      ...(realizedMeta ? realizedMeta : {}),
     });
 
     // ขาย: แยก "กำไร/ขาดทุนจากการขาย" ออกมาเป็นบรรทัดของตัวเองต่างหาก (เหมือน income:capital_gains ของอาจารย์)

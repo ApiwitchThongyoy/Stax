@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  TrendingUp,
   LineChart,
   WifiOff,
+  Wifi,
   Calculator,
   Sparkles,
   Loader2,
@@ -22,6 +22,12 @@ import {
   flagSuspendedFromResponse,
 } from "../../lib/suspended-account";
 import { loadLatestGeminiAnalysis } from "../../lib/gemini-analysis-storage";
+import {
+  fetchExchangeRate,
+  fetchAiAnalysis,
+  type ExchangeRateEntry,
+  type AiAnalysisResponse,
+} from "../../lib/server-api";
 
 interface FxAiPageProps {
   transactions: Transaction[];
@@ -50,8 +56,25 @@ interface TaxRowResponse {
   realizedGainLossThb: string | null;
   taxableAmountThb: string | null;
   isTaxable: boolean | null;
-  status: "not-computable";
+  status: "computable" | "not-computable";
+  classification:
+    | "realized-gain"
+    | "non-computable"
+    | "buy-basis"
+    | "not-applicable";
   reason: string;
+  symbol?: string | null;
+  side?: "BUY" | "SELL" | null;
+  quantity?: string | null;
+  unitPrice?: string | null;
+  grossAmount?: string | null;
+  fees?: string | null;
+  proceeds?: string | null;
+  costBasis?: string | null;
+  realizedGainLoss?: string | null;
+  fxRateStatement?: string | null;
+  fxRateEffective?: string | null;
+  exchange?: string | null;
 }
 
 interface TaxResponse {
@@ -59,6 +82,8 @@ interface TaxResponse {
   message?: string;
   data?: {
     computable: boolean;
+    computedCount: number;
+    nonComputableCount: number;
     reason: string;
     transactions: TaxRowResponse[];
     totalTaxableAmountThb: string | null;
@@ -86,6 +111,9 @@ export default function FxAiPage({
 
   const [aiPhase, setAiPhase] = useState<Aiphase>({ phase: "idle" });
   const [taxPhase, setTaxPhase] = useState<TaxPhase>({ phase: "idle" });
+  const [fxEntry, setFxEntry] = useState<ExchangeRateEntry | null>(null);
+  const [insight, setInsight] = useState<AiAnalysisResponse | null>(null);
+  const [insightLoading, setInsightLoading] = useState(false);
 
   const fxRows = transactions.filter(
     (t) => t.rate && t.rate.trim() !== "" && t.rate !== "-"
@@ -135,7 +163,7 @@ export default function FxAiPage({
       .map((t) => t.transactionId)
       .filter((id): id is string => typeof id === "string" && id.length > 0);
     if (ids.length === 0) {
-      setTaxPhase({ phase: "success", data: { computable: false, reason: "ไม่มีธุรกรรม", transactions: [], totalTaxableAmountThb: null } });
+      setTaxPhase({ phase: "success", data: { computable: false, computedCount: 0, nonComputableCount: 0, reason: "ไม่มีธุรกรรม", transactions: [], totalTaxableAmountThb: null } });
       return;
     }
 
@@ -185,6 +213,48 @@ export default function FxAiPage({
     }
   }, []);
 
+  // Fetch today's real external USD/THB rate from the Historical FX Provider.
+  // The server is authoritative — on failure/weekend/holiday it returns
+  // { available: false }, never a fabricated rate. Statement-sourced rates take
+  // priority; this external rate powers the FX status card below.
+  useEffect(() => {
+    if (!user?.accessToken || suspended) return;
+    let cancelled = false;
+    fetchExchangeRate(user.accessToken, "USD")
+      .then((entry) => {
+        if (!cancelled) setFxEntry(entry);
+      })
+      .catch(() => {
+        if (!cancelled)
+          setFxEntry({ available: false, date: "", reason: "network error" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.accessToken, suspended]);
+
+  // Fetch neutral AI insights about the imported activity. When Gemini is
+  // unavailable the server returns { available: false } — shown truthfully.
+  useEffect(() => {
+    if (!user?.accessToken || suspended) return;
+    let cancelled = false;
+    setInsightLoading(true);
+    fetchAiAnalysis(user.accessToken)
+      .then((data) => {
+        if (!cancelled) setInsight(data);
+      })
+      .catch(() => {
+        if (!cancelled)
+          setInsight({ available: false, code: "NETWORK_ERROR", errors: [] });
+      })
+      .finally(() => {
+        if (!cancelled) setInsightLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.accessToken, suspended, transactions]);
+
   const handleGeminiResult = (ai: AiResult) => {
     if (ai.source === "gemini") {
       setAiPhase({ phase: "success", result: ai.result });
@@ -206,6 +276,48 @@ export default function FxAiPage({
     }
   };
 
+  // Classification → Thai status. The server's `classification` field is
+  // authoritative (backend verdict); this is display text only, no calculation
+  // happens in React.
+  const taxStatusLabel = (t: TaxRowResponse): { text: string; cls: string } => {
+    switch (t.classification) {
+      case "realized-gain":
+        return {
+          text: t.isTaxable
+            ? "คำนวณได้ · กำไรต้องเสียภาษี"
+            : "คำนวณได้ · ขาดทุน (ไม่หักกลบ)",
+          cls: "text-emerald-600",
+        };
+      case "non-computable":
+        return {
+          text: "ยังไม่สามารถคำนวณภาษีรายการนี้ได้",
+          cls: "text-amber-600",
+        };
+      case "buy-basis":
+        return { text: "รายการซื้อ / รอใช้เป็นต้นทุน", cls: "text-blue-600" };
+      case "not-applicable":
+      default:
+        return {
+          text: "ไม่ใช่รายการกำไรที่ต้องคำนวณ",
+          cls: "text-gray-500",
+        };
+    }
+  };
+
+  const taxReasonLabel = (t: TaxRowResponse): string => {
+    switch (t.classification) {
+      case "realized-gain":
+        return `กำไร/ขาดทุนรับรู้: ${t.realizedGainLoss ?? "-"} · ฐานภาษี: ฿${t.taxableAmountThb}`;
+      case "non-computable":
+        return "ขาดต้นทุนอ้างอิงที่น่าเชื่อถือ (ไม่มีประวัติการซื้อที่เพียงพอ) จึงคำนวณกำไร/ขาดทุนไม่ได้";
+      case "buy-basis":
+        return "ใช้เป็นต้นทุนเมื่อมีการขาย (SELL) ในอนาคต";
+      case "not-applicable":
+      default:
+        return "เงินฝาก/ถอน ค่าธรรมเนียม หรือรายการที่มิใช่กำไรจากการขายหุ้น ไม่ถูกนำมาคำนวณ";
+    }
+  };
+
   const statusCards: {
     key: string;
     title: string;
@@ -214,12 +326,22 @@ export default function FxAiPage({
     Icon: typeof WifiOff;
   }[] = [
     {
-      key: "bot",
-      title: "อัตราแลกเปลี่ยนเรียลไทม์",
-      message: "ยังไม่ได้เชื่อมต่อ BOT API",
+      key: "fx",
+      title: "อัตราแลกเปลี่ยน (Historical FX Provider)",
+      message:
+        fxEntry === null
+          ? "กำลังตรวจสอบ..."
+          : fxEntry.available && fxEntry.rate != null
+          ? `USD/THB ≈ ฿${fxEntry.rate.toFixed(4)}`
+          : "ไม่พร้อมใช้งาน",
       detail:
-        "อัตราแบบเรียลไทม์จะแสดงที่นี่เมื่อเชื่อมต่อ BOT API กับ backend แล้ว",
-      Icon: WifiOff,
+        fxEntry === null
+          ? "กำลังตรวจสอบอัตราจาก Historical FX Provider"
+          : fxEntry.available && fxEntry.rate != null
+          ? `อัตราอ้างอิงจาก Historical FX Provider ณ วันที่ ${fxEntry.date} (${fxEntry.source ?? "historical-fx-provider"})`
+          : fxEntry.reason ||
+            "ไม่สามารถดึงอัตราได้ (Historical FX Provider ไม่มีข้อมูล หรือเป็นวันหยุดตลาด)",
+      Icon: fxEntry?.available ? Wifi : WifiOff,
     },
     {
       key: "ai",
@@ -498,9 +620,18 @@ export default function FxAiPage({
                   </p>
                 </>
               ) : (
-                <p className="text-sm font-semibold text-gray-800">
-                  ฐานภาษีรวม: ฿{taxPhase.data.totalTaxableAmountThb}
-                </p>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-sm font-semibold text-gray-800">
+                    ฐานภาษีที่คำนวณได้ (รวม): ฿
+                    {taxPhase.data.totalTaxableAmountThb}
+                  </p>
+                  {(taxPhase.data.nonComputableCount ?? 0) > 0 && (
+                    <span className="text-xs text-amber-600">
+                      {taxPhase.data.nonComputableCount} รายการยังคำนวณไม่ได้ ·
+                      คำนวณได้ {taxPhase.data.computedCount ?? 0} รายการ
+                    </span>
+                  )}
+                </div>
               )}
             </div>
 
@@ -519,64 +650,223 @@ export default function FxAiPage({
                   <thead>
                     <tr className="text-left text-xs text-gray-400 border-b border-gray-100">
                       <th className="px-5 py-3 font-medium">วันที่</th>
-                      <th className="px-5 py-3 font-medium">สกุลเงิน</th>
+                      <th className="px-5 py-3 font-medium">สัญลักษณ์</th>
+                      <th className="px-5 py-3 font-medium">ประเภท</th>
+                      <th className="px-5 py-3 font-medium text-right">จำนวน</th>
+                      <th className="px-5 py-3 font-medium text-right">ราคา/หน่วย</th>
+                      <th className="px-5 py-3 font-medium text-right">ยอดรวม</th>
+                      <th className="px-5 py-3 font-medium text-right">ค่าธรรมเนียม</th>
+                      <th className="px-5 py-3 font-medium text-right">ต้นทุน</th>
                       <th className="px-5 py-3 font-medium text-right">
-                        ยอดเงินสด (บาท)
+                        กำไร/ขาดทุน (เดิม)
+                      </th>
+                      <th className="px-5 py-3 font-medium text-right">อัตรา FX</th>
+                      <th className="px-5 py-3 font-medium text-right">
+                        กำไร/ขาดทุน (บาท)
                       </th>
                       <th className="px-5 py-3 font-medium">สถานะ</th>
                       <th className="px-5 py-3 font-medium">เหตุผล</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {taxPhase.data.transactions.map((t) => (
-                      <tr
-                        key={t.transactionId}
-                        className="border-b border-gray-50 last:border-0"
-                      >
-                        <td className="px-5 py-3 text-gray-500 whitespace-nowrap">
-                          {t.transactionDate ?? "-"}
-                        </td>
-                        <td className="px-5 py-3 text-gray-500">
-                          {t.currency ?? "-"}
-                        </td>
-                        <td className="px-5 py-3 text-gray-800 font-medium text-right">
-                          {t.transactionAmountThb}
-                        </td>
-                        <td className="px-5 py-3">
-                          <span className="text-xs font-medium text-amber-600">
-                            ยังไม่สามารถคำนวณภาษีรายการนี้ได้
-                          </span>
-                        </td>
-                        <td className="px-5 py-3 text-xs text-gray-400 leading-relaxed max-w-[280px]">
-                          {t.reason}
-                        </td>
-                      </tr>
-                    ))}
+                    {taxPhase.data.transactions.map((t) => {
+                      const status = taxStatusLabel(t);
+                      return (
+                        <tr
+                          key={t.transactionId}
+                          className="border-b border-gray-50 last:border-0 align-top"
+                        >
+                          <td className="px-5 py-3 text-gray-500 whitespace-nowrap">
+                            {t.transactionDate ?? "-"}
+                          </td>
+                          <td className="px-5 py-3">
+                            <p className="text-gray-800 font-medium">
+                              {t.symbol ?? "-"}
+                            </p>
+                            <p className="text-[11px] text-gray-400">
+                              {t.currency ?? "-"}
+                            </p>
+                          </td>
+                          <td className="px-5 py-3">
+                            <span
+                              className={`text-xs font-medium ${
+                                t.side === "BUY"
+                                  ? "text-blue-600"
+                                  : t.side === "SELL"
+                                    ? "text-red-600"
+                                    : "text-gray-400"
+                              }`}
+                            >
+                              {t.side ?? "-"}
+                            </span>
+                          </td>
+                          <td className="px-5 py-3 text-gray-700 text-right whitespace-nowrap">
+                            {t.quantity ?? "-"}
+                          </td>
+                          <td className="px-5 py-3 text-gray-700 text-right whitespace-nowrap">
+                            {t.unitPrice ?? "-"}
+                          </td>
+                          <td className="px-5 py-3 text-gray-700 text-right whitespace-nowrap">
+                            {t.grossAmount ?? "-"}
+                          </td>
+                          <td className="px-5 py-3 text-gray-700 text-right whitespace-nowrap">
+                            {t.fees ?? "-"}
+                          </td>
+                          <td className="px-5 py-3 text-gray-700 text-right whitespace-nowrap">
+                            {t.costBasis ?? "-"}
+                          </td>
+                          <td className="px-5 py-3 text-gray-700 text-right whitespace-nowrap">
+                            {t.realizedGainLoss ?? "-"}
+                          </td>
+                          <td className="px-5 py-3 text-gray-500 text-right whitespace-nowrap">
+                            {t.fxRateEffective ?? t.fxRateStatement ?? "-"}
+                          </td>
+                          <td
+                            className={`px-5 py-3 text-right font-medium whitespace-nowrap ${
+                              t.realizedGainLossThb != null
+                                ? parseFloat(t.realizedGainLossThb) >= 0
+                                  ? "text-emerald-600"
+                                  : "text-red-500"
+                                : "text-gray-300"
+                            }`}
+                          >
+                            {t.realizedGainLossThb != null
+                              ? `฿${t.realizedGainLossThb}`
+                              : "-"}
+                          </td>
+                          <td className="px-5 py-3">
+                            <span
+                              className={`text-xs font-medium ${status.cls}`}
+                            >
+                              {status.text}
+                            </span>
+                          </td>
+                          <td className="px-5 py-3 text-xs text-gray-400 leading-relaxed max-w-[260px]">
+                            {t.status === "computable"
+                              ? `กำไร/ขาดทุนรับรู้: ฿${t.realizedGainLossThb} · ฐานภาษี: ฿${t.taxableAmountThb}`
+                              : t.classification === "non-computable"
+                                ? taxReasonLabel(t)
+                                : taxReasonLabel(t)}
+                            {t.classification === "not-applicable" && (
+                              <span
+                                className="block text-[10px] text-gray-300"
+                                title={t.reason}
+                              >
+                                (รายการกระแสเงินสด)
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
             )}
             <p className="px-5 py-3 text-xs text-gray-400">
-              ระบบไม่ประดิษฐ์กำไร/ขาดทุนจากยอดเงินสดเข้า-ออก
-              เนื่องจากข้อมูลต้นทุนยังไม่ครบถ้วน
+              คำนวณกำไร/ขาดทุนรับรู้จากรายการขายหุ้น (SELL) ที่มีต้นทุนเฉลี่ยครบถ้วนเท่านั้น
+              ซื้อหุ้น (BUY) เป็นรายการสะสมต้นทุน เงินฝาก/ถอน ค่าธรรมเนียม หรือรายการอื่น
+              ที่มิใช่กำไรจากการขายหุ้นถูกจัดเป็น "ไม่ใช่รายการกำไรที่ต้องคำนวณ"
+              และรายการที่คำนวณไม่ได้จะแสดงสถานะ "ยังไม่สามารถคำนวณ" อย่างชัดเจน
             </p>
           </>
         )}
       </div>
 
-      {/* Upload entry */}
+      {/* AI insight summary */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2 bg-white rounded-xl border border-gray-100 p-5 flex items-center justify-center text-center">
-          <div>
-            <TrendingUp className="w-8 h-8 text-gray-300 mx-auto mb-3" />
-            <p className="text-sm font-medium text-gray-600">
-              การวิเคราะห์อัตราแลกเปลี่ยนด้วย AI ยังไม่พร้อมใช้งาน
-            </p>
-            <p className="text-xs text-gray-400 mt-1 max-w-sm mx-auto">
-              ระบบจะวิเคราะห์แนวโน้มอัตราแลกเปลี่ยนและให้ข้อเสนอแนะอัตโนมัติ
-              หลังเชื่อมต่อ BOT API
-            </p>
+        <div className="lg:col-span-2 bg-white rounded-xl border border-gray-100 overflow-hidden">
+          <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-blue-800" />
+              <h2 className="text-sm font-semibold text-gray-800">
+                สรุปกิจกรรมจาก CI Insight
+              </h2>
+            </div>
+            {insightLoading ? (
+              <span className="flex items-center gap-1 text-xs text-gray-400">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> กำลังวิเคราะห์...
+              </span>
+            ) : insight?.available && insight.result ? (
+              <span className="text-xs text-emerald-600 font-medium">
+                วิเคราะห์สำเร็จ
+              </span>
+            ) : null}
           </div>
+
+          {insightLoading ? (
+            <div className="px-5 py-12 text-center">
+              <Loader2 className="w-8 h-8 text-gray-300 mx-auto mb-3 animate-spin" />
+              <p className="text-sm font-medium text-gray-600">กำลังวิเคราะห์กิจกรรม</p>
+            </div>
+          ) : !insight ? (
+            <div className="px-5 py-12 text-center">
+              <Sparkles className="w-8 h-8 text-gray-300 mx-auto mb-3" />
+              <p className="text-sm font-medium text-gray-600">
+                สรุปกิจกรรมพร้อมใช้งานหลังนำเข้า Statement
+              </p>
+            </div>
+          ) : !insight.available || !insight.result ? (
+            <div className="px-5 py-10 text-center">
+              <AlertTriangle className="w-8 h-8 text-amber-400 mx-auto mb-3" />
+              <p className="text-sm font-medium text-gray-700">
+                การวิเคราะห์ด้วย AI ไม่พร้อมใช้งาน
+              </p>
+              <p className="text-xs text-gray-400 mt-1">
+                {insight.code === "GEMINI_NOT_CONFIGURED"
+                  ? "ยังไม่ได้ตั้งค่า Gemini API"
+                  : insight.code === "NO_TRANSACTIONS"
+                  ? "ยังไม่มีธุรกรรมที่จะวิเคราะห์"
+                  : `รหัส: ${insight.code}`}
+              </p>
+              {(insight.errors ?? []).map((e) => (
+                <p key={e} className="text-xs text-gray-400 mt-1">
+                  {e}
+                </p>
+              ))}
+            </div>
+          ) : (
+            <div className="px-5 py-4 space-y-4">
+              <p className="text-sm text-gray-700 leading-relaxed">
+                {insight.result.summary}
+              </p>
+              {insight.aggregates && (
+                <p className="text-xs text-gray-400">
+                  วิเคราะห์จาก {insight.aggregates.transactionCount} รายการ ·{" "}
+                  {insight.aggregates.currencies.join(", ")} · วันที่{" "}
+                  {insight.aggregates.minDate} ถึง {insight.aggregates.maxDate}
+                </p>
+              )}
+              {insight.result.patterns.length > 0 && (
+                <div>
+                  <p className="text-xs font-medium text-gray-500 mb-1">รูปแบบที่พบ</p>
+                  {insight.result.patterns.map((p, i) => (
+                    <p key={i} className="text-xs text-gray-600 leading-relaxed">• {p}</p>
+                  ))}
+                </div>
+              )}
+              {insight.result.dataQualityNotes.length > 0 && (
+                <div>
+                  <p className="text-xs font-medium text-gray-500 mb-1">คุณภาพข้อมูล</p>
+                  {insight.result.dataQualityNotes.map((n, i) => (
+                    <p key={i} className="text-xs text-gray-600 leading-relaxed">• {n}</p>
+                  ))}
+                </div>
+              )}
+              {insight.result.taxReadinessNotes.length > 0 && (
+                <div>
+                  <p className="text-xs font-medium text-amber-600 mb-1">ความพร้อมคำนวณภาษี</p>
+                  {insight.result.taxReadinessNotes.map((n, i) => (
+                    <p key={i} className="text-xs text-amber-700 leading-relaxed">• {n}</p>
+                  ))}
+                </div>
+              )}
+              <p className="text-xs text-gray-400 pt-1 border-t border-gray-50">
+                ข้อมูลนี้เป็นการวิเคราะห์เชิงโครงสร้างโดย Gemini เท่านั้น
+                ไม่ใช่การคำนวณภาษีหรือคำแนะนำการลงทุน
+              </p>
+            </div>
+          )}
         </div>
         <PdfStatementUploader
           onImport={onImport}
