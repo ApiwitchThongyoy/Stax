@@ -102,12 +102,6 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const prevUserId = useRef<string | undefined>(user?.id);
   useEffect(() => {
     if (prevUserId.current !== user?.id) {
-      // [STAX_DIAG] TEMPORARY — remove after diagnosing empty Calendar transactions
-      console.debug(
-        "[STAX_DIAG] prevUserId reset: hadPrev=%s, hasNext=%s → setTransactions([])",
-        !!prevUserId.current,
-        !!user?.id,
-      );
       prevUserId.current = user?.id;
       setTransactions([]);
     }
@@ -125,35 +119,11 @@ export default function Dashboard({ userEmail }: DashboardProps) {
 
   const refreshFromServer = useCallback(async () => {
     if (!user?.accessToken) return;
-    // [STAX_DIAG] TEMPORARY — remove after diagnosing empty Calendar transactions
-    console.debug(
-      "[STAX_DIAG] refreshFromServer: fetching, hasToken=%s, docsRefreshKey=%s",
-      !!user.accessToken,
-      docsRefreshKey,
-    );
     try {
       const rows = await fetchCapitalLedger(user.accessToken);
-      // [STAX_DIAG] TEMPORARY
-      console.debug(
-        "[STAX_DIAG] refreshFromServer: fetchCapitalLedger returned %d raw rows",
-        rows.length,
-      );
-      const mapped = capitalLedgerToTransactions(rows);
-      // [STAX_DIAG] TEMPORARY
-      console.debug(
-        "[STAX_DIAG] refreshFromServer: capitalLedgerToTransactions produced %d mapped rows, about to setTransactions",
-        mapped.length,
-      );
-      setTransactions(mapped);
-    } catch (err: unknown) {
+      setTransactions(capitalLedgerToTransactions(rows));
+    } catch {
       // Server is authoritative; on transient failure keep the last known state.
-      // [STAX_DIAG] TEMPORARY — log the failure reason
-      const e = err instanceof Error ? err : new Error(String(err));
-      console.error(
-        "[STAX_DIAG] refreshFromServer: FAILED — name=%s message=%s",
-        e.name,
-        e.message,
-      );
     }
   }, [user?.accessToken]);
 
@@ -163,14 +133,6 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   useEffect(() => {
     void refreshFromServer();
   }, [refreshFromServer, docsRefreshKey]);
-
-  // [STAX_DIAG] TEMPORARY — remove after diagnosing empty Calendar transactions
-  useEffect(() => {
-    console.debug(
-      "[STAX_DIAG] transactions length changed: %d",
-      transactions.length,
-    );
-  }, [transactions.length]);
 
   // Fetch today's real external USD/THB exchange rate as a FALLBACK for the
   // "อัตราแลกเปลี่ยน" card. Statement-sourced rates (fxRateStatement) inside the
