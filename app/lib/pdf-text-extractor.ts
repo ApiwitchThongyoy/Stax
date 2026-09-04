@@ -1,5 +1,44 @@
 import { readFile } from "node:fs/promises";
 
+// ---------------------------------------------------------------------------
+// Server-only: eagerly import @napi-rs/canvas and set DOMMatrix / Path2D
+// globals BEFORE pdfjs-dist is loaded.
+//
+// Why this is needed:
+//   pdfjs-dist/legacy/build/pdf.mjs contains module-level init code that uses
+//   `createRequire(import.meta.url)` to load @napi-rs/canvas and polyfill
+//   globalThis.DOMMatrix / globalThis.Path2D.  Vercel's file tracer
+//   (@vercel/nft) cannot follow createRequire(import.meta.url), so it does
+//   NOT include @napi-rs/canvas (or its platform-specific .node binary) in
+//   the serverless function deployment.
+//
+// Fix (two-pronged):
+//   1. Static import of @napi-rs/canvas here makes the dependency explicit
+//      and traceable by NFT → the package + native binary ARE included in
+//      the deployment.
+//   2. Setting the globals ourselves BEFORE pdfjs-dist loads means pdfjs-dist
+//      sees `globalThis.DOMMatrix` already defined (line 15610 of pdf.mjs),
+//      skips its own createRequire path entirely, and DOMMatrix/Path2D are
+//      available for all subsequent operations.
+//
+// This file is server-only (imports "node:fs/promises") and is never bundled
+// into the client build.
+// ---------------------------------------------------------------------------
+try {
+  const canvas = await import("@napi-rs/canvas");
+  if (typeof globalThis.DOMMatrix === "undefined" && canvas.DOMMatrix) {
+    (globalThis as any).DOMMatrix = canvas.DOMMatrix;
+  }
+  if (typeof globalThis.Path2D === "undefined" && canvas.Path2D) {
+    (globalThis as any).Path2D = canvas.Path2D;
+  }
+} catch {
+  // If @napi-rs/canvas is not available (e.g. a missing native binary),
+  // pdfjs-dist will attempt its own polyfill.  Text-only extraction does
+  // not strictly require DOMMatrix/Path2D, but some code paths may still
+  // reference them.
+}
+
 const MAX_PDF_SIZE_BYTES = 20 * 1024 * 1024;
 
 export type PdfTextExtractionResult =
