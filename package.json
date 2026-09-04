@@ -13,10 +13,11 @@
     "db:seed": "node scripts/seed.mjs",
     "db:seed:test": "node scripts/seed-test.mjs",
     "test:w2": "tsx scripts/run-tests.mts",
-    "test": "tsx scripts/test-tax-engine.mts && tsx scripts/test-gemini-parser.mts && tsx scripts/test-gemini-analysis-storage.mts && tsx scripts/test-gemini-insight.mts && tsx scripts/test-statement-dedup.mts && tsx scripts/test-webull-trade-parser.mts && tsx scripts/test-server-api.mts && tsx scripts/test-statement-tax-recon.mts && tsx scripts/test-ui-placeholders.mts && tsx scripts/test-portal-access.mts && tsx scripts/test-document-download.mts"
+    "test": "tsx scripts/test-tax-engine.mts && tsx scripts/test-gemini-parser.mts && tsx scripts/test-gemini-analysis-storage.mts && tsx scripts/test-gemini-insight.mts && tsx scripts/test-statement-dedup.mts && tsx scripts/test-webull-trade-parser.mts && tsx scripts/test-server-api.mts && tsx scripts/test-statement-tax-recon.mts && tsx scripts/test-ui-placeholders.mts && tsx scripts/test-portal-access.mts && tsx scripts/test-document-download.mts && tsx scripts/test-pdf-extraction.mts && tsx scripts/test-document-delete.mts"
   },
   "dependencies": {
     "@google/genai": "^2.19.0",
+    "@napi-rs/canvas": "^1.0.8",
     "@react-router/node": "8.0.0",
     "@react-router/serve": "8.0.0",
     "@supabase/supabase-js": "^2.112.4",
@@ -33,6 +34,7 @@
     "react-dom": "^19.2.7",
     "react-router": "8.0.0",
     "recharts": "^3.10.1",
+    "unpdf": "^1.8.1",
     "xlsx": "^0.18.5",
     "zod": "^4.5.4"
   },
