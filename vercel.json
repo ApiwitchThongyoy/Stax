@@ -1,9 +1,7 @@
 {
   "functions": {
     "build/server/index.js": {
-      "includeFiles": [
-        "node_modules/@napi-rs/**"
-      ]
+      "includeFiles": "node_modules/@napi-rs/**"
     }
   }
 }
