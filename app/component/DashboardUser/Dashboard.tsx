@@ -19,6 +19,7 @@ import {
 import StaxLogo from "../Login/StaxLogo";
 import { useNavigate } from "react-router";
 import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตรง
+import { clearAllSessions } from "../../lib/session";
 import { useSuspendedAccount } from "../../lib/suspended-account";
 import { usePresenceHeartbeat } from "../../lib/usePresenceHeartbeat";
 import { useTheme } from "../../lib/useTheme";
@@ -94,6 +95,10 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   usePresenceHeartbeat({
     enabled: !!user?.accessToken && !reactivated,
     accessToken: user?.accessToken ?? null,
+    onUnauthorized: () => {
+      clearAllSessions();
+      logout();
+    },
   });
 
   // Reset user-scoped in-memory state the moment the authenticated user changes

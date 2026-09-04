@@ -8,6 +8,8 @@ interface UseAccountStatusPollingOptions {
   accessToken: string | null;
   onSuspended: () => void;
   onActive: () => void;
+  /** Called once when the server returns 401 (expired/invalid JWT). */
+  onUnauthorized?: () => void;
   intervalMs?: number;
 }
 
@@ -16,6 +18,8 @@ interface UseAccountStatusPollingOptions {
  * authenticated user dashboard is open. Fetches /api/v1/auth/session on a fixed
  * interval.
  *
+ * - On 401 (expired/invalid JWT) it stops polling immediately and calls
+ *   onUnauthorized so the client can clear the session.
  * - On 403 + ACCOUNT_SUSPENDED it calls onSuspended() the FIRST time the status
  *   flips to suspended, then keeps polling so a later reactivation can be
  *   detected (the minimal check needed while the suspended overlay is active).
@@ -31,12 +35,15 @@ export function useAccountStatusPolling({
   accessToken,
   onSuspended,
   onActive,
+  onUnauthorized,
   intervalMs = ACCOUNT_STATUS_POLL_INTERVAL_MS,
 }: UseAccountStatusPollingOptions) {
   const onSuspendedRef = useRef(onSuspended);
   onSuspendedRef.current = onSuspended;
   const onActiveRef = useRef(onActive);
   onActiveRef.current = onActive;
+  const onUnauthorizedRef = useRef(onUnauthorized);
+  onUnauthorizedRef.current = onUnauthorized;
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
 
@@ -71,6 +78,11 @@ export function useAccountStatusPolling({
             return;
           }
           schedule();
+        } else if (res.status === 401) {
+          // JWT expired or invalid — stop polling and notify so the client can
+          // clear the session.  Do NOT schedule another poll.
+          stop();
+          onUnauthorizedRef.current?.();
         } else {
           schedule();
         }
