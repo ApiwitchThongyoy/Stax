@@ -26,6 +26,10 @@ export default function ProtectedLayout() {
     onActive: () => {
       markReactivated();
     },
+    onUnauthorized: () => {
+      clearAllSessions();
+      logout();
+    },
   });
 
   useEffect(() => {
