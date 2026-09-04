@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Archive,
   FolderOpen,
@@ -11,7 +11,6 @@ import {
 import { useAuth } from "../../lib/auth";
 import {
   fetchUserDocuments,
-  deleteUserDocument,
   downloadUserDocument,
 } from "../../lib/server-api";
 import {
@@ -19,6 +18,10 @@ import {
   deleteDocument,
   type StoredDocumentMeta,
 } from "../../lib/Documentstorage";
+import {
+  InFlightDeletionGuard,
+  classifyDeleteDocumentResponse,
+} from "../../lib/document-delete";
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -52,11 +55,27 @@ export default function StatementArchivePage({
   const { user } = useAuth();
   const [docs, setDocs] = useState<StoredDocumentMeta[]>([]);
   const [loading, setLoading] = useState(true);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deletingIds, setDeletingIds] = useState<ReadonlySet<string>>(new Set());
   const [deleteError, setDeleteError] = useState("");
   const [downloadError, setDownloadError] = useState("");
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set()
+  );
+
+  // Per-document in-flight deletion guard. `deletingIds` is React state ONLY
+  // to drive each row's disabled/pending UI; the authoritative guard is a
+  // synchronous ref (`inFlight`) so rapid clicks on the same document (even
+  // before React re-renders) cannot fire a second DELETE for that id. The guard
+  // is keyed by id, so different documents delete independently.
+  const inFlight = useRef(
+    new InFlightDeletionGuard((id, isDeleting) => {
+      setDeletingIds((prev) => {
+        const next = new Set(prev);
+        if (isDeleting) next.add(id);
+        else next.delete(id);
+        return next;
+      });
+    })
   );
 
   const refresh = async () => {
@@ -78,6 +97,9 @@ export default function StatementArchivePage({
       if (list.length > 0) {
         setExpandedFolders(new Set([monthFolderKey(list[0].createdAt)]));
       }
+    } catch {
+      // Best-effort revalidation: keep whatever we already have on a failed
+      // fetch so a transient error cannot crash the delete flow or blank the UI.
     } finally {
       setLoading(false);
     }
@@ -113,29 +135,68 @@ export default function StatementArchivePage({
 
   const handleDelete = async (id: string, fileName: string) => {
     if (!user?.accessToken) return;
-    setDeletingId(id);
-    setDeleteError("");
-    try {
-      // The server is authoritative: it removes the document row AND the
-      // transactions that originate from that exact document (user-scoped).
-      await deleteUserDocument(user.accessToken, id);
-      // Remove the optional local IndexedDB cache copy as cleanup only, not as
-      // authority — the server deletion already succeeded.
-      if (user?.id) {
-        const local = await getLocalDocumentByName(user.id, fileName);
-        if (local) {
-          await deleteDocument(user.id, local.id).catch(() => {});
+
+    // Duplicate-submit prevention: if this document id already has a DELETE in
+    // flight, ignore the repeat click entirely — no second network call is
+    // made, and that row's delete button is disabled while deleting anyway.
+    const { started, result: response } = await inFlight.current.run(
+      id,
+      async () => {
+        let res: Response;
+        try {
+          res = await fetch(`/api/v1/documents/${id}`, {
+            method: "DELETE",
+            headers: {
+              Authorization: `Bearer ${user.accessToken}`,
+            },
+          });
+        } catch {
+          return { status: 0, ok: false };
         }
+        return { status: res.status, ok: res.ok };
       }
-      await refresh();
-      // Signal the Dashboard to refresh its server-driven ledger (and the stored
-      // documents list) so FX/Calendar/ledger drop the deleted source's rows.
-      onDocumentDeleted?.();
-    } catch {
-      setDeleteError("ไม่สามารถลบไฟล์ได้ กรุณาลองใหม่อีกครั้ง");
-      refresh();
-    } finally {
-      setDeletingId(null);
+    );
+
+    if (!started) return; // another delete attempt for the same id is in flight
+
+    // `response` is always set when `started` is true.
+    const outcome = classifyDeleteDocumentResponse(response!);
+
+    switch (outcome.kind) {
+      case "deleted":
+      case "gone": {
+        // Server confirmed the document is gone (either deleted by this request
+        // or already deleted earlier). Remove the optional local IndexedDB copy
+        // as cleanup only, then revalidate the list so no stale row remains.
+        setDeleteError("");
+        if (user.id) {
+          const local = await getLocalDocumentByName(user.id, fileName);
+          if (local) {
+            await deleteDocument(user.id, local.id).catch(() => {});
+          }
+        }
+        await refresh();
+        // Signal the Dashboard to refresh its server-driven ledger (and the
+        // stored documents list) so FX/Calendar/ledger drop the deleted
+        // source's rows.
+        onDocumentDeleted?.();
+        break;
+      }
+      case "auth":
+        // Real 401/403 authorization failure — never swallow it. Surface a
+        // controlled message and leave the row in place (nothing was deleted).
+        setDeleteError(
+          outcome.status === 401
+            ? "เซสชันหมดอายุหรือไม่ถูกต้อง กรุณาเข้าสู่ระบบอีกครั้ง"
+            : "คุณไม่มีสิทธิ์ลบไฟล์นี้"
+        );
+        break;
+      case "error":
+        // Genuine failure: keep the row (server did NOT confirm deletion),
+        // re-enable the delete control (guard already released the id), and
+        // show one controlled error.
+        setDeleteError(outcome.message);
+        break;
     }
   };
 
@@ -250,11 +311,12 @@ export default function StatementArchivePage({
                           <button
                             type="button"
                             onClick={() => handleDelete(doc.id, doc.fileName)}
-                            disabled={deletingId !== null}
-                            className="text-gray-400 hover:text-red-600 transition shrink-0 disabled:opacity-50 disabled:cursor-wait"
-                            aria-label="ลบไฟล์"
+                            disabled={deletingIds.has(doc.id)}
+                            className="text-gray-400 hover:text-red-600 transition shrink-0 disabled:opacity-50 disabled:cursor-wait disabled:hover:text-gray-400"
+                            aria-label={deletingIds.has(doc.id) ? "กำลังลบไฟล์" : "ลบไฟล์"}
+                            title={deletingIds.has(doc.id) ? "กำลังลบ..." : "ลบไฟล์"}
                           >
-                            {deletingId === doc.id ? (
+                            {deletingIds.has(doc.id) ? (
                               <span className="inline-block w-3.5 h-3.5 border-2 border-gray-300 border-t-gray-500 rounded-full animate-spin" />
                             ) : (
                               <Trash2 className="w-3.5 h-3.5" />

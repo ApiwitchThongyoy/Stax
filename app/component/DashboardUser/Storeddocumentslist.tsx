@@ -1,16 +1,16 @@
-import { useEffect, useState } from "react";
-import { FileText, Download, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { FileText, Download, Trash2, Loader2 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
-import {
-  fetchUserDocuments,
-  downloadUserDocument,
-  deleteUserDocument,
-} from "../../lib/server-api";
+import { fetchUserDocuments, downloadUserDocument } from "../../lib/server-api";
 import {
   getLocalDocumentByName,
   deleteDocument,
   type StoredDocumentMeta,
 } from "../../lib/Documentstorage";
+import {
+  InFlightDeletionGuard,
+  classifyDeleteDocumentResponse,
+} from "../../lib/document-delete";
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -32,6 +32,21 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
   const [docs, setDocs] = useState<StoredDocumentMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [deletingIds, setDeletingIds] = useState<ReadonlySet<string>>(new Set());
+
+  // Per-document in-flight deletion guard (synchronous ref, keyed by id) so
+  // rapid clicks on the same document cannot fire duplicate DELETEs, while
+  // different documents still delete independently.
+  const inFlight = useRef(
+    new InFlightDeletionGuard((id, isDeleting) => {
+      setDeletingIds((prev) => {
+        const next = new Set(prev);
+        if (isDeleting) next.add(id);
+        else next.delete(id);
+        return next;
+      });
+    })
+  );
 
   const refresh = async () => {
     try {
@@ -48,6 +63,9 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
           size: d.fileSize,
         }))
       );
+    } catch {
+      // Best-effort revalidation: keep whatever we already have on a failed
+      // fetch so a transient error cannot crash the delete flow.
     } finally {
       setLoading(false);
     }
@@ -82,20 +100,54 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
 
   const handleDelete = async (id: string, fileName: string) => {
     if (!user?.accessToken) return;
-    setError("");
-    try {
-      // Server-authoritative delete: removes the document row AND its
-      // originating transactions (user-scoped, atomic).
-      await deleteUserDocument(user.accessToken, id);
-      // Best-effort cleanup of the optional local IndexedDB copy.
-      if (user.id) {
-        const local = await getLocalDocumentByName(user.id, fileName);
-        if (local) {
-          await deleteDocument(user.id, local.id);
+
+    // Duplicate-submit prevention: if this document id already has a DELETE in
+    // flight, ignore the repeat click entirely — no second network call is made.
+    const { started, result: response } = await inFlight.current.run(
+      id,
+      async () => {
+        let res: Response;
+        try {
+          res = await fetch(`/api/v1/documents/${id}`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${user.accessToken}` },
+          });
+        } catch {
+          return { status: 0, ok: false };
         }
+        return { status: res.status, ok: res.ok };
       }
-    } catch {
-      setError("ไม่สามารถลบไฟล์ได้ กรุณาลองใหม่อีกครั้ง");
+    );
+
+    if (!started) return; // another delete attempt for the same id is in flight
+
+    const outcome = classifyDeleteDocumentResponse(response!);
+
+    switch (outcome.kind) {
+      case "deleted":
+      case "gone": {
+        // Server confirmed the document is gone. Best-effort cleanup of the
+        // optional local IndexedDB copy (not authority), then revalidate.
+        setError("");
+        if (user.id) {
+          const local = await getLocalDocumentByName(user.id, fileName);
+          if (local) {
+            await deleteDocument(user.id, local.id).catch(() => {});
+          }
+        }
+        break;
+      }
+      case "auth":
+        // Real 401/403 — never swallow it.
+        setError(
+          outcome.status === 401
+            ? "เซสชันหมดอายุหรือไม่ถูกต้อง กรุณาเข้าสู่ระบบอีกครั้ง"
+            : "คุณไม่มีสิทธิ์ลบไฟล์นี้"
+        );
+        break;
+      case "error":
+        setError(outcome.message);
+        break;
     }
     refresh();
   };
@@ -148,10 +200,16 @@ export default function StoredDocumentsList({ refreshTrigger }: StoredDocumentsL
               <button
                 type="button"
                 onClick={() => handleDelete(doc.id, doc.fileName)}
-                className="text-gray-400 hover:text-red-600 transition shrink-0"
-                aria-label="ลบไฟล์"
+                disabled={deletingIds.has(doc.id)}
+                className="text-gray-400 hover:text-red-600 transition shrink-0 disabled:opacity-40 disabled:cursor-wait disabled:hover:text-gray-400"
+                aria-label={deletingIds.has(doc.id) ? "กำลังลบไฟล์" : "ลบไฟล์"}
+                title={deletingIds.has(doc.id) ? "กำลังลบ..." : "ลบไฟล์"}
               >
-                <Trash2 className="w-3.5 h-3.5" />
+                {deletingIds.has(doc.id) ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
               </button>
             </div>
           ))}
