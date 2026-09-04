@@ -1,4 +1,21 @@
-.react-router
-build
-node_modules
+.react-router/
+build/
+node_modules/
+
+# Never copy local secrets into Docker build context
+.env
+.env.*
+!.env.example
+
+# Local runtime/dev data
+storage/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Git metadata
+.git/
+.gitignore
+
 README.md
