@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@google/genai": "^2.19.0",
+    "@napi-rs/canvas": "^1.0.8",
     "@react-router/node": "8.0.0",
     "@react-router/serve": "8.0.0",
     "@supabase/supabase-js": "^2.112.4",
