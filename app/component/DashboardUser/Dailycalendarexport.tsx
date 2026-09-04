@@ -112,6 +112,16 @@ export default function DailyCalendarExport({
     return map;
   }, [transactions]);
 
+  // [STAX_DIAG] TEMPORARY — remove after diagnosing empty Calendar transactions
+  // eslint-disable-next-line no-console
+  console.debug(
+    "[STAX_DIAG] Calendar render: txCount=%d, viewYear=%d, viewMonth=%d, dayMapSize=%d",
+    transactions.length,
+    viewYear,
+    viewMonth0,
+    dayMap.size,
+  );
+
   // สร้างลำดับกำไรสะสม (running total) ตามวันที่จากทุก transaction ที่มีอยู่จริง
   const cumulativeByDate = useMemo(() => {
     const dateKeys = [...dayMap.keys()].sort();
