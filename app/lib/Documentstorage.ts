@@ -18,6 +18,8 @@ export interface StoredDocumentMeta {
   fileName: string;
   uploadedAt: string; // ISO timestamp
   size: number; // bytes
+  /** Server-reported number of ledger rows this statement produced (optional). */
+  transactionCount?: number;
 }
 
 interface StoredDocumentRecord extends StoredDocumentMeta {

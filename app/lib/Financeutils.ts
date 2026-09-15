@@ -16,6 +16,8 @@ export interface Transaction {
   amount: number; // ยอดเงินดิบ (บวก = เข้า, ลบ = ออก) หน่วยสกุลเงินเดิม
   currency: string;
   // ---- Trade detail (server-authoritative, จาก Capital_Transactions) ----
+  // เอกสาร Statement ที่รายการนี้มาจาก (ถ้ามี) ใช้จับคู่ปฏิทินกับไฟล์ของวันได้
+  sourceDocumentId?: string | null;
   symbol?: string | null;
   side?: "BUY" | "SELL" | null;
   quantity?: string | null;

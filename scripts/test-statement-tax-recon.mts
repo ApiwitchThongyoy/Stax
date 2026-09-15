@@ -10,10 +10,10 @@
 //     rate lands in fx_rate_effective and recomputes amountThb + realized
 //     gain/loss THB; provider-unavailable stays graceful (base fallback kept,
 //     no fabricated rate).
-//   - buildTaxRecon: rows with stored realizedGainLossThb produce a REAL
-//     taxable total; rows without it are reported not-computable and never
-//     contribute to the total.
 //   - capitalRowToTransaction: effective-first FX rate fallback.
+//   - 2-stage gain rounding is INTENTIONAL: realizedGainLoss = round2(net -
+//     basis), then realizedGainLossThb = round2(roundedGain x fx), so the pair
+//     is always mutually consistent (never "simplify" to a single stage).
 //
 // The imported modules instantiate a postgres client at load time but this
 // suite performs ZERO queries (pure functions only). Run:
@@ -25,12 +25,16 @@ import {
   applyFxRateFallback,
   recomputeCostBasisMap,
   summarizeRows,
+  computeGainLossBackfill,
+  recomputeAllGainLoss,
+  type GainLossBackfillRow,
 } from "../app/lib/statement-pipeline";
-import { buildTaxRecon, type TaxReconDetailRow } from "../app/lib/tax-engine";
 import {
   capitalRowToTransaction,
   type CapitalLedgerRow,
 } from "../app/lib/server-api";
+import { applyCorporateAction } from "../app/lib/corporate-action";
+import type { CostBasisMap } from "../app/lib/cost-basis-engine";
 import type { ExtractedTransaction } from "../app/lib/pdfStatementParser";
 
 let passed = 0;
@@ -118,108 +122,16 @@ async function main() {
   ok(feeRow.type === "CASH_OUT" && feeRow.realizedGainLoss === null && feeRow.realizedGainLossThb === null,
     "expense row stays CASH_OUT with no realized P&L");
 
-  // ---- buildTaxRecon: real taxable totals, no fabrication ----
-  const calcRow: TaxReconDetailRow = {
-    transactionId: "c1",
-    amountThb: "3318.85",
-    type: "CASH_IN",
-    realizedGainLossThb: "3318.85",
-    symbol: "AAPL",
-    side: "SELL",
-  };
-  const plainRow: TaxReconDetailRow = {
-    transactionId: "c2",
-    amountThb: "5000.00",
-    type: "CASH_IN",
-    realizedGainLossThb: null,
-    symbol: null,
-    side: null,
-  };
-  const mixed = buildTaxRecon([calcRow, plainRow]);
-  ok(mixed.computable === true, "tax recon is computable when stored realized gain/loss exists");
-  ok(mixed.computedCount === 1 && mixed.nonComputableCount === 1, "1 computed + 1 not-computable row");
-  ok(mixed.totalTaxableAmountThb === "3318.85", "taxable total comes ONLY from stored realized gain/loss");
-  const nonC = buildTaxRecon([plainRow]);
-  ok(nonC.computable === false && nonC.totalTaxableAmountThb === null,
-    "no stored gain/loss -> explicitly not computable, NO fabricated total");
-
-  // ---- buildTaxRecon: classification + trade detail threading (UI labels) ----
-  const nvdaRow: TaxReconDetailRow = {
-    transactionId: "c3",
-    amountThb: "4433.37",
-    type: "CASH_IN",
-    realizedGainLossThb: "140.45",
-    symbol: "NVDA",
-    side: "SELL",
-    quantity: "0.0160",
-    unitPrice: "140.43",
-    grossAmount: "2.25",
-    fees: "0.01",
-    proceeds: "2.25",
-    costBasis: "2.10",
-    realizedGainLoss: "0.15",
-    fxRateStatement: "31.57",
-    fxRateEffective: "31.57",
-    exchange: "NASDAQ",
-  };
-  const buyRow: TaxReconDetailRow = {
-    transactionId: "c4",
-    amountThb: "1771.00",
-    type: "CASH_OUT",
-    realizedGainLossThb: null,
-    symbol: "TSLA",
-    side: "BUY",
-    quantity: "1",
-    unitPrice: "50",
-    grossAmount: "50",
-    fees: "0.5",
-    proceeds: "49.5",
-    costBasis: "49.5",
-    fxRateStatement: "35.42",
-    fxRateEffective: "35.42",
-    exchange: "NASDAQ",
-  };
-  const cashRow: TaxReconDetailRow = {
-    transactionId: "c5",
-    amountThb: "5000.00",
-    type: "CASH_IN",
-    realizedGainLossThb: null,
-    symbol: null,
-    side: null,
-  };
-  const sellNoBasis: TaxReconDetailRow = {
-    transactionId: "c6",
-    amountThb: "1000.00",
-    type: "CASH_IN",
-    realizedGainLossThb: null,
-    symbol: "MSFT",
-    side: "SELL",
-  };
-  const classified = buildTaxRecon([nvdaRow, buyRow, cashRow, sellNoBasis]);
-  ok(classified.computedCount === 1 && classified.nonComputableCount === 3,
-    "mixed set: 1 computed SELL + 3 rows without stored gain/loss");
-  ok(classified.totalTaxableAmountThb === "140.45",
-    "taxable total reflects ONLY the computable SELL");
-  const byId = (id: string) =>
-    classified.transactions.find((t) => t.transactionId === id)!;
-  const computeRow = byId("c3");
-  ok(computeRow.classification === "realized-gain" && computeRow.status === "computable",
-    "computable SELL row classified as realized-gain");
-  ok(computeRow.grossAmount === "2.25" && computeRow.fees === "0.01" &&
-    computeRow.proceeds === "2.25" && computeRow.costBasis === "2.10" &&
-    computeRow.realizedGainLoss === "0.15" && computeRow.fxRateStatement === "31.57" &&
-    computeRow.fxRateEffective === "31.57" && computeRow.exchange === "NASDAQ",
-    "computable SELL threads gross/fees/proceeds/costBasis/realized/fx/exchange detail");
-  const buyOut = byId("c4");
-  ok(buyOut.classification === "buy-basis" && buyOut.status === "not-computable",
-    "BUY row classified as buy-basis (status stays not-computable, no fake number)");
-  ok(buyOut.quantity === "1" && buyOut.unitPrice === "50" && buyOut.fxRateEffective === "35.42",
-    "BUY row carries qty/price/fx detail for display");
-  ok(byId("c5").classification === "not-applicable",
-    "pure CASH_IN (deposit) classified as not-applicable");
-  const noBasis = byId("c6");
-  ok(noBasis.classification === "non-computable" && noBasis.symbol === "MSFT",
-    "SELL without a computed basis classified as non-computable (real reason, distinct from CASH)");
+  // ---- Dividend symbol derivation: section "เงินปันผล:X" fills symbol column
+  // so the dividend account ledger and memo field can show which stock. ----
+  const divRow = map(txn({ category: "income", section: "เงินปันผล:goog", symbol: undefined }));
+  ok(divRow.symbol === "GOOG", "dividend symbol derived from section 'เงินปันผล:goog' -> GOOG");
+  const divUpper = map(txn({ category: "income", section: "เงินปันผล:NVDA", symbol: undefined }));
+  ok(divUpper.symbol === "NVDA", "dividend symbol derived uppercase from section even when ticker was already upper");
+  const noTicker = map(txn({ category: "income", section: "เงินปันผล:ไม่ทราบสัญลักษณ์", symbol: undefined }));
+  ok(noTicker.symbol === null, "dividend symbol stays null when section contains unknown-marker");
+  const withExplicit = map(txn({ category: "income", section: "เงินปันผล:xom", symbol: "exxon" }));
+  ok(withExplicit.symbol === "exxon", "explicit t.symbol preserved verbatim (never derived/replaced)");
 
   // ---- capitalRowToTransaction: effective-first FX rate fallback ----
   const capRow = (
@@ -421,6 +333,444 @@ async function main() {
     usdNoProvider[0].fxRateEffective === "1" && usdNoProvider[0].amountThb === "250.00",
     "provider unavailable -> graceful: base fallback kept, no fabricated rate, import still succeeds"
   );
+
+  // ---- Gain/loss backfill: heal FROZEN SELL rows (out-of-order imports) ----
+  const bfRow = (
+    overrides: Partial<GainLossBackfillRow>
+  ): GainLossBackfillRow => ({
+    transactionId: overrides.transactionId ?? "bf",
+    sourceType: "AI_PARSED",
+    transactionDate: "2026-02-05",
+    symbol: "AAA",
+    side: "SELL",
+    quantity: "5",
+    unitPrice: "60",
+    grossAmount: "300",
+    fees: "10",
+    netAmount: null,
+    currency: "USD",
+    fxRateEffective: "35.42",
+    realizedGainLossThb: null,
+    ...overrides,
+  });
+
+  const bfFrozen = computeGainLossBackfill([
+    bfRow({
+      transactionId: "sellFrozen",
+      transactionDate: "2026-02-05",
+      symbol: "AAA",
+      quantity: "5",
+      grossAmount: "300",
+      fees: "10",
+    }),
+    bfRow({
+      transactionId: "buyLate",
+      transactionDate: "2026-01-20",
+      symbol: "AAA",
+      side: "BUY",
+      quantity: "10",
+      unitPrice: "20",
+      grossAmount: "200",
+      fees: "1",
+      netAmount: "199",
+    }),
+  ]);
+  ok(bfFrozen.stats.filled === 1, "backfill fills ONE frozen SELL (BUY was imported later)");
+  const aaa = bfFrozen.updates.find((u) => u.transactionId === "sellFrozen");
+  ok(
+    aaa?.update.costBasis === "100.00" && aaa?.update.proceeds === "290.00",
+    "backfill cost basis = avg 20 * 5 = 100; proceeds reconstructed from gross 300 - fees 10 (no stored net)"
+  );
+  ok(
+    aaa?.update.realizedGainLoss === "190.00",
+    "backfill realized gain = net 290 - basis 100 = 190"
+  );
+  ok(
+    aaa?.update.realizedGainLossThb === "6729.80",
+    "backfill THB gain = 190 * stored fx_rate_effective 35.42 (never an invented rate)"
+  );
+
+  const bfStoredNet = computeGainLossBackfill([
+    bfRow({
+      transactionId: "s1",
+      symbol: "BBB",
+      quantity: "2",
+      grossAmount: "100",
+      fees: "1",
+      netAmount: "98.5",
+    }),
+    bfRow({
+      transactionId: "b1",
+      symbol: "BBB",
+      side: "BUY",
+      transactionDate: "2026-01-01",
+      quantity: "2",
+      unitPrice: "40",
+    }),
+  ]);
+  ok(
+    bfStoredNet.updates[0].update.proceeds === "98.50",
+    "backfill prefers the stored authoritative net_amount over gross - fees"
+  );
+
+  const bfAlready = computeGainLossBackfill([
+    bfRow({
+      transactionId: "sDone",
+      symbol: "CCC",
+      quantity: "1",
+      realizedGainLossThb: "123.45",
+    }),
+    bfRow({
+      transactionId: "bDone",
+      symbol: "CCC",
+      side: "BUY",
+      transactionDate: "2026-01-01",
+      quantity: "1",
+      unitPrice: "10",
+    }),
+  ]);
+  ok(
+    bfAlready.stats.skippedAlready === 1 && bfAlready.stats.filled === 0,
+    "backfill NEVER overwrites an already-computed SELL (skippedAlready)"
+  );
+
+  const bfManual = computeGainLossBackfill([
+    bfRow({
+      transactionId: "sManual",
+      symbol: "DDD",
+      quantity: "1",
+      sourceType: "MANUAL",
+    }),
+    bfRow({
+      transactionId: "bManual",
+      symbol: "DDD",
+      side: "BUY",
+      transactionDate: "2026-01-01",
+      quantity: "1",
+      unitPrice: "10",
+    }),
+  ]);
+  ok(
+    bfManual.stats.skippedManual === 1 && bfManual.stats.filled === 0,
+    "backfill NEVER touches MANUAL rows, even with sufficient basis"
+  );
+
+  const bfNoBasis = computeGainLossBackfill([
+    bfRow({ transactionId: "sNoBasis", symbol: "EEE", quantity: "15" }),
+    bfRow({
+      transactionId: "bShort",
+      symbol: "EEE",
+      side: "BUY",
+      transactionDate: "2026-01-01",
+      quantity: "10",
+      unitPrice: "10",
+    }),
+  ]);
+  ok(
+    bfNoBasis.stats.stillNonComputable === 1 && bfNoBasis.stats.filled === 0,
+    "backfill stays honest when qty sold exceeds the available basis (no invented gain)"
+  );
+
+  const bfNoFx = computeGainLossBackfill([
+    bfRow({ transactionId: "sNoFx", symbol: "FFF", quantity: "1", fxRateEffective: null }),
+    bfRow({
+      transactionId: "bNoFx",
+      symbol: "FFF",
+      side: "BUY",
+      transactionDate: "2026-01-01",
+      quantity: "1",
+      unitPrice: "10",
+    }),
+  ]);
+  ok(
+    bfNoFx.stats.stillNonComputable === 1 && bfNoFx.stats.filled === 0,
+    "backfill never invents an FX rate — a non-THB SELL with a NULL effective rate stays non-computable"
+  );
+
+  const bfThb = computeGainLossBackfill([
+    bfRow({
+      transactionId: "sThb",
+      symbol: "GGG",
+      quantity: "1",
+      currency: "THB",
+      fxRateEffective: null,
+      grossAmount: "100",
+      fees: "0",
+    }),
+    bfRow({
+      transactionId: "bThb",
+      symbol: "GGG",
+      side: "BUY",
+      transactionDate: "2026-01-01",
+      quantity: "1",
+      unitPrice: "80",
+    }),
+  ]);
+  ok(
+    bfThb.stats.filled === 1 && bfThb.updates[0].update.realizedGainLossThb === "20.00",
+    "THB SELL pins the rate to 1, so backfill computes gain 100 - 80 = 20 THB even with no stored rate"
+  );
+
+  // INTENTIONAL 2-stage rounding (locked, not a bug): the stored gain is
+  // rounded first, then gainThb is derived from that ROUNDED gain.
+  const bfPenny = computeGainLossBackfill([
+    bfRow({
+      transactionId: "sPenny",
+      symbol: "PPP",
+      quantity: "1",
+      grossAmount: "110.005",
+      fees: "0",
+    }),
+    bfRow({
+      transactionId: "bPenny",
+      symbol: "PPP",
+      side: "BUY",
+      transactionDate: "2026-01-01",
+      quantity: "1",
+      unitPrice: "100",
+    }),
+  ]);
+  const penny = bfPenny.updates.find((u) => u.transactionId === "sPenny");
+  ok(
+    penny?.update.realizedGainLoss === "10.01",
+    "stage 1: raw gain 10.005 rounds half-up to stored 10.01"
+  );
+  ok(
+    penny?.update.realizedGainLossThb === "354.55",
+    "stage 2: THB gain from the ROUNDED gain (10.01 x 35.42 = 354.55), not the raw gain (would be 354.38)"
+  );
+
+  const bfPennyThb = computeGainLossBackfill([
+    bfRow({
+      transactionId: "sPennyThb",
+      symbol: "QQQ",
+      quantity: "1",
+      currency: "THB",
+      fxRateEffective: null,
+      grossAmount: "110.005",
+      fees: "0",
+    }),
+    bfRow({
+      transactionId: "bPennyThb",
+      symbol: "QQQ",
+      side: "BUY",
+      transactionDate: "2026-01-01",
+      quantity: "1",
+      unitPrice: "100",
+    }),
+  ]);
+  const pennyThb = bfPennyThb.updates.find((u) => u.transactionId === "sPennyThb");
+  ok(
+    pennyThb?.update.realizedGainLoss === "10.01" && pennyThb?.update.realizedGainLossThb === "10.01",
+    "THB rows pin fx to 1, so gain and gainThb agree after the same single rounding"
+  );
+
+  // A stored FX rate must be authoritative even when a BUY for another symbol
+  // interleaves chronologically (state is per-symbol, not global).
+  const bfInterleaved = computeGainLossBackfill([
+    bfRow({
+      transactionId: "sH1",
+      symbol: "HHH",
+      quantity: "1",
+      transactionDate: "2026-02-05",
+      grossAmount: "100",
+      fees: "0",
+    }),
+    bfRow({
+      transactionId: "bH1",
+      symbol: "HHH",
+      side: "BUY",
+      transactionDate: "2026-01-05",
+      quantity: "1",
+      unitPrice: "40",
+    }),
+    bfRow({
+      transactionId: "sH2",
+      symbol: "III",
+      quantity: "1",
+      transactionDate: "2026-02-06",
+      grossAmount: "50",
+      fees: "0",
+    }),
+  ]);
+  ok(
+    bfInterleaved.stats.filled === 1 &&
+      bfInterleaved.updates[0].transactionId === "sH1" &&
+      bfInterleaved.stats.stillNonComputable === 1,
+    "backfill state is per-symbol: HHH fills, III (no BUY) stays non-computable"
+  );
+
+  // ---- Webull Average Cost: SELL does not change the divisor (avg) ----
+  // buy 1000@300, sell 500, buy 200@350:
+  //   old running avg = 314.29 (partial-sell math lowers the remaining avg);
+  //   Webull avg = (300000 + 70000) / 1200 = 308.33 (fees excluded, avg kept).
+  const webullReplay = recomputeCostBasisMap([
+    { symbol: "WBL", transactionDate: "2026-01-02", side: "BUY", quantity: "1000", unitPrice: "300.00" },
+    { symbol: "WBL", transactionDate: "2026-01-05", side: "SELL", quantity: "500", unitPrice: "330.00" },
+    { symbol: "WBL", transactionDate: "2026-02-02", side: "BUY", quantity: "200", unitPrice: "350.00" },
+  ]);
+  ok(
+    webullReplay.WBL?.quantity === 700 &&
+      Math.abs((webullReplay.WBL?.avgCost ?? NaN) - 308.333333333) < 1e-6,
+    "Webull avg = cumulative cost / cumulative BUY qty = 308.33 (not the old 314.29 running avg)"
+  );
+  const webullDivergence = computeGainLossBackfill([
+    bfRow({
+      transactionId: "sWbl",
+      symbol: "WBL2",
+      quantity: "500",
+      transactionDate: "2026-02-10",
+      grossAmount: "165000",
+      fees: "0",
+    }),
+    bfRow({
+      transactionId: "bWbl1",
+      symbol: "WBL2",
+      side: "BUY",
+      transactionDate: "2026-01-02",
+      quantity: "1000",
+      unitPrice: "300",
+    }),
+    bfRow({
+      transactionId: "bWbl2",
+      symbol: "WBL2",
+      side: "BUY",
+      transactionDate: "2026-02-02",
+      quantity: "200",
+      unitPrice: "350",
+    }),
+  ]);
+  ok(
+    webullDivergence.updates[0].update.costBasis === "154166.67",
+    "Webull SELL basis = 308.3333... * 500 = 154166.67 (lifetime avg, not 157142.86)"
+  );
+
+  const wblFullLiquidation = recomputeCostBasisMap([
+    { symbol: "WLQ", transactionDate: "2026-01-02", side: "BUY", quantity: "100", unitPrice: "10.00" },
+    { symbol: "WLQ", transactionDate: "2026-02-01", side: "BUY", quantity: "100", unitPrice: "12.00" },
+    { symbol: "WLQ", transactionDate: "2026-03-01", side: "SELL", quantity: "200", unitPrice: "15.00" },
+    { symbol: "WLQ", transactionDate: "2026-03-10", side: "BUY", quantity: "50", unitPrice: "9.00" },
+  ]);
+  ok(
+    wblFullLiquidation.WLQ?.quantity === 50 &&
+      Math.abs((wblFullLiquidation.WLQ?.avgCost ?? NaN) - 9) < 1e-9,
+    "Webull full liquidation resets the position: next BUY 50@9 restarts avg at 9 (not blended with 11)"
+  );
+
+  // ---- Full recompute (one-shot Webull migration): overwrites AI_PARSED ----
+  const rc = recomputeAllGainLoss([
+    bfRow({
+      transactionId: "b1",
+      symbol: "RCM",
+      side: "BUY",
+      transactionDate: "2026-01-01",
+      quantity: "100",
+      unitPrice: "10",
+    }),
+    bfRow({
+      transactionId: "b2",
+      symbol: "RCM",
+      side: "BUY",
+      transactionDate: "2026-02-01",
+      quantity: "100",
+      unitPrice: "20",
+    }),
+    bfRow({
+      transactionId: "sOldMethod",
+      symbol: "RCM",
+      quantity: "100",
+      transactionDate: "2026-03-01",
+      grossAmount: "3000",
+      fees: "0",
+      realizedGainLossThb: "123.45", // old-method value — must be OVERWRITTEN
+    }),
+    bfRow({
+      transactionId: "sManual",
+      symbol: "RCM",
+      quantity: "10",
+      transactionDate: "2026-03-02",
+      sourceType: "MANUAL",
+      grossAmount: "500",
+      fees: "0",
+    }),
+  ]);
+  ok(
+    rc.stats.recomputed === 1 &&
+      rc.stats.skippedManual === 1 &&
+      rc.stats.stillNonComputable === 0,
+    "full recompute rewrites EVERY AI_PARSED SELL (even already-computed) and still skips MANUAL"
+  );
+  ok(
+    rc.updates[0].update.costBasis === "1500.00" &&
+      rc.updates[0].update.realizedGainLoss === "1500.00",
+    "full recompute uses the Webull lifetime avg 15 (was 10 before the 2nd BUY): basis 1500, gain 1500"
+  );
+
+  // ---- SPIN_OFF FMV allocation: parent cumCost split pro-rata by total FMV ----
+  // Parent holds 100 @ 50 (cumCost 5000); spin-off 10 child shares, FMV 90/10:
+  //   parentTotal = 90*100 = 9000, childTotal = 10*10 = 100
+  //   toChild = 5000 * 100/9100 = 54.94505495; parent keeps 4945.05494505.
+  const spinParent: CostBasisMap = {
+    MOM: { quantity: 100, avgCost: 50, cumQuantity: 100, cumCost: 5000 },
+  };
+  const spinFmv = applyCorporateAction(spinParent, {
+    symbol: "MOM",
+    actionType: "SPIN_OFF",
+    transactionDate: "2026-03-01",
+    sharesOut: "10",
+    priceOut: "10",
+    newSymbol: "KID",
+    parentFmvPerShare: "90",
+    childFmvPerShare: "10",
+  });
+  ok(
+    spinFmv.MOM !== undefined && spinFmv.KID !== undefined,
+    "FMV spin-off keeps the parent and creates the child position"
+  );
+  const momCost = spinFmv.MOM?.cumCost ?? 0;
+  const kidCost = spinFmv.KID?.cumCost ?? 0;
+  ok(
+    Math.abs(momCost + kidCost - 5000) < 1e-6,
+    "FMV spin-off preserves total cost across parent + child (5000)"
+  );
+  ok(
+    Math.abs(kidCost - 54.94505495) < 1e-4 && spinFmv.KID?.quantity === 10,
+    "child receives the FMV pro-rata share (54.95) with the spun shares"
+  );
+  ok(
+    spinFmv.MOM?.quantity === 100 && Math.abs((spinFmv.MOM?.avgCost ?? 0) - 49.45054945) < 1e-4,
+    "parent quantity unchanged, unit cost drops to 49.45"
+  );
+
+  // Legacy spin-off (no FMV pair): old valuation kept, parent untouched.
+  const spinLegacy = applyCorporateAction(spinParent, {
+    symbol: "MOM",
+    actionType: "SPIN_OFF",
+    transactionDate: "2026-03-01",
+    sharesOut: "10",
+    priceOut: "10",
+    newSymbol: "KID2",
+  });
+  ok(
+    spinLegacy.MOM?.cumCost === 5000 && spinLegacy.KID2?.cumCost === 100,
+    "legacy spin-off without FMV keeps the old behaviour (child at priceOut, parent untouched)"
+  );
+
+  // One-sided FMV is rejected, never guessed.
+  let fmvThrow = "";
+  try {
+    applyCorporateAction(spinParent, {
+      symbol: "MOM",
+      actionType: "SPIN_OFF",
+      transactionDate: "2026-03-01",
+      sharesOut: "10",
+      priceOut: "10",
+      parentFmvPerShare: "90",
+    });
+  } catch (e) {
+    fmvThrow = e instanceof Error ? e.message : String(e);
+  }
+  ok(fmvThrow.includes("both-or-neither"), "one-sided FMV spin-off throws (both-or-neither)");
 
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);

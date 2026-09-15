@@ -16,3 +16,6 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Local dev logs
+dev-server.log

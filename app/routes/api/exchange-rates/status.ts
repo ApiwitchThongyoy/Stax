@@ -13,8 +13,8 @@ export async function action() {
 /**
  * GET /api/v1/exchange-rates/status
  *
- * Returns the status of external API integrations (FX provider, Gemini, Tax
- * Engine). Used by the admin dashboard to show real integration status. The
+ * Returns the status of external API integrations (FX provider, Gemini).
+ * Used by the admin dashboard to show real integration status. The
  * historical FX provider is keyless and built-in, so it is always configured.
  *
  * Authenticated — admin-only endpoint.
@@ -46,10 +46,6 @@ export async function loader({ request }: Route.LoaderArgs) {
         gemini: {
           configured: geminiConfigured,
           status: geminiConfigured ? "configured" : "not_configured",
-        },
-        taxEngine: {
-          configured: true,
-          status: "built_in",
         },
       },
     },

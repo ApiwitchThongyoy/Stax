@@ -1,8 +1,7 @@
 // W1-1 — Server-only Gemini integration for structured statement extraction.
 //
 // Gemini is used ONLY for structured extraction/analysis of statement text into
-// a typed shape. It is deliberately NOT used to calculate tax (tax is handled by
-// the deterministic Decimal Core Engine in ./tax-engine.ts).
+// a typed shape. Financial figures are never computed by Gemini.
 //
 // This module is server-only. It reads GEMINI_API_KEY / GEMINI_MODEL from the
 // process environment and never exposes those values to browser code.

@@ -86,7 +86,7 @@ export function validatePdfFile(file: File): { ok: true } | { ok: false; message
 }
 
 // MIME type from the client is not trusted on its own — verify the %PDF- magic bytes.
-async function hasPdfMagicBytes(file: File): Promise<boolean> {
+export async function hasPdfMagicBytes(file: File): Promise<boolean> {
   const head = new Uint8Array(await file.slice(0, PDF_MAGIC.length).arrayBuffer());
   const decoded = Buffer.from(head).toString("latin1");
   return decoded === PDF_MAGIC;

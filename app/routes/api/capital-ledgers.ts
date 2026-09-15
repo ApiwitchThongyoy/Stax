@@ -5,6 +5,13 @@ import { db } from "~/lib/drizzle-db";
 import { capitalTransactions } from "~/db/schema";
 import { verifyAuth, type AuthPayload, authErrorResponse } from "~/lib/auth-middleware";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
+import {
+  insertManualCashJournal,
+} from "~/lib/ledger-service";
+import {
+  journalEntryToCapitalRow,
+  listCapitalLedgerRows,
+} from "~/lib/journal-ledger-read";
 
 const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"];
 const VALID_SOURCE_TYPES = ["MANUAL", "AI_PARSED"];
@@ -36,11 +43,12 @@ export async function loader({ request }: Route.LoaderArgs) {
   }
 
   try {
-    const rows = await db
-      .select()
-      .from(capitalTransactions)
-      .where(eq(capitalTransactions.userId, auth.userId))
-      .execute();
+    // Journal as SSOT: the ledger list is served from the journal (migration
+    // 0020), which holds every Capital_Transactions-mirrored entry plus the
+    // full trade detail. The reconstructed rows are identical in shape to what
+    // this endpoint returned before.
+    const entries = await listCapitalLedgerRows(auth.userId);
+    const rows = entries.map(journalEntryToCapitalRow);
 
     return Response.json({ success: true, data: rows }, { status: 200 });
   } catch (error) {
@@ -115,6 +123,14 @@ async function handleCreate(
   if (rateErr) {
     return Response.json({ success: false, message: rateErr }, { status: 400 });
   }
+  // A manual non-THB row without a positive rate would journalize at a silent
+  // 1:1 default downstream — reject it here instead of inventing a rate.
+  if (currency.trim().toUpperCase() !== "THB" && !(Number(fxRateBot) > 0)) {
+    return Response.json(
+      { success: false, message: "fxRateBot must be a positive number for non-THB rows" },
+      { status: 400 }
+    );
+  }
 
   const thbErr = validateAmount(amountThb, "amountThb");
   if (thbErr) {
@@ -167,8 +183,36 @@ async function handleCreate(
         amountThb: String(amountThb),
         type,
         sourceType,
+        // Manual cash entries (CASH_IN/CASH_OUT) are money entering/leaving the
+        // account's equity pool, so they are classified as equity for the
+        // general-ledger posting engine and the cash in/out summary aggregator.
+        category: "equity",
       })
       .execute();
+
+    // Journal as SSOT: mirror manual rows in the journal too, or they would
+    // disappear from the journal-backed ledger/cash views. AI_PARSED manual-type
+    // rows come from statements and are already journaled by the import path.
+    let entryNo: number | undefined;
+    if (sourceType === "MANUAL") {
+      const journaled = await insertManualCashJournal(auth.userId, {
+        transactionId,
+        type: type as "CASH_IN" | "CASH_OUT",
+        amountForeign: String(amountForeign),
+        currency: currency.trim(),
+        transactionDate: transactionDate.trim(),
+        fxRateEffective: String(fxRateBot),
+        amountThb: String(amountThb),
+      });
+      if (journaled.ok) {
+        entryNo = journaled.entryNo;
+      } else {
+        console.error(
+          `CapitalLedgers POST: manual row ${transactionId} inserted but journal failed`,
+          journaled.errors
+        );
+      }
+    }
 
     await insertAuditLog({
       userId: auth.userId,
@@ -183,6 +227,7 @@ async function handleCreate(
         sourceType,
         currency: currency.trim(),
         transactionDate: transactionDate.trim(),
+        journalEntryNo: entryNo ?? null,
       },
     });
 
@@ -200,6 +245,8 @@ async function handleCreate(
           amountThb: String(amountThb),
           type,
           sourceType,
+          category: "equity",
+          journalEntryNo: entryNo ?? null,
         },
       },
       { status: 201 }

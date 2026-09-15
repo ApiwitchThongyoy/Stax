@@ -38,6 +38,9 @@ const SUPABASE_OBJECT_KEY_RE =
 export interface StorePdfInput {
   key: string;
   bytes: Uint8Array;
+  // Optional MIME type for the stored object. Defaults to application/pdf so
+  // existing Statement callers are unchanged.
+  contentType?: string;
 }
 
 export type StorePdfResult =
@@ -51,12 +54,16 @@ export interface StatementStorageDriver {
 }
 
 /**
- * Build the server-side storage object key for a Statement PDF. Always generated
+ * Build the server-side storage object key for a Statement file. Always generated
  * server-side from the authenticated user's id and a fresh document id — a
  * client-supplied object path is never used.
  */
-export function buildObjectKey(userId: string, documentId: string): string {
-  return `statements/${userId}/${documentId}.pdf`;
+export function buildObjectKey(
+  userId: string,
+  documentId: string,
+  extension: "pdf" = "pdf"
+): string {
+  return `statements/${userId}/${documentId}.${extension}`;
 }
 
 function isNotFoundStorageError(error: unknown): boolean {
@@ -178,6 +185,7 @@ function supabaseBucket(): string {
 async function supabaseStorePdf({
   key,
   bytes,
+  contentType,
 }: StorePdfInput): Promise<StorePdfResult> {
   if (!SUPABASE_OBJECT_KEY_RE.test(key)) {
     console.warn("supabaseStorePdf: rejecting invalid object key");
@@ -187,7 +195,7 @@ async function supabaseStorePdf({
     const { error } = await supabaseClient()
       .storage.from(supabaseBucket())
       .upload(key, bytes, {
-        contentType: "application/pdf",
+        contentType: contentType ?? "application/pdf",
         upsert: false,
         cacheControl: "0",
       });

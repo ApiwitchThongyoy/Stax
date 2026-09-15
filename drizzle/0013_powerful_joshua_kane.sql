@@ -1,0 +1,1 @@
+ALTER TABLE "Capital_Transactions" ADD COLUMN "section" text;

@@ -1,5 +1,5 @@
 import { useRef, useState, type DragEvent } from "react";
-import { UploadCloud, Sparkles, FileWarning, CheckCircle2, X } from "lucide-react";
+import { UploadCloud, Sparkles, FileWarning, CheckCircle2, AlertTriangle, X } from "lucide-react";
 import { saveDocument } from "../../lib/Documentstorage";
 import { useAuth } from "../../lib/auth";
 import {
@@ -53,6 +53,10 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved, onGemi
     "idle" | "saving" | "saved" | "error"
   >("idle");
   const [serverMessage, setServerMessage] = useState("");
+  const [duplicateModal, setDuplicateModal] = useState<{
+    open: boolean;
+    fileName: string;
+  }>({ open: false, fileName: "" });
 
   const resetToIdle = () => {
     setStatus("idle");
@@ -168,6 +172,7 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved, onGemi
       if (res.code === "STATEMENT_ALREADY_IMPORTED") {
         setServerStatus("saved");
         setServerMessage("Statement นี้เคยถูกนำเข้าแล้ว จึงไม่มีการเพิ่มรายการซ้ำ");
+        setDuplicateModal({ open: true, fileName: file.name });
         return;
       }
       if (res.ai) {
@@ -380,6 +385,55 @@ export default function PdfStatementUploader({ onImport, onDocumentSaved, onGemi
                 className="text-sm font-medium px-4 py-2.5 rounded-lg text-gray-500 hover:bg-gray-50 transition"
               >
                 ยกเลิก
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ----- Modal แจ้งเตือน Statement ซ้ำ (ปิดด้วย X หรือ OK เท่านั้น) ----- */}
+      {duplicateModal.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/40 backdrop-blur-sm">
+          <div className="w-full max-w-sm bg-white rounded-2xl shadow-xl overflow-hidden">
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+              <h4 className="text-sm font-semibold text-gray-800">
+                Statement ซ้ำ
+              </h4>
+              <button
+                type="button"
+                onClick={() => setDuplicateModal({ open: false, fileName: "" })}
+                className="text-gray-400 hover:text-gray-600 transition p-1"
+                aria-label="ปิดหน้าต่าง"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="px-5 py-6">
+              <div className="flex flex-col items-center text-center gap-3">
+                <div className="w-12 h-12 rounded-full bg-amber-50 flex items-center justify-center">
+                  <AlertTriangle className="w-6 h-6 text-amber-500" />
+                </div>
+                <p className="text-sm text-gray-700">
+                  ไฟล์{" "}
+                  <span className="font-medium text-gray-900">
+                    &quot;{duplicateModal.fileName}&quot;
+                  </span>{" "}
+                  เคยถูกนำเข้าแล้ว จึงไม่มีการเพิ่มรายการซ้ำ
+                </p>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="px-5 py-4 border-t border-gray-100 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setDuplicateModal({ open: false, fileName: "" })}
+                className="bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium px-6 py-2.5 rounded-lg transition"
+              >
+                OK
               </button>
             </div>
           </div>

@@ -3,8 +3,16 @@ import type { Route } from "./+types/capital-ledgers.$id";
 import { db } from "~/lib/drizzle-db";
 import { capitalTransactions } from "~/db/schema";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
-import { rebuildCostBasisStateFromLedger } from "~/lib/statement-pipeline";
+import { rebuildCostBasisStateFromLedger, backfillComputedGainLoss } from "~/lib/statement-pipeline";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
+import {
+  removeCapitalLedgerJournal,
+  syncCapitalLedgerJournal,
+} from "~/lib/ledger-service";
+import {
+  getCapitalLedgerRow,
+  journalEntryToCapitalRow,
+} from "~/lib/journal-ledger-read";
 
 const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"];
 const VALID_SOURCE_TYPES = ["MANUAL", "AI_PARSED"];
@@ -44,26 +52,20 @@ export async function loader({ request, params }: Route.LoaderArgs) {
   }
 
   try {
-    const rows = await db
-      .select()
-      .from(capitalTransactions)
-      .where(
-        and(
-          eq(capitalTransactions.transactionId, id),
-          eq(capitalTransactions.userId, auth.userId)
-        )
-      )
-      .limit(1);
-    const row = rows[0];
-
-    if (!row) {
+    // Journal as SSOT: single-record reads come from the journal, which holds
+    // every Capital_Transactions-mirrored entry (migration 0020).
+    const record = await getCapitalLedgerRow(auth.userId, id);
+    if (!record) {
       return Response.json(
         { success: false, message: "Record not found" },
         { status: 404 }
       );
     }
 
-    return Response.json({ success: true, data: row }, { status: 200 });
+    return Response.json(
+      { success: true, data: journalEntryToCapitalRow(record) },
+      { status: 200 }
+    );
   } catch (error) {
     console.error("CapitalLedgers GET by ID: failed to query", error);
     return Response.json(
@@ -248,6 +250,34 @@ async function handleUpdate(
       )
       .limit(1);
 
+    const updated = updatedRows[0];
+
+    // Journal as SSOT: keep the mirrored journal entry fresh so journal-backed
+    // reads never show stale values. Only cash rows (CASH_IN/CASH_OUT) get the
+    // two-leg equity entry rebuilt; statement trade rows keep their original
+    // posting lines untouched. Best-effort — a failed sync must not 500 a
+    // successful update.
+    if (
+      updated &&
+      (updated.type === "CASH_IN" || updated.type === "CASH_OUT")
+    ) {
+      try {
+        await syncCapitalLedgerJournal(userId, transactionId, {
+          transactionId,
+          type: updated.type,
+          amountForeign: String(updated.amountForeign ?? ""),
+          currency: String(updated.currency ?? ""),
+          transactionDate: String(updated.transactionDate ?? ""),
+          fxRateEffective: String(
+            updated.fxRateEffective ?? updated.fxRateBot ?? "1"
+          ),
+          amountThb: String(updated.amountThb ?? ""),
+        });
+      } catch (error) {
+        console.warn("CapitalLedgers PUT: journal sync failed", error);
+      }
+    }
+
     await insertAuditLog({
       userId,
       action: AuditAction.CAPITAL_TRANSACTION_UPDATE,
@@ -261,7 +291,17 @@ async function handleUpdate(
       },
     });
 
-    return Response.json({ success: true, data: updatedRows[0] }, { status: 200 });
+    // Journal as SSOT: the response comes from the mirrored journal record
+    // (same shape as GET /:id), with the raw capital row only as a fallback
+    // when the journal read fails — never the other way around.
+    let data: unknown = updated;
+    try {
+      const record = await getCapitalLedgerRow(userId, transactionId);
+      if (record) data = journalEntryToCapitalRow(record);
+    } catch (error) {
+      console.warn("CapitalLedgers PUT: journal re-read failed, returning capital row", error);
+    }
+    return Response.json({ success: true, data }, { status: 200 });
   } catch (error) {
     console.error("CapitalLedgers PUT: failed to update", error);
     return Response.json(
@@ -294,6 +334,16 @@ async function handleDelete(
       );
     }
 
+    // Journal as SSOT: drop the mirrored journal entry (and its lines) so the
+    // journal-backed ledger/cash views stop showing the deleted row. Purely
+    // recursive cleanup — the entry itself is not reversed, because reversal
+    // would re-show the movement in the account ledger.
+    try {
+      await removeCapitalLedgerJournal(userId, transactionId);
+    } catch (error) {
+      console.warn("CapitalLedgers DELETE: journal remove failed", error);
+    }
+
     await db
       .delete(capitalTransactions)
       .where(
@@ -311,6 +361,15 @@ async function handleDelete(
       await rebuildCostBasisStateFromLedger(userId);
     } catch (error) {
       console.warn("CapitalLedgers DELETE: cost_basis_state rebuild failed", error);
+    }
+
+    // Heal frozen SELL rows that only became computable after this deletion
+    // (fills holes only; never overwrites existing values, never touches
+    // MANUAL rows). Best-effort — a deletion must never fail because of it.
+    try {
+      await backfillComputedGainLoss(userId);
+    } catch (error) {
+      console.warn("CapitalLedgers DELETE: gain-loss backfill failed", error);
     }
 
     await insertAuditLog({

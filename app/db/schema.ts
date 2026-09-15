@@ -8,6 +8,7 @@ import {
   uniqueIndex,
   timestamp,
   jsonb,
+  check,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -42,6 +43,16 @@ export const capitalTransactions = pgTable(
     type: text("type").notNull(),
     sourceType: text("source_type").notNull(),
     sourceDocumentId: text("source_document_id"),
+    // Parser transaction category ("income" | "expense" | "equity" | "asset").
+    // Persisted so the general-ledger posting engine can classify each row into
+    // the right set of journal accounts without re-parsing. Nullable for legacy
+    // rows created before this column existed; the posting engine then falls
+    // back to side/type heuristics.
+    category: text("category"),
+    // Parser section label (e.g. "เงินปันผล:goog", "ค่าธรรมเนียม",
+    // "ภาษีหัก ณ ที่จ่าย", "ดอกเบี้ย"). Persisted so the general-ledger posting
+    // engine can pick the correct income/expense account deterministically.
+    section: text("section"),
     // ---- Trade detail (realized capital gains, migration 0009) ----
     // Symbol/ticker of the traded asset when this row originates from a
     // statement TRADE RECORDS line (BUY/SELL). Null for deposits, dividends,
@@ -57,6 +68,13 @@ export const capitalTransactions = pgTable(
     grossAmount: numeric("gross_amount"),
     // Broker commission + VAT for this single trade, in transaction currency.
     fees: numeric("fees"),
+    // Broker-authoritative net cash for this single trade (the statement's "Net
+    // Amount" = gross - fees). Persisted for EVERY trade row so realized
+    // gain/loss can be recomputed later even when a SELL was frozen as
+    // non-computable at import time (e.g. its supporting BUY arrived in a later
+    // statement). Null for rows imported before this column existed; the
+    // backfill then reconstructs net = gross_amount - fees.
+    netAmount: numeric("net_amount"),
     // Gross sale proceeds = unit_price * quantity (SELL rows only).
     proceeds: numeric("proceeds"),
     // Acquisition cost of the sold quantity = running average cost * quantity
@@ -79,6 +97,15 @@ export const capitalTransactions = pgTable(
     // Stock exchange where the trade executed (e.g. NASDAQ, NYSE, NYSEARCA).
     // Trade rows only; null for non-trade rows.
     exchange: text("exchange"),
+    // ---- Currency-exchange FROM side + printed rate (migration 0021) ----
+    // That the statement's CURRENCY EXCHANGE RECORDS line printed: "from Ccy
+    // fromAmt -> to Ccy toAmt (rate)". The to-side is stored in the existing
+    // currency/amount columns; these make the FROM side and the bank's printed
+    // rate readable for the cash page. CURRENCY-EXCHANGE rows only; null for
+    // every other row (never fabricated).
+    exchangeFromCurrency: text("exchange_from_currency"),
+    exchangeFromAmount: numeric("exchange_from_amount"),
+    exchangeRate: numeric("exchange_rate"),
   },
   (table) => [
     index("Capital_Transactions_user_id_idx").on(table.userId),
@@ -89,10 +116,12 @@ export const capitalTransactions = pgTable(
   ]
 );
 
-// Server-authoritative running average cost basis per (user, symbol).
+// Server-authoritative Webull Average-Cost cost basis per (user, symbol).
 // The deterministic statement pipeline maintains this across imports, mirroring
-// the parser's average-cost algorithm; it is what makes SELL realized
-// gain/loss computable. Additive-only; historical data is preserved.
+// the parser's Webull Average-Cost algorithm; `cum_quantity`/`cum_cost` are the
+// lifetime accumulator (every BUY adds price×qty; SELL only reduces `quantity`)
+// that makes `avg_cost = cum_cost / cum_quantity` and SELL realized gain/loss
+// computable. Additive-only; historical data is preserved.
 export const costBasisState = pgTable(
   "cost_basis_state",
   {
@@ -103,11 +132,97 @@ export const costBasisState = pgTable(
     symbol: text("symbol").notNull(),
     quantity: numeric("quantity").notNull(),
     avgCost: numeric("avg_cost").notNull(),
+    cumQuantity: numeric("cum_quantity").notNull(),
+    cumCost: numeric("cum_cost").notNull(),
     updatedAt: text("updated_at").notNull(),
   },
   (table) => [
     index("cost_basis_state_user_id_idx").on(table.userId),
     uniqueIndex("cost_basis_state_user_symbol_idx").on(table.userId, table.symbol),
+  ]
+);
+
+// Corporate actions (split / reverse-split / spin-off / rename) that adjust a
+// symbol's share count and per-share average cost WITHOUT touching the cash
+// ledger. They are replayed chronologically with Capital_Transactions when the
+// derived cost_basis_state cache is rebuilt — mirroring the statement parser's
+// running-average math — so a SELL after a split computes realized gain/loss
+// against the post-split cost basis. Additive-only; the parser is untouched.
+export const corporateActions = pgTable(
+  "corporate_actions",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    // Uppercase ticker the action applies to (e.g. "BBAI").
+    symbol: text("symbol").notNull(),
+    // SPLIT | REVERSE_SPLIT | SPIN_OFF | RENAME
+    actionType: text("action_type").notNull(),
+    // ISO date (yyyy-mm-dd) of the corporate action event.
+    transactionDate: text("transaction_date").notNull(),
+    // Split-like ratio, expressed old:new (e.g. ratio 1:10 => quantity ×10 and
+    // per-share cost ÷10; ratio 10:1 => the reverse). ratioOld defaults to 1.
+    ratioOld: numeric("ratio_old"),
+    ratioNew: numeric("ratio_new"),
+    // RENAME / SPIN_OFF: the resulting symbol.
+    newSymbol: text("new_symbol"),
+    // SPIN_OFF: new-symbol shares received and their per-share value.
+    sharesOut: numeric("shares_out"),
+    priceOut: numeric("price_out"),
+    // SPIN_OFF FMV pair for cost-basis allocation (parent -> child), in the
+    // symbol's trade currency per share. Nullable = legacy rows (pre-0023):
+    // those keep the old behaviour (child at price_out, parent untouched).
+    parentFmvPerShare: numeric("parent_fmv_per_share"),
+    childFmvPerShare: numeric("child_fmv_per_share"),
+    // Fractional-share payout for split-like actions (informational; total cost
+    // is preserved regardless), in the symbol's trade currency.
+    cashInLieu: numeric("cash_in_lieu"),
+    description: text("description"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("corporate_actions_user_id_idx").on(table.userId),
+    uniqueIndex("corporate_actions_user_symbol_date_idx").on(
+      table.userId,
+      table.symbol,
+      table.transactionDate
+    ),
+  ]
+);
+
+// Reference-market daily-close stock prices, keyed by symbol + trade date.
+//
+// Unlike every other table in this schema this is intentionally NOT user-scoped:
+// share prices are public market data shared by all users, so a single row per
+// (symbol, price_date) serves every account. It is maintained by the stock-price
+// provider (Yahoo Finance, keyless) via a daily cron + lazy refresh; the
+// Dashboard "การถือครองหุ้น" card reads it for display-only current price,
+// market value and unrealized P&L. NEVER an input to the tax engine or the
+// general ledger.
+export const stockPrices = pgTable(
+  "stock_prices",
+  {
+    id: text("id").primaryKey(),
+    // Uppercase ticker, e.g. "NVDA".
+    symbol: text("symbol").notNull(),
+    // ISO trade date (yyyy-mm-dd) the close belongs to.
+    priceDate: text("price_date").notNull(),
+    // Daily close per share, in `currency`.
+    closePrice: numeric("close_price").notNull(),
+    // Quote currency returned by the provider (e.g. USD for US-listed tickers).
+    currency: text("currency").notNull().default("USD"),
+    // Provider label, e.g. "yahoo-finance".
+    source: text("source"),
+    createdAt: text("created_at").notNull(),
+    // Last fetch/update time (used for the 1-day staleness check).
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("stock_prices_symbol_date_idx").on(table.symbol, table.priceDate),
+    index("stock_prices_price_date_idx").on(table.priceDate),
+    index("stock_prices_symbol_idx").on(table.symbol),
   ]
 );
 
@@ -140,30 +255,6 @@ export const documents = pgTable(
     uniqueIndex("documents_user_content_hash_key")
       .on(table.userId, table.contentHash)
       .where(sql`${table.contentHash} IS NOT NULL`),
-  ]
-);
-
-export const dailyTaxSummaries = pgTable(
-  "daily_tax_summaries",
-  {
-    id: text("id").primaryKey(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => users.id),
-    summaryDate: text("summary_date").notNull(),
-    totalAmountThb: numeric("total_amount_thb").notNull(),
-    totalTaxAmount: numeric("total_tax_amount"),
-    transactionCount: integer("transaction_count").notNull(),
-    createdAt: text("created_at").notNull(),
-    updatedAt: text("updated_at").notNull(),
-  },
-  (table) => [
-    index("daily_tax_summaries_user_id_idx").on(table.userId),
-    index("daily_tax_summaries_summary_date_idx").on(table.summaryDate),
-    uniqueIndex("daily_tax_summaries_user_date_idx").on(
-      table.userId,
-      table.summaryDate
-    ),
   ]
 );
 
@@ -239,5 +330,153 @@ export const notifications = pgTable(
     index("notifications_user_id_idx").on(table.userId),
     index("notifications_user_read_idx").on(table.userId, table.isRead),
     index("notifications_dedup_idx").on(table.userId, table.type, table.entityId),
+  ]
+);
+
+// ---------------------------------------------------------------------------
+// Double-entry general ledger (บัญชีแยกประเภท) — foreign investment pivot.
+//
+// Every journal_entries row balances debits == credits PER CURRENCY. That rule
+// is enforced in the service layer + the pure engine (general-ledger.ts) — a
+// Postgres trigger would be needed for a hard DB-level guarantee, which this
+// codebase deliberately avoids (all invariants live in tested application
+// code). The per-line CHECK below is the DB safety net for the most common
+// defect: a line that is simultaneously a debit and a credit, or neither.
+// ---------------------------------------------------------------------------
+
+export const accounts = pgTable(
+  "accounts",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    // Chart-of-accounts code, e.g. 1020, 1110. Unique per user.
+    code: text("code").notNull(),
+    name: text("name").notNull(),
+    // ASSET | LIABILITY | EQUITY | INCOME | EXPENSE
+    type: text("type").notNull(),
+    // Base currency for this account — USD for foreign broker/investment
+    // accounts, THB default. Journal lines posted to it must match.
+    currency: text("currency").notNull().default("THB"),
+    // Parent account code id (sub-accounts). Kept nullable/loose.
+    parentId: text("parent_id"),
+    // Opening balance in account currency (positive magnitude; normal side is
+    // derived from `type`).
+    openingBalance: numeric("opening_balance"),
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("accounts_user_id_code_idx").on(table.userId, table.code),
+    index("accounts_user_id_idx").on(table.userId),
+    index("accounts_parent_id_idx").on(table.parentId),
+  ]
+);
+
+export const journalEntries = pgTable(
+  "journal_entries",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    // Per-user running number (monotonic int) shown to the user.
+    entryNo: integer("entry_no").notNull(),
+    // ISO date (yyyy-mm-dd) of the economic event.
+    entryDate: text("entry_date").notNull(),
+    description: text("description").notNull(),
+    // MANUAL | STATEMENT
+    sourceType: text("source_type").notNull().default("MANUAL"),
+    // documents.id when posted from a statement import.
+    sourceDocumentId: text("source_document_id"),
+    // Capital_Transactions.transaction_id when posted from a statement row.
+    sourceTransactionId: text("source_transaction_id"),
+    // POSTED | REVERSED
+    status: text("status").notNull().default("POSTED"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    // ---- Trade-detail columns (statement imports; manual entries keep null) ----
+    category: text("category"),
+    section: text("section"),
+    symbol: text("symbol"),
+    side: text("side"),
+    exchange: text("exchange"),
+    quantity: numeric("quantity"),
+    unitPrice: numeric("unit_price"),
+    grossAmount: numeric("gross_amount"),
+    fees: numeric("fees"),
+    netAmount: numeric("net_amount"),
+    proceeds: numeric("proceeds"),
+    costBasis: numeric("cost_basis"),
+    realizedGainLoss: numeric("realized_gain_loss"),
+    realizedGainLossThb: numeric("realized_gain_loss_thb"),
+    averageCost: numeric("average_cost"),
+    currency: text("currency"),
+    amount: numeric("amount"),
+    amountThb: numeric("amount_thb"),
+    fxRateEffective: numeric("fx_rate_effective"),
+    fxRateStatement: numeric("fx_rate_statement"),
+    exchangeFromCurrency: text("exchange_from_currency"),
+    exchangeFromAmount: numeric("exchange_from_amount"),
+    exchangeRate: numeric("exchange_rate"),
+    isFxConversion: boolean("is_fx_conversion").notNull().default(false),
+    // POSTED (lines exist + balanced) | SKIPPED (recorded but not double-entry).
+    postingState: text("posting_state").notNull().default("POSTED"),
+    skipReason: text("skip_reason"),
+    // The source-row capital type ("CASH_IN" | "CASH_OUT") — part of the
+    // journal-as-SSOT record so the journal can serve every screen that today
+    // reads Capital_Transactions (cash summary, ledger list, portfolio, ...).
+    // Manual/statement entries carry it; general GL journal entries keep null.
+    type: text("type"),
+    // Investor's own note on this entry (trading-journal "จดบันทึก").
+    // Nullable free text, written ONLY via the journal note endpoint —
+    // never by imports, postings, backfills or reversals.
+    note: text("note"),
+  },
+  (table) => [
+    uniqueIndex("journal_entries_user_entry_no_idx").on(table.userId, table.entryNo),
+    index("journal_entries_user_id_idx").on(table.userId),
+    index("journal_entries_entry_date_idx").on(table.entryDate),
+    index("journal_entries_source_document_id_idx").on(table.sourceDocumentId),
+    index("journal_entries_symbol_idx").on(table.symbol),
+    index("journal_entries_source_transaction_id_idx").on(table.sourceTransactionId),
+  ]
+);
+
+export const journalEntryLines = pgTable(
+  "journal_entry_lines",
+  {
+    id: text("id").primaryKey(),
+    journalEntryId: text("journal_entry_id")
+      .notNull()
+      .references(() => journalEntries.id),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    accountId: text("account_id")
+      .notNull()
+      .references(() => accounts.id),
+    currency: text("currency").notNull(),
+    // Exactly ONE of these is set, always as a positive magnitude.
+    debitAmount: numeric("debit_amount"),
+    creditAmount: numeric("credit_amount"),
+    // THB reporting base derived from fxRateEffective.
+    amountThb: numeric("amount_thb").notNull(),
+    fxRateEffective: numeric("fx_rate_effective").notNull(),
+    fxRateStatement: numeric("fx_rate_statement"),
+    fxRateProvider: numeric("fx_rate_provider"),
+    memo: text("memo"),
+  },
+  (table) => [
+    index("journal_entry_lines_journal_entry_id_idx").on(table.journalEntryId),
+    index("journal_entry_lines_user_id_idx").on(table.userId),
+    index("journal_entry_lines_account_id_idx").on(table.accountId),
+    // DB safety net: a line is either a debit or a credit, never both/neither.
+    check(
+      "journal_entry_lines_single_leg",
+      sql`(debit_amount IS NULL) <> (credit_amount IS NULL)`
+    ),
   ]
 );

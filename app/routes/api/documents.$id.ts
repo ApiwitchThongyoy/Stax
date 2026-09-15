@@ -4,7 +4,7 @@ import { db } from "~/lib/drizzle-db";
 import { documents, capitalTransactions } from "~/db/schema";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import { deleteStoredFile } from "~/lib/storage/statement-storage";
-import { rebuildCostBasisStateFromLedger } from "~/lib/statement-pipeline";
+import { rebuildCostBasisStateFromLedger, backfillComputedGainLoss } from "~/lib/statement-pipeline";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 
 const UUID_REGEX =
@@ -130,6 +130,16 @@ export async function action({ request, params }: Route.ActionArgs) {
     await rebuildCostBasisStateFromLedger(auth.userId);
   } catch (error) {
     console.warn("DocumentDelete: cost_basis_state rebuild failed", error);
+  }
+
+  // Recompute any frozen SELL rows that only became computable now that the
+  // deleted statement's rows are gone (e.g. a SELL-into-deleted-BUY blocker no
+  // longer reduces the running basis). Best-effort — fills holes only, never
+  // overwrites values and never touches MANUAL rows.
+  try {
+    await backfillComputedGainLoss(auth.userId);
+  } catch (error) {
+    console.warn("DocumentDelete: gain-loss backfill failed", error);
   }
 
   // Best-effort physical file cleanup AFTER the DB commit succeeded. A failure

@@ -1,66 +1,61 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useLocation } from "react-router";
+import { useCallback, useEffect, useState } from "react";
+import { useLocation, useNavigate } from "react-router";
 import {
   LayoutDashboard,
-  BookOpen,
-  TrendingUp,
-  Users,
+  UploadCloud,
   Settings,
   HelpCircle,
   Archive,
-  Plus,
-  Pencil,
-  Trash2,
-  ChevronRight,
-  ChevronUp,
-  ArrowUpDown,
-  CalendarDays,
+  ScrollText,
+  Wallet,
+  NotebookPen,
+  BookOpenText,
 } from "lucide-react";
 import StaxLogo from "../Login/StaxLogo";
-import { useNavigate } from "react-router";
-import { useAuth } from "../../lib/auth"; // ปรับ path ให้ตรง
+import { useAuth } from "../../lib/auth";
 import { clearAllSessions } from "../../lib/session";
 import { useSuspendedAccount } from "../../lib/suspended-account";
 import { usePresenceHeartbeat } from "../../lib/usePresenceHeartbeat";
 import { useTheme } from "../../lib/useTheme";
 import ThemeToggle from "../ThemeToggle";
-import PdfStatementUploader from "./PdfStatementUploader";
-import StoredDocumentsList from "./Storeddocumentslist";
-import DailyCalendarExport from "./Dailycalendarexport";
-import CapitalLedgerPage from "../Ledger/CapitalLedgerPage";
+import GeneralLedgerNew, { type GlTab } from "../LedgerRedesign/GeneralLedgerNew";
 import SettingsPage from "./SettingsPage";
 import NotificationBell from "./NotificationBell";
 import StatementArchivePage from "./StatementArchivePage";
-import FxAiPage from "./FxAiPage";
+import StatementUploadPage from "./StatementUploadPage";
+import CashFlowPage from "./CashFlowPage";
+import DashboardHomePage from "./DashboardHomePage";
+import StockDetailPage from "./StockDetailPage";
+import TradingJournalPage from "./TradingJournalPage";
+import JournalPage from "../Journal/JournalPage";
 import type { Transaction } from "../../lib/Financeutils";
-import {
-  sumAuthoritativeGainThb,
-  countComputableGainRows,
-  hasNonComputableGain,
-  pickRelevantRate,
-} from "../../lib/Financeutils";
 import {
   fetchCapitalLedger,
   capitalLedgerToTransactions,
-  fetchExchangeRate,
-  fetchAiAnalysis,
-  fetchTaxRecon,
-  type ExchangeRateEntry,
-  type AiAnalysisResponse,
-  type TaxReconSummary,
+  fetchUserDocuments,
+  type ServerDocumentMeta,
 } from "../../lib/server-api";
 
-// ไม่มีข้อมูลตัวอย่างแล้ว — สมุดบัญชีเริ่มต้นว่างเปล่า รอผู้ใช้ import ไฟล์ statement จริง
-const initialTransactions: Transaction[] = [];
+// สมุดบัญชีเริ่มต้นว่างเปล่า — รายการจริงโหลดจาก server ผ่าน endpoint ที่เกี่ยวข้อง
 
-type NavId = "dashboard" | "ledger" | "fx" | "users" | "settings" | "archive";
+type NavId =
+  | "dashboard"
+  | "journal"
+  | "gl"
+  | "upload"
+  | "archive"
+  | "cashflow"
+  | "trading"
+  | "settings";
 
 const navItems: { id: NavId; label: string; icon: typeof LayoutDashboard }[] = [
-  { id: "dashboard", label: "แดชบอร์ด", icon: LayoutDashboard },
-  { id: "ledger", label: "สมุดบัญชี", icon: BookOpen },
-  { id: "fx", label: "อัตราแลกเปลี่ยน AI", icon: TrendingUp },
-  { id: "users", label: "ปฏิทิน", icon: CalendarDays },
+  { id: "dashboard", label: "หน้าหลัก", icon: LayoutDashboard },
+  { id: "trading", label: "สมุดบันทึกการซื้อขาย", icon: BookOpenText },
+  { id: "journal", label: "สมุดรายวัน", icon: NotebookPen },
+  { id: "gl", label: "บัญชีแยกประเภท", icon: ScrollText },
+  { id: "upload", label: "อัปโหลด Statement", icon: UploadCloud },
   { id: "archive", label: "คลัง Statement", icon: Archive },
+  { id: "cashflow", label: "เงินเข้า/ออก", icon: Wallet },
 ];
 
 interface DashboardProps {
@@ -72,14 +67,42 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const { logout, user } = useAuth();
   const { theme, toggleTheme } = useTheme();
   const [activeNav, setActiveNav] = useState<NavId>("dashboard");
-  const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions);
-  const [docsRefreshKey, setDocsRefreshKey] = useState(0);
-  const [sortOrder, setSortOrder] = useState<"newest" | "oldest">("newest");
-  const [showAllTransactions, setShowAllTransactions] = useState(false);
-  const [fxRateEntry, setFxRateEntry] = useState<ExchangeRateEntry | null>(null);
-  const [taxRecon, setTaxRecon] = useState<TaxReconSummary | null>(null);
-  const [aiInsight, setAiInsight] = useState<AiAnalysisResponse | null>(null);
+  const [glTab, setGlTab] = useState<GlTab>("overview");
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const location = useLocation();
+
+  // Server-authoritative data for หน้าหลัก (ไม่มี session-import state แยก
+  // ค่านี้เป็นแหล่งเดียวกับที่หน้าอื่นใช้)
+  const [serverTransactions, setServerTransactions] = useState<Transaction[]>(
+    []
+  );
+  const [serverDocuments, setServerDocuments] = useState<ServerDocumentMeta[]>(
+    []
+  );
+  const [ledgerError, setLedgerError] = useState<string | null>(null);
+
+  const refreshServerData = useCallback(async () => {
+    if (!user?.accessToken) return;
+    setLedgerError(null);
+    try {
+      const [rows, docs] = await Promise.all([
+        fetchCapitalLedger(user.accessToken),
+        fetchUserDocuments(user.accessToken),
+      ]);
+      setServerTransactions(capitalLedgerToTransactions(rows));
+      setServerDocuments(docs);
+    } catch (error) {
+      setLedgerError(
+        error instanceof Error
+          ? error.message
+          : "ไม่สามารถโหลดข้อมูลจากเซิร์ฟเวอร์ได้"
+      );
+    }
+  }, [user?.accessToken]);
+
+  useEffect(() => {
+    void refreshServerData();
+  }, [refreshServerData]);
 
   // Identity must come from the authenticated user only. Never fabricate a
   // fallback ("investor@stax.com") — ProtectedLayout guarantees <Dashboard/>
@@ -101,17 +124,6 @@ export default function Dashboard({ userEmail }: DashboardProps) {
     },
   });
 
-  // Reset user-scoped in-memory state the moment the authenticated user changes
-  // (A -> B) so the next render can never reuse the previous user's data. This
-  // is defensive; normal logout already unmounts <Dashboard/> via ProtectedLayout.
-  const prevUserId = useRef<string | undefined>(user?.id);
-  useEffect(() => {
-    if (prevUserId.current !== user?.id) {
-      prevUserId.current = user?.id;
-      setTransactions([]);
-    }
-  }, [user?.id]);
-
   // ตัดชื่อย่อจากอีเมล (ส่วนก่อน @) แล้วปรับให้ตัวแรกเป็นตัวใหญ่
   const emailPrefix = resolvedEmail.split("@")[0] || "ผู้ใช้งาน";
   const displayName =
@@ -121,151 +133,6 @@ export default function Dashboard({ userEmail }: DashboardProps) {
     logout(); // เคลียร์สถานะ login (+ localStorage) ใน AuthProvider
     navigate("/login", { replace: true }); // เด้งกลับไปหน้า Login
   };
-
-  const refreshFromServer = useCallback(async () => {
-    if (!user?.accessToken) return;
-    try {
-      const rows = await fetchCapitalLedger(user.accessToken);
-      setTransactions(capitalLedgerToTransactions(rows));
-    } catch {
-      // Server is authoritative; on transient failure keep the last known state.
-    }
-  }, [user?.accessToken]);
-
-  // Load + refresh the ledger from the server (authoritative). This runs on
-  // mount and again whenever a document is (re)imported, so the dashboard never
-  // accumulates a second independent copy of the imported session.
-  useEffect(() => {
-    void refreshFromServer();
-  }, [refreshFromServer, docsRefreshKey]);
-
-  // Fetch today's real external USD/THB exchange rate as a FALLBACK for the
-  // "อัตราแลกเปลี่ยน" card. Statement-sourced rates (fxRateStatement) inside the
-  // ledger take priority in pickRelevantRate(); this external entry is only used
-  // when the ledger has no statement rate. The server is authoritative: on
-  // failure/weekend/holiday it returns { available: false }, never a fabricated
-  // rate, and the UI never blames the external rate provider.
-  useEffect(() => {
-    if (!user?.accessToken) return;
-    let cancelled = false;
-    fetchExchangeRate(user.accessToken, "USD")
-      .then((entry) => {
-        if (!cancelled) setFxRateEntry(entry);
-      })
-      .catch(() => {
-        if (!cancelled) setFxRateEntry({ available: false, date: "", reason: "network error" });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [user?.accessToken]);
-
-  // Fetch the Tax Core Engine result for the user's transactions. The tax base
-  // (ฐานภาษี) card renders the authoritative totalTaxableAmountThb only; when
-  // the engine reports nothing computable the card stays truthful (NOT
-  // AVAILABLE) instead of inventing an estimate.
-  useEffect(() => {
-    if (!user?.accessToken) return;
-    if (transactions.length === 0) {
-      setTaxRecon(null);
-      return;
-    }
-    let cancelled = false;
-    fetchTaxRecon(
-      user.accessToken,
-      transactions.map((t) => t.id)
-    )
-      .then((summary) => {
-        if (!cancelled) setTaxRecon(summary);
-      })
-      .catch(() => {
-        if (!cancelled) setTaxRecon(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [user?.accessToken, transactions]);
-
-  // Fetch neutral AI insights about imported activity (best-effort). Falls back
-  // to a truthful unavailable state when Gemini is not configured.
-  useEffect(() => {
-    if (!user?.accessToken) return;
-    let cancelled = false;
-    fetchAiAnalysis(user.accessToken)
-      .then((data) => {
-        if (!cancelled) setAiInsight(data);
-      })
-      .catch(() => {
-        if (!cancelled)
-          setAiInsight({ available: false, code: "NETWORK_ERROR", errors: [] });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [user?.accessToken]);
-
-  // After an import the server is authoritative; refresh rather than append the
-  // locally parsed copy into persistent UI state.
-  const handleImportFromPdf = () => {
-    setDocsRefreshKey((k) => k + 1);
-  };
-
-  const sortedTransactions = [...transactions].sort((a, b) =>
-    sortOrder === "newest"
-      ? a.date < b.date
-        ? 1
-        : -1
-      : a.date > b.date
-      ? 1
-      : -1
-  );
-
-  const visibleTransactions = showAllTransactions
-    ? sortedTransactions
-    : sortedTransactions.slice(0, 5);
-
-  const toggleSortOrder = () => {
-    setSortOrder((prev) => (prev === "newest" ? "oldest" : "newest"));
-  };
-
-  // คำนวณ "กำไร/ขาดทุนสุทธิ" แบบเรียลไทม์จากค่า authoritative ของ Backend เท่านั้น:
-  // pnlAmount == realizedGainLossThb (บาท) ของ SELL ที่คำนวณได้จริง — ไม่มีการ
-  // คูณอัตราแลกเปลี่ยนซ้ำ และไม่มีการปรุงตัวเลขขึ้นเอง รายการที่คำนวณไม่ได้
-  // (pnlAmount null) จะไม่ถูกนับรวม แต่จะแสดงคำเตือนอย่างตรงไปตรงมา
-  const netRealizedThb = sumAuthoritativeGainThb(transactions);
-  const computableGainRows = countComputableGainRows(transactions);
-  const hasNonComputablePnl = hasNonComputableGain(transactions);
-
-  // กำไรรวม (เฉพาะรายการบวก) ใช้เป็นตัวหารสำหรับเปอร์เซ็นต์เท่านั้น
-  const positiveGainThb = transactions.reduce((sum, t) => {
-    if (t.pnlAmount === undefined || t.pnlAmount === null) return sum;
-    if (t.pnlAmount <= 0) return sum;
-    return sum + t.pnlAmount;
-  }, 0);
-
-  const pnlPercent =
-    positiveGainThb > 0 ? (netRealizedThb / positiveGainThb) * 100 : 0;
-
-  const isGain = netRealizedThb >= 0;
-
-  // อัตราแลกเปลี่ยนที่ใช้จริง — ลำดับ: fxRateStatement (จาก Statement) →
-  // Historical FX Provider (ภายนอก) → THB = 1 (ฐานสกุลเงิน) ไม่มีอัตราปลอม
-  const rateInfo = pickRelevantRate(
-    transactions,
-    fxRateEntry?.available && fxRateEntry.rate != null
-      ? { rate: fxRateEntry.rate, date: fxRateEntry.date }
-      : null
-  );
-
-  const taxBaseComputable =
-    taxRecon?.computable === true &&
-    taxRecon.totalTaxableAmountThb != null;
-
-  // จำนวน SELL ที่ไม่มีต้นทุนอ้างอิงจริง ๆ (ไม่นับเงินฝาก/ถอน หรือ BUY ซึ่งไม่ใช่
-  // รายการที่ "ควร" คำนวณกำไร) สำหรับข้อความเตือนบนการ์ดฐานภาษี
-  const genuinelyNonComputableSells = (taxRecon?.transactions ?? []).filter(
-    (t) => t.classification === "non-computable"
-  ).length;
 
   return (
     <div
@@ -302,6 +169,73 @@ export default function Dashboard({ userEmail }: DashboardProps) {
               {item.label}
             </button>
           ))}
+
+          {/* เมนูย่อยของบัญชีแยกประเภท: ภาพรวม + 5 หมวด + รายงาน */}
+          {activeNav === "gl" && (
+            <div className="pt-2 space-y-1">
+              <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-400">
+                ภาพรวม
+              </p>
+              <button
+                type="button"
+                onClick={() => setGlTab("overview")}
+                className={`w-full flex items-center gap-3 pl-8 pr-3 py-2 rounded-lg text-[13px] font-medium transition ${
+                  glTab === "overview"
+                    ? "bg-blue-50 text-blue-900"
+                    : "text-gray-500 hover:bg-gray-50"
+                }`}
+              >
+                ภาพรวมการเงิน
+              </button>
+
+              <p className="px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-gray-400">
+                หมวดหมู่
+              </p>
+              {([
+                { id: "ASSET", label: "สินทรัพย์" },
+                { id: "LIABILITY", label: "หนี้สิน" },
+                { id: "EQUITY", label: "ส่วนทุน" },
+                { id: "INCOME", label: "รายได้" },
+                { id: "EXPENSE", label: "ค่าใช้จ่าย" },
+              ] as { id: GlTab; label: string }[]).map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setGlTab(item.id)}
+                  className={`w-full flex items-center gap-3 pl-8 pr-3 py-2 rounded-lg text-[13px] font-medium transition ${
+                    glTab === item.id
+                      ? "bg-blue-50 text-blue-900"
+                      : "text-gray-500 hover:bg-gray-50"
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
+              <div className="my-1 border-t border-gray-100" />
+              <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-400">
+                รายงาน
+              </p>
+              {([
+                { id: "journal", label: "บันทึกรายการ" },
+                { id: "trial", label: "งบทดลอง" },
+                { id: "income", label: "งบกำไรขาดทุน" },
+                { id: "balance", label: "งบดุล" },
+              ] as { id: GlTab; label: string }[]).map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setGlTab(item.id)}
+                  className={`w-full flex items-center gap-3 pl-8 pr-3 py-2 rounded-lg text-[13px] font-medium transition ${
+                    glTab === item.id
+                      ? "bg-blue-50 text-blue-900"
+                      : "text-gray-500 hover:bg-gray-50"
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          )}
         </nav>
 
         <div className="px-3 py-4 border-t border-gray-100 space-y-1">
@@ -359,359 +293,74 @@ export default function Dashboard({ userEmail }: DashboardProps) {
 
         {/* Scrollable body */}
         <main className="flex-1 overflow-y-auto p-6 space-y-6">
-          {activeNav === "users" ? (
-            <DailyCalendarExport transactions={transactions} />
-          ) : activeNav === "ledger" ? (
-            <CapitalLedgerPage />
-          ) : activeNav === "fx" ? (
-            <FxAiPage
-              transactions={transactions}
-              onImport={handleImportFromPdf}
-              onDocumentSaved={() => setDocsRefreshKey((k) => k + 1)}
-            />
-          ) : activeNav === "settings" ? (
-            <SettingsPage onLogout={handleLogout} />
-          ) : activeNav === "archive" ? (
-            <StatementArchivePage
-              onDocumentDeleted={() => setDocsRefreshKey((k) => k + 1)}
+          {selectedSymbol ? (
+            <StockDetailPage
+              symbol={selectedSymbol}
+              onBack={() => setSelectedSymbol(null)}
             />
           ) : (
             <>
-              {/* Welcome banner */}
-              <div className="bg-linear-to-br from-blue-900 to-blue-950 rounded-2xl px-6 py-5 text-white">
-                <p className="text-xs text-blue-300 mb-1">เซสชั่นนี้ของคุณ</p>
-                <h1 className="text-xl font-semibold mb-1.5">
-                  ยินดีต้อนรับกลับเข้าสู่ระบบ, {displayName}
-                </h1>
-                <p className="text-sm text-blue-200">
-                  เชื่อได้ว่าการควบคุมและกำกับดูแลบัญชีการเงินคลังโรงเรือน 3
-                </p>
-              </div>
-
-              {/* Stat cards */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div className="bg-white rounded-xl border border-gray-100 p-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-xs text-gray-400">
-                      กำไร/ขาดทุนสุทธิ (realized, บาท)
-                    </span>
-                    <span
-                      className={`text-xs font-medium px-1.5 py-0.5 rounded ${
-                        computableGainRows > 0
-                          ? isGain
-                            ? "bg-emerald-50 text-emerald-500"
-                            : "bg-red-50 text-red-500"
-                          : "bg-gray-100 text-gray-500"
-                      }`}
-                    >
-                      {computableGainRows > 0
-                        ? `${isGain ? "กำไร" : "ขาดทุน"}${
-                            pnlPercent !== 0
-                              ? ` ${isGain ? "+" : ""}${pnlPercent.toFixed(1)}%`
-                              : ""
-                          }`
-                        : "คำนวณไม่ได้"}
-                    </span>
-                  </div>
-                  <p
-                    className={`text-xl font-semibold ${
-                      computableGainRows > 0
-                        ? isGain
-                          ? "text-gray-800"
-                          : "text-red-600"
-                        : "text-gray-400"
-                    }`}
-                  >
-                    {computableGainRows > 0 ? (
-                      <>
-                        {isGain ? "+" : "-"}฿
-                        {Math.abs(netRealizedThb).toLocaleString(undefined, {
-                          minimumFractionDigits: 2,
-                          maximumFractionDigits: 2,
-                        })}
-                      </>
-                    ) : (
-                      "ยังไม่มีการคำนวณ"
-                    )}
-                  </p>
-                  <p className="text-[11px] text-gray-400 mt-3 leading-relaxed">
-                    {computableGainRows > 0 ? (
-                      hasNonComputablePnl ? (
-                        "มีบางรายการที่ยังคำนวณไม่ได้ (ไม่นับรวมในยอด)"
-                      ) : (
-                        "อ้างอิงจากรายการกำไร/ขาดทุนที่คำนวณได้จริง"
-                      )
-                    ) : (
-                      "ยังไม่มีรายการกำไร/ขาดทุนที่คำนวณได้ในสมุดบัญชี"
-                    )}
-                  </p>
-                  <div className="h-1.5 bg-gray-100 rounded-full mt-3 overflow-hidden">
-                    <div
-                      className={`h-full rounded-full ${
-                        isGain ? "bg-emerald-400" : "bg-red-400"
-                      }`}
-                      style={{ width: `${Math.min(Math.abs(pnlPercent), 100)}%` }}
+              {activeNav === "dashboard" && (
+                <>
+                  {ledgerError && (
+                    <div className="bg-amber-50 border border-amber-200 text-amber-700 text-sm px-4 py-3 rounded-lg">
+                      โหลดข้อมูลสำหรับหน้าหลักไม่สำเร็จ: {ledgerError}
+                    </div>
+                  )}
+                  {!ledgerError && (
+                    <DashboardHomePage
+                      transactions={serverTransactions}
+                      documents={serverDocuments}
+                      onNavigate={(nav) => setActiveNav(nav)}
+                      onOpenSymbol={(symbol) => setSelectedSymbol(symbol)}
                     />
-                  </div>
-                </div>
-
-                <div className="bg-white rounded-xl border border-gray-100 p-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-xs text-gray-400">
-                      อัตราแลกเปลี่ยนที่ใช้จริง
-                    </span>
-                    <span
-                      className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-                        rateInfo.rate != null
-                          ? "bg-emerald-50 text-emerald-600"
-                          : "bg-amber-50 text-amber-600"
-                      }`}
-                    >
-                      {rateInfo.source === "statement"
-                        ? "จาก Statement"
-                        : rateInfo.source === "external"
-                          ? "จาก Historical FX Provider"
-                          : rateInfo.source === "base"
-                            ? "ฐานสกุลเงิน"
-                            : "ไม่พร้อมใช้งาน"}
-                    </span>
-                  </div>
-                  <p className="text-xl font-semibold text-gray-800">
-                    {rateInfo.rate != null ? (
-                      <>
-                        {rateInfo.base}/THB ฿
-                        {rateInfo.rate.toLocaleString(undefined, {
-                          minimumFractionDigits: 2,
-                          maximumFractionDigits: 4,
-                        })}
-                      </>
-                    ) : (
-                      "ยังไม่มีข้อมูลอัตราแลกเปลี่ยน"
-                    )}
-                  </p>
-                  <p className="text-[11px] text-gray-400 mt-3 leading-relaxed">
-                    {rateInfo.source === "statement"
-                      ? `แหล่งที่มา: Statement${
-                          rateInfo.date ? ` (วันที่ ${rateInfo.date})` : ""
-                        }`
-                      : rateInfo.source === "external"
-                        ? `แหล่งที่มา: Historical FX Provider${
-                            rateInfo.date ? ` (วันที่ ${rateInfo.date})` : ""
-                          }`
-                        : rateInfo.source === "base"
-                          ? "อัตรา THB/THB = 1 (ใช้บาทเป็นฐาน)"
-                          : "ยังไม่มีข้อมูลอัตราแลกเปลี่ยนสำหรับรายการที่นำเข้า"}
-                  </p>
-                  <p className="text-[10px] text-gray-300 mt-1">
-                    อัตราในแต่ละธุรกรรมอาจแตกต่างจากค่าที่แสดง
-                  </p>
-                </div>
-
-                <div className="bg-white rounded-xl border border-gray-100 p-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-xs text-gray-400">
-                      ฐานภาษีที่คำนวณได้
-                    </span>
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium">
-                      {taxBaseComputable
-                        ? "คำนวณได้"
-                        : taxRecon === null
-                          ? "กำลังโหลด..."
-                          : "NOT AVAILABLE"}
-                    </span>
-                  </div>
-                  <p className="text-xl font-semibold text-gray-800">
-                    {taxBaseComputable ? (
-                      <>฿{taxRecon!.totalTaxableAmountThb}</>
-                    ) : (
-                      <span className="text-gray-400">
-                        {taxRecon === null
-                          ? "กำลังโหลด..."
-                          : "ยังไม่มีฐานภาษีที่คำนวณได้"}
-                      </span>
-                    )}
-                  </p>
-                  <p className="text-[11px] text-gray-400 mt-3 leading-relaxed">
-                    {taxBaseComputable
-                      ? `Tax Core Engine คำนวณจากรายการขายที่ยืนยันได้${
-                          genuinelyNonComputableSells > 0
-                            ? ` (SELL ${genuinelyNonComputableSells} รายการยังไม่มีต้นทุนอ้างอิง)`
-                            : ""
-                        }`
-                      : taxRecon === null
-                        ? "กำลังติดต่อ Tax Core Engine..."
-                        : "ไม่มีรายการกำไร/ขาดทุนที่คำนวณได้เพียงพอ (ข้อมูลต้นทุนไม่ครบถ้วน)"}
-                  </p>
-                </div>
-              </div>
-
-              {/* Table + right column */}
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                {/* Transaction table */}
-                <div className="lg:col-span-2 bg-white rounded-xl border border-gray-100 overflow-hidden">
-                  <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
-                    <h2 className="text-sm font-semibold text-gray-800">
-                      สมุดบัญชีเงินทุน
-                    </h2>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={toggleSortOrder}
-                        className="flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
-                        title={
-                          sortOrder === "newest"
-                            ? "กำลังเรียง: ล่าสุด → เก่าสุด"
-                            : "กำลังเรียง: เก่าสุด → ล่าสุด"
-                        }
-                      >
-                        <ArrowUpDown className="w-3.5 h-3.5" />
-                        {sortOrder === "newest" ? "ล่าสุดก่อน" : "เก่าสุดก่อน"}
-                      </button>
-                      <button
-                        type="button"
-                        className="flex items-center gap-1.5 bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium px-3 py-2 rounded-lg transition"
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                        เพิ่มรายการใหม่
-                      </button>
-                    </div>
-                  </div>
-
-                  {sortedTransactions.length === 0 ? (
-                    <div className="px-5 py-12 text-center">
-                      <BookOpen className="w-8 h-8 text-gray-300 mx-auto mb-3" />
-                      <p className="text-sm font-medium text-gray-600">
-                        ยังไม่มีรายการในสมุดบัญชี
-                      </p>
-                      <p className="text-xs text-gray-400 mt-1">
-                        ลากไฟล์ PDF statement มาที่ช่องด้านขวา หรือกด "เพิ่มรายการใหม่" เพื่อเริ่มต้น
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="overflow-x-auto">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-left text-xs text-gray-400 border-b border-gray-100">
-                          <th className="px-5 py-3 font-medium">วันที่</th>
-                          <th className="px-5 py-3 font-medium">รายการ</th>
-                          <th className="px-5 py-3 font-medium">เงินเข้า</th>
-                          <th className="px-5 py-3 font-medium">เงินออก</th>
-                          <th className="px-5 py-3 font-medium">อัตรา</th>
-                          <th className="px-5 py-3 font-medium text-right">
-                            จัดการ
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {visibleTransactions.map((t) => (
-                          <tr
-                            key={t.id}
-                            className="border-b border-gray-50 last:border-0 hover:bg-gray-50/60 transition"
-                          >
-                            <td className="px-5 py-3.5 text-gray-500 whitespace-nowrap">
-                              {t.date}
-                            </td>
-                            <td className="px-5 py-3.5">
-                              <p className="text-gray-800 font-medium">
-                                {t.description}
-                              </p>
-                              {t.subLabel && (
-                                <p className="text-xs text-gray-400">
-                                  {t.subLabel}
-                                </p>
-                              )}
-                            </td>
-                            <td className="px-5 py-3.5 text-emerald-600 font-medium whitespace-nowrap">
-                              {t.income || "-"}
-                            </td>
-                            <td className="px-5 py-3.5 text-red-500 font-medium whitespace-nowrap">
-                              {t.expense || "-"}
-                            </td>
-                            <td className="px-5 py-3.5 text-gray-500">
-                              {t.rate}
-                            </td>
-                            <td className="px-5 py-3.5">
-                              <div className="flex items-center justify-end gap-2">
-                                <button
-                                  type="button"
-                                  className="text-gray-400 hover:text-blue-800 transition"
-                                  aria-label="แก้ไขรายการ"
-                                >
-                                  <Pencil className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  className="text-gray-400 hover:text-red-600 transition"
-                                  aria-label="ลบรายการ"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                    </div>
                   )}
+                </>
+              )}
 
-                  {sortedTransactions.length > 5 && (
-                    <div className="px-5 py-3.5 text-center border-t border-gray-100">
-                      <button
-                        type="button"
-                        onClick={() => setShowAllTransactions((prev) => !prev)}
-                        className="inline-flex items-center gap-1 text-xs text-blue-800 font-medium hover:underline"
-                      >
-                        {showAllTransactions ? "ย่อรายการ" : "ดูรายการบัญชีทั้งหมด"}
-                        {showAllTransactions ? (
-                          <ChevronUp className="w-3.5 h-3.5" />
-                        ) : (
-                          <ChevronRight className="w-3.5 h-3.5" />
-                        )}
-                      </button>
-                    </div>
-                  )}
-                </div>
+              {activeNav === "gl" && (
+                <GeneralLedgerNew
+                  activeTab={glTab}
+                  onSelectTab={(t) => {
+                    setGlTab(t);
+                    setActiveNav("gl");
+                  }}
+                  onNavigateToArchive={() => setActiveNav("archive")}
+                  onOpenSymbol={(symbol) => setSelectedSymbol(symbol)}
+                />
+              )}
 
-                {/* Right column */}
-                <div className="space-y-4">
-                  <PdfStatementUploader
-                    onImport={handleImportFromPdf}
-                    onDocumentSaved={() => setDocsRefreshKey((k) => k + 1)}
-                  />
-                  <StoredDocumentsList refreshTrigger={docsRefreshKey} />
+              {activeNav === "journal" && (
+                <JournalPage
+                  onNavigateToArchive={() => setActiveNav("archive")}
+                />
+              )}
 
-                  <div className="bg-emerald-50 rounded-xl p-5">
-                    <p className="text-xs text-emerald-700 font-medium mb-1.5">
-                      ข้อเสนอแนะจาก AI
-                    </p>
-                    {aiInsight === null ? (
-                      <p className="text-sm text-emerald-900 leading-relaxed">
-                        กำลังโหลดข้อสรุปจาก AI...
-                      </p>
-                    ) : aiInsight.available && aiInsight.result ? (
-                      <>
-                        <p className="text-sm text-emerald-900 leading-relaxed">
-                          {aiInsight.result.summary}
-                        </p>
-                        {aiInsight.result.patterns.length > 0 && (
-                          <p className="text-xs text-emerald-800/90 mt-2">
-                            รูปแบบ: {aiInsight.result.patterns[0]}
-                          </p>
-                        )}
-                      </>
-                    ) : (
-                      <p className="text-sm text-emerald-900 leading-relaxed">
-                        ยังไม่มีคำแนะนำจาก AI
-                      </p>
-                    )}
-                    <p className="text-xs text-emerald-700/80 mt-2">
-                      AI ใช้วิเคราะห์โครงสร้างของ Statement เท่านั้น
-                      ไม่ใช่การคาดการณ์คำแนะนำด้านการเงิน
-                    </p>
-                  </div>
-                </div>
-              </div>
+              {activeNav === "upload" && (
+                <StatementUploadPage
+                  onNavigateToArchive={() => setActiveNav("archive")}
+                  onNavigateToOverview={() => {
+                    setGlTab("overview");
+                    setActiveNav("gl");
+                  }}
+                />
+              )}
+
+              {activeNav === "archive" && <StatementArchivePage />}
+
+              {activeNav === "cashflow" && (
+                <CashFlowPage onBack={() => setActiveNav("dashboard")} />
+              )}
+
+              {activeNav === "trading" && (
+                <TradingJournalPage
+                  onOpenSymbol={(symbol) => setSelectedSymbol(symbol)}
+                />
+              )}
+
+              {activeNav === "settings" && (
+                <SettingsPage onLogout={handleLogout} />
+              )}
             </>
           )}
 
@@ -730,15 +379,6 @@ export default function Dashboard({ userEmail }: DashboardProps) {
           </div>
         </main>
       </div>
-
-      {/* Floating action button (mobile) */}
-      <button
-        type="button"
-        className="md:hidden fixed bottom-5 right-5 w-12 h-12 rounded-full bg-blue-900 text-white flex items-center justify-center shadow-lg"
-        aria-label="เพิ่มรายการใหม่"
-      >
-        <Plus className="w-5 h-5" />
-      </button>
     </div>
   );
 }
