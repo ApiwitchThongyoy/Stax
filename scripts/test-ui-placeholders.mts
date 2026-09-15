@@ -910,9 +910,9 @@ ok(
   "holdings card exposes ราคาปัจจุบัน / มูลค่าตลาด / กำไร-ขาดทุน columns"
 );
 ok(
-  dashboardPage.includes("พักไว้เฉพาะการแสดงผล") &&
-    dashboardPage.includes("ไม่เกี่ยวข้องกับการคำนวณ"),
-  "holdings card labels the live prices as display-only, never tax/ledger input"
+  dashboardPage.includes("เพื่อแสดงผลเท่านั้น") &&
+    dashboardPage.includes("เพื่อแสดงผลประกอบ"),
+  "holdings card labels the live prices as display-only"
 );
 ok(
   /"crons":\s*\[/.test(vercelFile) &&
@@ -1241,7 +1241,7 @@ ok(
   stockDetailPage.includes("กำไร/ขาดทุน (ยังไม่รับรู้)") &&
     stockDetailPage.includes("กำไร/ขาดทุนที่รับรู้แล้ว") &&
     stockDetailPage.includes("SELL ที่ยังคำนวณไม่ได้") &&
-    stockDetailPage.includes("ไม่เกี่ยวข้องกับการคำนวณฐานภาษี"),
+    stockDetailPage.includes("เพื่อแสดงผลประกอบเท่านั้น"),
   "Stock detail shows unrealized + realized P&L honestly (non-computable rows explicit)"
 );
 ok(
@@ -1835,7 +1835,7 @@ ok(
 ok(
   portfolioChart.includes("missingCount") &&
     portfolioChart.includes("ยังคำนวณสัดส่วนพอร์ตไม่ได้") &&
-    portfolioChart.includes("ไม่เกี่ยวข้องกับการคำนวณฐานภาษี"),
+    portfolioChart.includes("เพื่อแสดงผลเท่านั้น"),
   "PortfolioChart honestly excludes holdings without a daily close and labels prices display-only"
 );
 ok(
@@ -1902,6 +1902,24 @@ ok(
     adminDashboard.includes('placeholder="ค้นหาชื่อไฟล์ ผู้ใช้ หรือกิจกรรม"') &&
     adminDashboard.includes("พบ {filteredUploadLog.length + filteredAccessLog.length} รายการ"),
   "Admin audit tab has one search box filtering both uploads + access logs client-side"
+);
+
+// --- 18. No tax-base (ฐานภาษี) feature remnants in UI/README ---
+// The Tax Core engine was removed from the project: no route, no engine, no
+// fetchTaxRecon anywhere. These asserts lock that in — display texts must not
+// reference a tax-base calculation that no longer exists. (Withholding-tax
+// expense rows from statements are real data, not the removed feature.)
+ok(
+  !dashboardPage.includes("ฐานภาษี") &&
+    !portfolioChart.includes("ฐานภาษี") &&
+    !stockDetailPage.includes("ฐานภาษี") &&
+    !stockDetailPage.includes("คำนวณภาษี") &&
+    !dashboardPage.includes("คำนวณภาษี"),
+  "No ฐานภาษี/คำนวณภาษี wording remains in Dashboard/PortfolioChart/StockDetail UI"
+);
+ok(
+  !read("README.md").includes("ฐานภาษี"),
+  "README does not advertise a tax-base feature"
 );
 
 console.log("\n================ SUMMARY ================");

@@ -207,8 +207,7 @@ export default function StockDetailPage({
         {quote && (
           <p className="text-[11px] text-blue-200/70 mt-2">
             ราคาวันที่ {fmtDate(quote.priceDate)} · แหล่งอ้างอิง{" "}
-            {quote.source ?? "ราคารายวัน"} — แสดงผลประกอบเท่านั้น ไม่ใช่ตัวเลข
-            เพื่อคำนวณภาษี
+            {quote.source ?? "ราคารายวัน"} — เพื่อแสดงผลประกอบเท่านั้น
           </p>
         )}
       </div>
@@ -323,7 +322,7 @@ export default function StockDetailPage({
             <p className="text-[11px] text-gray-400 pt-2 border-t border-gray-50">
               (ราคาปิด − ต้นทุนเฉลี่ย) × จำนวนถืออยู่ · อิงราคาปิดรายวัน{" "}
               {quote ? `วันที่ ${fmtDate(quote.priceDate)}` : "ที่ยังไม่มี"}
-              — แสดงผลประกอบเท่านั้น ไม่เกี่ยวข้องกับการคำนวณฐานภาษี
+              — เพื่อแสดงผลประกอบเท่านั้น
             </p>
           </div>
         </section>
