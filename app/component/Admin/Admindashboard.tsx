@@ -107,7 +107,6 @@ interface AdminStatsPayload {
     total: number;
     fxProvider?: { configured: boolean };
     gemini?: { configured: boolean };
-    taxEngine?: { configured: boolean };
   };
 }
 
@@ -212,6 +211,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [showAllUploads, setShowAllUploads] = useState(false);
   const [showAllAccessLogs, setShowAllAccessLogs] = useState(false);
+  const [auditSearch, setAuditSearch] = useState("");
 
   const emailFromLogin = (location.state as { email?: string } | null)?.email;
   const resolvedEmail = userEmail || emailFromLogin || "admin@stax.com";
@@ -448,16 +448,31 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
   const apiTotal = stats?.apiStatus?.total ?? null;
   const fxProviderConfigured = stats?.apiStatus?.fxProvider?.configured ?? null;
   const geminiConfigured = stats?.apiStatus?.gemini?.configured ?? null;
-  const taxEngineConfigured = stats?.apiStatus?.taxEngine?.configured ?? null;
 
   const apiRows: { key: string; label: string; ok: boolean | null }[] = [
     { key: "fx", label: "Historical FX Provider (อัตราแลกเปลี่ยนย้อนหลัง)", ok: fxProviderConfigured },
     { key: "gemini", label: "Gemini API (การวิเคราะห์ Statement)", ok: geminiConfigured },
-    { key: "tax", label: "Tax Core Engine (ในตัว)", ok: taxEngineConfigured },
   ];
 
-  const visibleUploads = showAllUploads ? uploadLog : uploadLog.slice(0, 4);
-  const visibleAccessLogs = showAllAccessLogs ? accessLog : accessLog.slice(0, 4);
+  const auditSearching = auditSearch.trim() !== "";
+  const filteredUploadLog = auditSearching
+    ? uploadLog.filter((e) =>
+        [e.fileName, e.uploadedBy, e.status]
+          .join(" ")
+          .toLowerCase()
+          .includes(auditSearch.trim().toLowerCase())
+      )
+    : uploadLog;
+  const filteredAccessLog = auditSearching
+    ? accessLog.filter((e) =>
+        [e.user, e.action, e.device]
+          .join(" ")
+          .toLowerCase()
+          .includes(auditSearch.trim().toLowerCase())
+      )
+    : accessLog;
+  const visibleUploads = showAllUploads ? filteredUploadLog : filteredUploadLog.slice(0, 4);
+  const visibleAccessLogs = showAllAccessLogs ? filteredAccessLog : filteredAccessLog.slice(0, 4);
 
   const uploadStatusBreakdown: { name: string; value: number }[] = [];
 
@@ -911,6 +926,33 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
           )}
 
           {activeSection === "audit" && (
+            <>
+            <div className="flex flex-wrap items-center gap-3 mb-6">
+              <div className="relative flex-1 min-w-[220px]">
+                <Search className="w-3.5 h-3.5 text-gray-300 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={auditSearch}
+                  onChange={(e) => setAuditSearch(e.target.value)}
+                  placeholder="ค้นหาชื่อไฟล์ ผู้ใช้ หรือกิจกรรม"
+                  className="w-full text-sm bg-white border border-gray-200 rounded-lg pl-9 pr-3 py-2 outline-none focus:border-blue-900 focus:ring-2 focus:ring-blue-900/10"
+                />
+              </div>
+              {auditSearching && (
+                <>
+                  <span className="text-xs text-gray-500">
+                    พบ {filteredUploadLog.length + filteredAccessLog.length} รายการ
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setAuditSearch("")}
+                    className="bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
+                  >
+                    ล้าง
+                  </button>
+                </>
+              )}
+            </div>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {/* Upload history */}
               <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
@@ -945,7 +987,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     </div>
                   ))}
                 </div>
-                {uploadLog.length > 4 && (
+                {filteredUploadLog.length > 4 && (
                   <div className="px-5 py-3 text-center border-t border-gray-100">
                     <button
                       type="button"
@@ -998,7 +1040,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                     );
                   })}
                 </div>
-                {accessLog.length > 4 && (
+                {filteredAccessLog.length > 4 && (
                   <div className="px-5 py-3 text-center border-t border-gray-100">
                     <button
                       type="button"
@@ -1016,6 +1058,7 @@ export default function AdminDashboard({ userEmail }: AdminDashboardProps) {
                 )}
               </div>
             </div>
+            </>
           )}
 
           {activeSection === "settings" && (

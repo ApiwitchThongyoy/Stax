@@ -38,10 +38,12 @@ const uploadRoute = await import("../app/routes/api/statements/upload");
 const documentsRoute = await import("../app/routes/api/documents");
 const documentRoute = await import("../app/routes/api/documents.$id");
 const documentDownloadRoute = await import("../app/routes/api/documents.$id.download");
-const taxCalculateRoute = await import("../app/routes/api/tax/calculate");
-const exportRoute = await import("../app/routes/api/export");
+const documentTransactionsRoute = await import("../app/routes/api/documents.$id.transactions");
 const exchangeRatesRoute = await import("../app/routes/api/exchange-rates");
-const analysisRoute = await import("../app/routes/api/analysis");
+const accountsRoute = await import("../app/routes/api/accounts");
+const journalRoute = await import("../app/routes/api/journal");
+const journalReverseRoute = await import("../app/routes/api/journal.$id.reverse");
+const trialBalanceRoute = await import("../app/routes/api/reports/trial-balance");
 
 const { AuditAction } = await import("../app/lib/audit-log");
 
@@ -830,6 +832,280 @@ async function main() {
     }
   }
 
+  // ================= REG: STATEMENT PREVIEW (แสดงรายละเอียดก่อน + OK ค่อยนำเข้า) =================
+  // POST /api/v1/statements/preview must return the FULL parsed rows + stats for
+  // the "ตรวจสอบเอกสารก่อนนำเข้า" screen WITHOUT persisting anything (no storage
+  // object, no documents row, no Capital_Transactions, no cost-basis write).
+  // After the real commit, the same preview must return a duplicate payload so
+  // the review screen never commits twice.
+  {
+    const previewRoute = await import("../app/routes/api/statements/preview");
+    const statementLines = [
+      "TRADE RECORDS",
+      "Currency: USD",
+      "USD/THB = 35.42",
+      "VRMAX",
+      "02/01/2026 10:00:00,GMT+07 02/01/2026 BUY 100 10.00 1000.00 1000.00 1.00 0.07 NASDAQ",
+      "VRMAX",
+      "03/01/2026 10:00:00,GMT+07 03/01/2026 BUY 100 20.00 2000.00 2000.00 1.50 0.10 NYSE",
+      "VRMAX",
+      "04/01/2026 10:00:00,GMT+07 04/01/2026 SELL 50 30.00 1500.00 1497.93 1.00 0.07 NASDAQ",
+      "PORTFOLIO SUMMARY",
+    ];
+    const previewFile = new File(
+      [makePdf(statementLines) as BlobPart],
+      "w2-preview-test.pdf",
+      { type: "application/pdf" }
+    );
+    const previewAs = (token: string) => {
+      const fd = new FormData();
+      fd.append("file", previewFile);
+      return previewRoute.action({
+        request: new Request("http://test.local/api/v1/statements/preview", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }),
+      } as never);
+    };
+    const commitAs = (token: string) => {
+      const fd = new FormData();
+      fd.append("file", previewFile);
+      return uploadRoute.action({
+        request: new Request("http://test.local/api/v1/statements/upload", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }),
+      } as never);
+    };
+    if (tokenA && userARow) {
+      // clean slate for the fixture (any previous run's leftovers)
+      const priorPreviewDocs = await client`SELECT id FROM documents WHERE user_id = ${userARow.id} AND original_name = 'w2-preview-test.pdf'`;
+      for (const d of priorPreviewDocs) {
+        await client`DELETE FROM "Capital_Transactions" WHERE source_document_id = ${d.id} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM documents WHERE id = ${d.id} AND user_id = ${userARow.id}`;
+      }
+
+      const txBeforePreview = await client`SELECT COUNT(*)::int AS n FROM "Capital_Transactions" WHERE user_id = ${userARow.id}`;
+      const basisBeforePreview = await client`SELECT COUNT(*)::int AS n FROM cost_basis_state WHERE user_id = ${userARow.id}`;
+      const docsBeforePreview = await client`SELECT COUNT(*)::int AS n FROM documents WHERE user_id = ${userARow.id}`;
+
+      // 1. Preview (read-only) on a fresh file.
+      const prev = await previewAs(tokenA);
+      const prevBody = (await prev.json()) as {
+        data?: {
+          preview?: boolean;
+          duplicate?: boolean;
+          duplicateDecision?: string;
+          extracted?: number;
+          rows?: Array<{
+            symbol?: string | null;
+            side?: string | null;
+            transactionDate?: string;
+            transactionId?: string;
+          }>;
+          stats?: { buyCount?: number; sellCount?: number; cashCount?: number };
+        };
+      };
+      ok(
+        prev.status === 200 && prevBody.data?.preview === true,
+        "REG-preview: preview endpoint succeeds with preview:true"
+      );
+      ok(
+        !!prevBody.data?.rows && prevBody.data.rows.length >= 3,
+        "REG-preview: preview returns the FULL parsed rows (>= 3 trade rows)"
+      );
+      ok(
+        prevBody.data?.stats?.buyCount === 2 &&
+          prevBody.data?.stats?.sellCount === 1,
+        "REG-preview: preview stats classify the 2 BUY + 1 SELL correctly"
+      );
+      ok(
+        prevBody.data?.duplicateDecision === "fresh",
+        "REG-preview: fresh file is labeled 'fresh' (not rebuilt/duplicate)"
+      );
+      ok(
+        prevBody.data?.rows?.every(
+          (r) => r.symbol === null || r.symbol === "VRMAX"
+        ) === true &&
+          prevBody.data?.rows?.every((r) => !!r.transactionId) === true,
+        "REG-preview: preview rows carry the parser's symbol + stable row ids for React keys"
+      );
+
+      // 2. Preview must NOT write anything (rows/cache/documents unchanged).
+      const txAfterPreview = await client`SELECT COUNT(*)::int AS n FROM "Capital_Transactions" WHERE user_id = ${userARow.id}`;
+      const basisAfterPreview = await client`SELECT COUNT(*)::int AS n FROM cost_basis_state WHERE user_id = ${userARow.id}`;
+      const docsAfterPreview = await client`SELECT COUNT(*)::int AS n FROM documents WHERE user_id = ${userARow.id}`;
+      ok(
+        txAfterPreview[0]?.n === txBeforePreview[0]?.n &&
+          basisAfterPreview[0]?.n === basisBeforePreview[0]?.n &&
+          docsAfterPreview[0]?.n === docsBeforePreview[0]?.n,
+        "REG-preview: preview persists NOTHING (no rows, no cache, no document)"
+      );
+
+      // 3. Real commit still imports the rows after the preview step.
+      const commit = await commitAs(tokenA);
+      const commitBody = (await commit.json()) as {
+        data?: { saved?: number; documentId?: string };
+      };
+      ok(
+        commit.status === 200 && (commitBody.data?.saved ?? 0) >= 3,
+        "REG-preview: the real upload after preview commits the rows"
+      );
+
+      // 4. Previewing the now-imported file returns a duplicate payload.
+      const prevAgain = await previewAs(tokenA);
+      const prevAgainBody = (await prevAgain.json()) as {
+        data?: { duplicate?: boolean; code?: string };
+      };
+      ok(
+        prevAgainBody.data?.duplicate === true &&
+          prevAgainBody.data?.code === "STATEMENT_ALREADY_IMPORTED",
+        "REG-preview: preview of an already-imported file reports a duplicate (no commit)"
+      );
+
+      // defensive cleanup for any partial state
+      if (commitBody.data?.documentId) {
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${userARow.id} AND source_document_id = ${commitBody.data.documentId}`;
+        await client`DELETE FROM documents WHERE id = ${commitBody.data.documentId} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM notifications WHERE entity_id = ${commitBody.data.documentId}`;
+      }
+    }
+  }
+
+  // ================= REG: STATEMENT TRANSACTION VIEW (per-document records) =================
+  // GET /api/v1/documents/:id/transactions reads the committed ledger rows that
+  // one stored statement produced (server-authoritative, no re-parse), with
+  // ownership scoping; the documents list carries the aggregate transactionCount.
+  {
+    const docLines = [
+      "TRADE RECORDS",
+      "Currency: USD",
+      "USD/THB = 35.42",
+      "VRMAX",
+      "02/01/2026 10:00:00,GMT+07 02/01/2026 BUY 100 10.00 1000.00 1000.00 1.00 0.07 NASDAQ",
+      "VRMAX",
+      "03/01/2026 10:00:00,GMT+07 03/01/2026 BUY 100 20.00 2000.00 2000.00 1.50 0.10 NYSE",
+      "VRMAX",
+      "04/01/2026 10:00:00,GMT+07 04/01/2026 SELL 50 30.00 1500.00 1497.93 1.00 0.07 NASDAQ",
+      "PORTFOLIO SUMMARY",
+    ];
+    const docFile = new File([makePdf(docLines) as BlobPart], "w2-doc-tx-view.pdf", {
+      type: "application/pdf",
+    });
+    const uploadDocTx = (token: string) => {
+      const fd = new FormData();
+      fd.append("file", docFile);
+      return uploadRoute.action({
+        request: new Request("http://test.local/api/v1/statements/upload", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }),
+      } as never);
+    };
+    if (tokenA && tokenB && userARow) {
+      // clean slate for the fixture
+      const priorDocs = await client`SELECT id FROM documents WHERE user_id = ${userARow.id} AND original_name = 'w2-doc-tx-view.pdf'`;
+      for (const d of priorDocs) {
+        await client`DELETE FROM "Capital_Transactions" WHERE source_document_id = ${d.id} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM documents WHERE id = ${d.id} AND user_id = ${userARow.id}`;
+      }
+
+      const up = await uploadDocTx(tokenA);
+      const upBody = (await up.json()) as { data?: { documentId?: string; saved?: number } };
+      ok(
+        up.status === 200 && (upBody.data?.saved ?? 0) === 3,
+        "REG-doc-tx-view: upload commits 3 rows (2 BUY + 1 SELL)"
+      );
+      const docId = upBody.data?.documentId;
+      ok(!!docId, "REG-doc-tx-view: upload returns a document id");
+
+      if (docId) {
+        // 1. Own read -> 200 with full rows + stats.
+        const own = await documentTransactionsRoute.loader({
+          request: authedRequest("GET", tokenA),
+          params: { id: docId },
+        } as never);
+        const ownBody = (await own.json()) as {
+          data?: {
+            documentName?: string;
+            transactions?: Array<{
+              side?: string | null;
+              fxRateStatement?: string | null;
+            }>;
+            stats?: {
+              total?: number;
+              buyCount?: number;
+              sellCount?: number;
+              cashCount?: number;
+              computableSellCount?: number;
+              fxRates?: string[];
+            };
+          };
+        };
+        ok(
+          own.status === 200 && ownBody.data?.documentName === "w2-doc-tx-view.pdf",
+          "REG-doc-tx-view: owner reads the document's transactions (200, name echoed)"
+        );
+        ok(
+          ownBody.data?.transactions?.length === 3,
+          "REG-doc-tx-view: all 3 committed rows are returned"
+        );
+        ok(
+          ownBody.data?.stats?.buyCount === 2 &&
+            ownBody.data?.stats?.sellCount === 1 &&
+            ownBody.data?.stats?.computableSellCount === 1 &&
+            ownBody.data?.stats?.total === 3,
+          "REG-doc-tx-view: stats are server-derived (2 BUY / 1 computable SELL / total 3)"
+        );
+        ok(
+          (ownBody.data?.stats?.fxRates ?? []).includes("35.42"),
+          "REG-doc-tx-view: statement FX 35.42 is reported among the applied rates"
+        );
+
+        // 2. Cross-user read -> safe 404 (no existence leak).
+        const cross = await documentTransactionsRoute.loader({
+          request: authedRequest("GET", tokenB),
+          params: { id: docId },
+        } as never);
+        ok(
+          cross.status === 404,
+          "REG-doc-tx-view: another user reading this document's transactions is a safe 404"
+        );
+
+        // 3. Malformed id -> 400.
+        const bad = await documentTransactionsRoute.loader({
+          request: authedRequest("GET", tokenA),
+          params: { id: "not-a-uuid" },
+        } as never);
+        ok(
+          bad.status === 400,
+          "REG-doc-tx-view: malformed document id is rejected (400)"
+        );
+
+        // 4. Documents list carries the aggregate transactionCount for the statement.
+        const list = await documentsRoute.loader({
+          request: authedRequest("GET", tokenA),
+        } as never);
+        const listBody = (await list.json()) as {
+          data?: Array<{ id?: string; transactionCount?: number }>;
+        };
+        const mine = (listBody.data ?? []).find((d) => d.id === docId);
+        ok(
+          !!mine && mine.transactionCount === 3,
+          "REG-doc-tx-view: documents list transactionCount aggregates the statement's rows"
+        );
+
+        // cleanup
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${userARow.id} AND source_document_id = ${docId}`;
+        await client`DELETE FROM documents WHERE id = ${docId} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM notifications WHERE entity_id = ${docId}`;
+      }
+    }
+  }
+
   // ================= REG: REGISTER -> LOGIN -> SESSION SMOKE =================
   {
     const { randomUUID } = await import("node:crypto");
@@ -1166,153 +1442,12 @@ async function main() {
   });
   ok(allOwned, "W2-10: every audit row's user_id belongs to a known test account");
 
-  // ================= W1-2 TESTS =================
-  console.log("\n=== W1-2: DECIMAL TAX RECONSTRUCTION API ===");
-
-  // USER A seeded transactions (raw cash in THB):
-  //  ...a1 = CASH_IN  (amount_thb 35420)
-  //  ...a2 = CASH_OUT (amount_thb 17550)
-  //
-  // SEMANTIC: the schema stores raw cash only (no cost basis / proceeds), so the
-  // API must NOT treat CASH_IN/CASH_OUT as realized gain/loss. It returns the
-  // neutral signed cash value (transactionAmountThb) and marks the tax outcome
-  // as explicitly "not computable".
-  const userA1 = "00000000-0000-0000-0000-0000000000a1";
-  const userA2 = "00000000-0000-0000-0000-0000000000a2";
-
-  const taxFor = async (token: string | undefined, ids: string[]) =>
-    taxCalculateRoute.action({
-      request: jsonBody({ transactionIds: ids }, "POST", token),
-    } as never);
-
-  // 1. reconstruct own transactions
-  const ownRes = await taxFor(tokenA, [userA1, userA2]);
-  const ownBody = (await ownRes.json()) as {
-    success?: boolean;
-    data?: {
-      computable?: boolean;
-      totalTaxableAmountThb?: string | null;
-      transactions: {
-        transactionId: string;
-        transactionAmountThb: string;
-        realizedGainLossThb?: string | null;
-        taxableAmountThb?: string | null;
-      }[];
-    };
-  };
-  ok(ownRes.status === 200 && ownBody.success === true, "W1-2: USER A tax reconstruction succeeds");
-  ok(ownBody.data?.computable === false, "W1-2: outcome is explicitly NOT computable (schema lacks cost basis)");
-  ok(ownBody.data?.totalTaxableAmountThb === null, "W1-2: no fabricated taxable total returned");
-  ok(
-    ownBody.data?.transactions?.length === 2,
-    "W1-2: exactly A's 2 transactions returned"
-  );
-  ok(
-    ownBody.data?.transactions?.every((t) => t.taxableAmountThb === null && t.realizedGainLossThb === null) === true,
-    "W1-2: no row fabricates realizedGainLossThb/taxableAmountThb from cash flow"
-  );
-  const a1Row = ownBody.data?.transactions?.find((t) => t.transactionId === userA1);
-  const a2Row = ownBody.data?.transactions?.find((t) => t.transactionId === userA2);
-  ok(a1Row?.transactionAmountThb === "35420.00", "W1-2: CASH_IN neutral signed cash = +35420.00");
-  ok(a2Row?.transactionAmountThb === "-17550.00", "W1-2: CASH_OUT neutral signed cash = -17550.00");
-
-  // 2. USER A tries to include USER B's transaction -> B's row must NOT appear
-  if (userBTxnId) {
-    const mixRes = await taxFor(tokenA, [userA1, userA2, userBTxnId]);
-    const mixBody = (await mixRes.json()) as {
-      data?: { transactions: { transactionId: string }[] };
-    };
-    const mixIds = (mixBody.data?.transactions ?? []).map((t) => t.transactionId);
-    ok(
-      !mixIds.includes(userBTxnId),
-      "W1-2/Case F: USER A cannot mix USER B's transaction through the API"
-    );
-    ok(
-      mixIds.length === 2,
-      "W1-2/Case F: only A's 2 transactions returned when foreign id included"
-    );
-
-    // 3. USER A requests ONLY USER B's transaction -> empty result
-    const onlyBRes = await taxFor(tokenA, [userBTxnId]);
-    const onlyBBody = (await onlyBRes.json()) as {
-      data?: { transactions: unknown[] };
-    };
-    ok(onlyBRes.status === 200, "W1-2/Case F: request with only foreign id still succeeds");
-    ok(
-      (onlyBBody.data?.transactions?.length ?? 0) === 0,
-      "W1-2/Case F: foreign-only request returns empty (no data leak)"
-    );
-  }
-
-  // 4. unauthenticated request is rejected
-  const anonRes = await taxFor(undefined, [userA1]);
-  ok(anonRes.status === 401, "W1-2: unauthenticated tax calc rejected (401)");
-
-  // 5. validation: missing/empty/oversized transactionIds
-  const missingRes = await taxFor(tokenA, [] as string[]);
-  ok(missingRes.status === 400, "W1-2: empty transactionIds rejected (400)");
-  const noField = await taxFor(tokenA, undefined as never);
-  ok(noField.status === 400, "W1-2: missing transactionIds rejected (400)");
-  const tooMany = await taxFor(tokenA, Array.from({ length: 501 }, (_, i) => `id-${i}`));
-  ok(tooMany.status === 400, "W1-2: oversized transactionIds rejected (400)");
-
-  // === W2-11: EXPORT + NOTIFICATIONS + HISTORICAL FX PROVIDER (MOCKED) + ANALYSIS ===
-  console.log("\n=== W2-11: EXPORT / NOTIFICATIONS / HISTORICAL FX (MOCKED) / ANALYSIS ===");
+  // === W2-11: NOTIFICATIONS + HISTORICAL FX PROVIDER (MOCKED) ===
+  console.log("\n=== W2-11: NOTIFICATIONS / HISTORICAL FX (MOCKED) ===");
   {
     const { randomUUID } = await import("node:crypto");
 
-    // ---- 1. Export: auth + user scoping + validation ----
-    if (tokenA) {
-      // unauthenticated -> 401
-      const anonExport = await exportRoute.action({
-        request: new Request("http://test.local/api/v1/export", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ format: "csv" }),
-        }),
-      } as never);
-      ok(anonExport.status === 401, "W2-11: unauthenticated export rejected (401)");
-
-      // USER A CSV export -> 200 + attachment headers + own rows only
-      const aCsv = await exportRoute.action({
-        request: jsonBody({ format: "csv" }, "POST", tokenA),
-      } as never);
-      ok(aCsv.status === 200, "W2-11: USER A CSV export succeeds (200)");
-      ok(
-        (aCsv.headers.get("Content-Type") ?? "").includes("text/csv"),
-        "W2-11: CSV export has text/csv content type"
-      );
-      const aCsvBody = Buffer.from(await aCsv.arrayBuffer()).toString("utf-8");
-      ok(
-        aCsvBody.includes("35420") && aCsvBody.includes("17550"),
-        "W2-11: USER A CSV contains A's seeded amounts"
-      );
-      ok(
-        !aCsvBody.includes("8800") && !aCsvBody.includes("35.2"),
-        "W2-11: USER A CSV does NOT contain USER B's data"
-      );
-
-      // date format validation -> 400
-      const badDate = await exportRoute.action({
-        request: jsonBody({ format: "csv", dateFrom: "2026/01/01" }, "POST", tokenA),
-      } as never);
-      ok(badDate.status === 400, "W2-11: malformed dateFrom rejected (400)");
-    }
-
-    if (tokenB) {
-      const bCsv = await exportRoute.action({
-        request: jsonBody({ format: "csv" }, "POST", tokenB),
-      } as never);
-      ok(bCsv.status === 200, "W2-11: USER B CSV export succeeds (200)");
-      const bCsvBody = Buffer.from(await bCsv.arrayBuffer()).toString("utf-8");
-      ok(bCsvBody.includes("8800"), "W2-11: USER B CSV contains B's amount");
-      ok(
-        !bCsvBody.includes("35420"),
-        "W2-11: USER B CSV does NOT contain USER A's data"
-      );
-    }
-
-    // ---- 2. Notifications: idempotency + opt-out (service level, DB-backed) ----
+    // ---- 1. Notifications: idempotency + opt-out (service level, DB-backed) ----
     if (userARow && userBRow) {
       const hidePath = await import("../app/lib/notification-service");
       const entityKey = "00000000-0000-0000-0000-00000000nt1";
@@ -1342,7 +1477,7 @@ async function main() {
       await client`DELETE FROM user_settings WHERE id = ${settingsId}`;
     }
 
-    // ---- 3. Historical FX provider with MOCKED HTTP (never a live call) ----
+    // ---- 2. Historical FX provider with MOCKED HTTP (never a live call) ----
     {
       const savedFetch = globalThis.fetch;
       const botEnv = process.env.BOT_API_KEY;
@@ -1454,44 +1589,7 @@ async function main() {
       await client`DELETE FROM exchange_rate_cache WHERE rate_date IN (${fxDate}, ${fxDateFail}, ${fxDateWeekend})`;
     }
 
-    // ---- 4. Analysis endpoint: auth + graceful unavailable (no live Gemini) ----
-    {
-      const savedGemini = process.env.GEMINI_API_KEY;
-      const savedGeminiModel = process.env.GEMINI_MODEL;
-      delete process.env.GEMINI_API_KEY;
-      delete process.env.GEMINI_MODEL;
-
-      const anonAnalysis = await analysisRoute.action({
-        request: jsonBody({}, "POST", undefined),
-      } as never);
-      ok(anonAnalysis.status === 401, "W2-11: unauthenticated analysis rejected (401)");
-
-      if (tokenA) {
-        const aAnalysis = await analysisRoute.action({
-          request: jsonBody({}, "POST", tokenA),
-        } as never);
-        const aBody = (await aAnalysis.json()) as {
-          success?: boolean;
-          data?: { available?: boolean; code?: string | null };
-        };
-        ok(
-          aAnalysis.status === 200 && aBody.success === true,
-          "W2-11: analysis returns a graceful response (200)"
-        );
-        ok(
-          aBody.data?.available === false && aBody.data?.code === "gemini_not_configured",
-          "W2-11: analysis is unavailable when Gemini not configured (no crash)"
-        );
-      }
-
-      // restore
-      if (savedGemini === undefined) delete process.env.GEMINI_API_KEY;
-      else process.env.GEMINI_API_KEY = savedGemini;
-      if (savedGeminiModel === undefined) delete process.env.GEMINI_MODEL;
-      else process.env.GEMINI_MODEL = savedGeminiModel;
-    }
-
-    // ---- 5. users.created_at set on registration ----
+    // ---- 3. users.created_at set on registration ----
     {
       const registerRoute = await import("../app/routes/api/auth/register");
       const email = `join-${randomUUID()}@test.local`;
@@ -1518,6 +1616,1574 @@ async function main() {
     }
   }
 
+  // ================= REG: GENERAL LEDGER WIRING =================
+  // Proves the double-entry backend is wired end-to-end through the REAL route
+  // modules (not direct service calls): registration seeds the default chart of
+  // accounts, a manual entry posted by account CODE resolves to the user's UUID
+  // account ids, the journal list + trial balance read back what posted,
+  // currency-mismatched entries are rejected, and reversal posts an inverted
+  // mirror. All rows are tracked and removed in CLEANUP.
+  {
+    console.log("\n=== REG: GENERAL LEDGER WIRING ===");
+    const { randomUUID } = await import("node:crypto");
+    const registerRoute = await import("../app/routes/api/auth/register");
+    const glEmail = `gl-${randomUUID()}@test.local`;
+    const glPassword = "GLPost!234";
+    const regRes = await registerRoute.action({
+      request: new Request("http://test.local/api/v1/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: glEmail, password: glPassword }),
+      }),
+    } as never);
+    const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
+    const glUserId = regJson.data?.user?.id;
+    if (!glUserId) {
+      ok(false, "REG-GL: register failed to create the ledger test user");
+    } else {
+      smokeUserIds.push(glUserId);
+      const glLogin = await loginAs(glEmail, glPassword);
+      const glToken = glLogin.data?.accessToken as string | undefined;
+      if (!glToken) {
+        ok(false, "REG-GL: registered ledger user could not log in");
+      } else {
+        // 1. Default chart of accounts seeded by registration.
+        const accountsRes = await accountsRoute.loader({
+          request: authedRequest("GET", glToken),
+        } as never);
+        const accountsBody = (await accountsRes.json()) as {
+          data?: { id: string; code: string }[];
+        };
+        const codes = (accountsBody.data ?? []).map((a) => a.code);
+        ok(codes.length >= 14, "REG-GL: default chart of accounts seeded after registration (14+)");
+        ok(
+          codes.includes("1020") && codes.includes("3010"),
+          "REG-GL: broker cash + owner-capital accounts present"
+        );
+
+        // 2. Manual entry posted by account CODE (service resolves to UUID ids).
+        const jRes = await journalRoute.action({
+          request: jsonBody(
+            {
+              entryDate: "2026-01-15",
+              description: "ฝากเงินเข้าบัญชี",
+              lines: [
+                { accountId: "1020", currency: "USD", debit: "1000.00", fxRateEffective: "35.0" },
+                { accountId: "3010", currency: "USD", credit: "1000.00", fxRateEffective: "35.0" },
+              ],
+            },
+            "POST",
+            glToken
+          ),
+        } as never);
+        const jJson = (await jRes.json()) as { data?: { entryId?: string; entryNo?: number } };
+        const entryId = jJson.data?.entryId;
+        ok(jRes.status === 201 && !!entryId, "REG-GL: manual journal entry created via route (201)");
+
+        // 3. Currency mismatch is rejected (THB line into the USD equity account).
+        const badRes = await journalRoute.action({
+          request: jsonBody(
+            {
+              entryDate: "2026-01-16",
+              description: "ผิดสกุล",
+              lines: [
+                { accountId: "1010", currency: "THB", debit: "100" },
+                { accountId: "3010", currency: "USD", credit: "100" },
+              ],
+            },
+            "POST",
+            glToken
+          ),
+        } as never);
+        ok(badRes.status === 422, "REG-GL: currency-mismatched entry rejected (422)");
+
+        // 4. Journal list reads back the posted entry with its lines.
+        if (entryId) {
+          const listRes = await journalRoute.loader({
+            request: authedRequest("GET", glToken),
+          } as never);
+          const listJson = (await listRes.json()) as {
+            data?: { id: string; lines: unknown[] }[];
+          };
+          const found = listJson.data?.find((e) => e.id === entryId);
+          ok(!!found && found.lines.length === 2, "REG-GL: journal list returns the entry with 2 lines");
+
+          // 5. Trial balance reflects the posted deposit and balances.
+          const tbRes = await trialBalanceRoute.loader({
+            request: authedRequest("GET", glToken),
+          } as never);
+          const tbJson = (await tbRes.json()) as {
+            data?: { balanced?: boolean; totalDebit?: string; totalDebitThb?: string; balancedThb?: boolean };
+          };
+          ok(
+            tbJson.data?.balanced === true && tbJson.data?.totalDebit === "1000.00",
+            "REG-GL: trial balance balanced with total 1000.00"
+          );
+          ok(
+            tbJson.data?.totalDebitThb === "35000.00" && tbJson.data?.balancedThb === true,
+            "REG-GL: trial balance THB-base total 35000.00 and balanced"
+          );
+
+          // 6. Reversal posts an inverted mirror and marks the original REVERSED.
+          const revRes = await journalReverseRoute.action({
+            request: authedRequest("POST", glToken),
+            params: { id: entryId },
+          } as never);
+          const revJson = (await revRes.json()) as { data?: { reversalEntryNo?: number } };
+          ok(
+            revRes.status === 200 && typeof revJson.data?.reversalEntryNo === "number",
+            "REG-GL: reversal posts a mirror entry (200)"
+          );
+        }
+      }
+    }
+  }
+
+  // ================= REG: TRANSACTION RECORD VIEW (ledger line -> source tx) =================
+  // A statement posting attaches sourceTransactionId to each journal line; the
+  // account-ledger route surfaces it on every line, and GET
+  // /api/v1/capital-ledgers/:id returns that single authoritative transaction
+  // (the "ดูธุรกรรม" drill-down) — owner-only, safe 404 cross-user.
+  {
+    console.log("\n=== REG: TRANSACTION RECORD VIEW ===");
+    const { randomUUID } = await import("node:crypto");
+    const registerRoute = await import("../app/routes/api/auth/register");
+    const accountLedgerRoute = await import("../app/routes/api/ledger.$accountId");
+    const { deleteStoredFile } = await import(
+      "../app/lib/storage/statement-storage"
+    );
+
+    const txrEmail = `txr-${randomUUID()}@test.local`;
+    const txrPassword = "TxRecord!234";
+    const regRes = await registerRoute.action({
+      request: new Request("http://test.local/api/v1/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: txrEmail, password: txrPassword }),
+      }),
+    } as never);
+    const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
+    const txrUserId = regJson.data?.user?.id;
+    if (!txrUserId) {
+      ok(false, "REG-TXREC: register failed to create the transaction-record user");
+    } else {
+      smokeUserIds.push(txrUserId);
+      const txrLogin = await loginAs(txrEmail, txrPassword);
+      const txrToken = txrLogin.data?.accessToken as string | undefined;
+      if (!txrToken) {
+        ok(false, "REG-TXREC: registered user could not log in");
+      } else {
+        const otherEmail = `txr-other-${randomUUID()}@test.local`;
+        const otherPass = "TxRecord-#other1";
+        const otherReg = await registerRoute.action({
+          request: new Request("http://test.local/api/v1/auth/register", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email: otherEmail, password: otherPass }),
+          }),
+        } as never);
+        const otherJson = (await otherReg.json()) as {
+          data?: { user?: { id?: string } };
+        };
+        const otherUserId = otherJson.data?.user?.id;
+        if (otherUserId) smokeUserIds.push(otherUserId);
+        const otherLogin = await loginAs(otherEmail, otherPass);
+        const otherToken = otherLogin.data?.accessToken as string | undefined;
+
+        // 1. Upload a 3-row statement; the postings it triggers must carry
+        //    sourceTransactionId on their journal lines.
+        const txrLines = [
+          "TRADE RECORDS",
+          "Currency: USD",
+          "USD/THB = 35.42",
+          "VRMAX",
+          "02/01/2026 10:00:00,GMT+07 02/01/2026 BUY 100 10.00 1000.00 1000.00 1.00 0.07 NASDAQ",
+          "VRMAX",
+          "03/01/2026 10:00:00,GMT+07 03/01/2026 BUY 100 20.00 2000.00 2000.00 1.50 0.10 NYSE",
+          "VRMAX",
+          "04/01/2026 10:00:00,GMT+07 04/01/2026 SELL 50 30.00 1500.00 1497.93 1.00 0.07 NASDAQ",
+          "PORTFOLIO SUMMARY",
+        ];
+        const txrFile = new File(
+          [makePdf(txrLines) as BlobPart],
+          "w2-tx-record.pdf",
+          { type: "application/pdf" }
+        );
+        const txrFd = new FormData();
+        txrFd.append("file", txrFile);
+        const up = await uploadRoute.action({
+          request: new Request("http://test.local/api/v1/statements/upload", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${txrToken}` },
+            body: txrFd,
+          }),
+        } as never);
+        const upBody = (await up.json()) as {
+          data?: { documentId?: string; saved?: number };
+        };
+        const txrDocId = upBody.data?.documentId;
+        ok(
+          up.status === 200 && !!txrDocId && (upBody.data?.saved ?? 0) === 3,
+          "REG-TXREC: statement upload stores 3 rows that trigger postings"
+        );
+
+        if (txrDocId) {
+          // 2. The posted journal line (with its source transaction id).
+          const lineRows = await client`
+            SELECT jel.id AS line_id, jel.account_id AS account_id,
+                   je.id AS entry_id, je.source_transaction_id
+            FROM journal_entry_lines jel
+            JOIN journal_entries je ON jel.journal_entry_id = je.id
+            WHERE jel.user_id = ${txrUserId}
+              AND je.source_transaction_id IS NOT NULL
+            ORDER BY je.entry_date, je.entry_no, jel.id
+            LIMIT 1`;
+          const lineRow = lineRows[0];
+          ok(
+            !!lineRow && !!lineRow.source_transaction_id,
+            "REG-TXREC: statement postings carry sourceTransactionId on journal lines"
+          );
+
+          if (lineRow) {
+            const txId = lineRow.source_transaction_id as string;
+
+            // 3. Owner reads the single transaction record (the clicked entry).
+            const txRes = await ledgerRoute.loader({
+              request: authedRequest("GET", txrToken),
+              params: { id: txId },
+            } as never);
+            const txBody = (await txRes.json()) as {
+              data?: { transactionId?: string; symbol?: string };
+            };
+            ok(
+              txRes.status === 200 && txBody.data?.transactionId === txId,
+              "REG-TXREC: owner reads the source transaction record (200, id matches)"
+            );
+            ok(
+              txBody.data?.symbol === "VRMAX",
+              "REG-TXREC: returned record is the clicked entry (symbol matches)"
+            );
+
+            // 4. Cross-user read is a safe 404.
+            if (otherToken) {
+              const crossRes = await ledgerRoute.loader({
+                request: authedRequest("GET", otherToken),
+                params: { id: txId },
+              } as never);
+              ok(
+                crossRes.status === 404,
+                "REG-TXREC: another user reading the record is a safe 404"
+              );
+            }
+
+            // 5. The account-ledger route surfaces sourceTransactionId on the line.
+            const alRes = await accountLedgerRoute.loader({
+              request: authedRequest("GET", txrToken),
+              params: { accountId: lineRow.account_id as string },
+            } as never);
+            const alBody = (await alRes.json()) as {
+              data?: {
+                lines?: Array<{
+                  lineId?: string;
+                  sourceTransactionId?: string | null;
+                }>;
+              };
+            };
+            const foundLine = (alBody.data?.lines ?? []).find(
+              (l) => l.lineId === lineRow.line_id
+            );
+            ok(
+              !!foundLine &&
+                foundLine.sourceTransactionId === lineRow.source_transaction_id,
+              "REG-TXREC: account ledger exposes sourceTransactionId on the posting line"
+            );
+          }
+
+          // cleanup: rows, document, cost basis, notifications, postings, file
+          await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${txrUserId}`;
+          await client`DELETE FROM documents WHERE user_id = ${txrUserId}`;
+          await client`DELETE FROM cost_basis_state WHERE user_id = ${txrUserId}`;
+          await client`DELETE FROM notifications WHERE user_id = ${txrUserId}`;
+          await client`DELETE FROM journal_entry_lines WHERE user_id = ${txrUserId}`;
+          await client`DELETE FROM journal_entries WHERE user_id = ${txrUserId}`;
+          await deleteStoredFile(`statements/${txrUserId}/${txrDocId}.pdf`).catch(
+            () => {}
+          );
+        }
+      }
+    }
+  }
+
+  // ================= REG: PER-STOCK DETAIL (case-by-case stocks) =================
+  // GET /api/v1/portfolio/:symbol returns EVERY ledger row for one ticker plus the
+  // current holding, latest daily close and server-computed realized totals —
+  // the data behind the "รายละเอียดหุ้นรายตัว" screen. Ownership-scoped (safe 404
+  // cross-user), uppercase-normalized, symbol-validated, read-only (405).
+  {
+    console.log("\n=== REG: PER-STOCK DETAIL (CASE-BY-CASE STOCKS) ===");
+    const { randomUUID } = await import("node:crypto");
+    const registerRoute = await import("../app/routes/api/auth/register");
+    const portfolioRoute = await import("../app/routes/api/portfolio.$symbol");
+    const { deleteStoredFile } = await import(
+      "../app/lib/storage/statement-storage"
+    );
+
+    const pfEmail = `pf-${randomUUID()}@test.local`;
+    const pfPassword = "PfStock!234";
+    const regRes = await registerRoute.action({
+      request: new Request("http://test.local/api/v1/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: pfEmail, password: pfPassword }),
+      }),
+    } as never);
+    const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
+    const pfUserId = regJson.data?.user?.id;
+    if (!pfUserId) {
+      ok(false, "REG-pf: register failed to create the per-stock test user");
+    } else {
+      smokeUserIds.push(pfUserId);
+      const pfLogin = await loginAs(pfEmail, pfPassword);
+      const pfToken = pfLogin.data?.accessToken as string | undefined;
+      if (!pfToken) {
+        ok(false, "REG-pf: registered user could not log in");
+      } else {
+        const otherEmail = `pf-other-${randomUUID()}@test.local`;
+        const otherPass = "PfOther!#234";
+        const otherReg = await registerRoute.action({
+          request: new Request("http://test.local/api/v1/auth/register", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email: otherEmail, password: otherPass }),
+          }),
+        } as never);
+        const otherJson = (await otherReg.json()) as {
+          data?: { user?: { id?: string } };
+        };
+        const otherUserId = otherJson.data?.user?.id;
+        if (otherUserId) smokeUserIds.push(otherUserId);
+        const otherLogin = await loginAs(otherEmail, otherPass);
+        const otherToken = otherLogin.data?.accessToken as string | undefined;
+
+        // 1. Upload a 3-row VRMAX statement (2 BUY + 1 computable SELL).
+        const pfLines = [
+          "TRADE RECORDS",
+          "Currency: USD",
+          "USD/THB = 35.42",
+          "VRMAX",
+          "02/01/2026 10:00:00,GMT+07 02/01/2026 BUY 100 10.00 1000.00 1000.00 1.00 0.07 NASDAQ",
+          "VRMAX",
+          "03/01/2026 10:00:00,GMT+07 03/01/2026 BUY 100 20.00 2000.00 2000.00 1.50 0.10 NYSE",
+          "VRMAX",
+          "04/01/2026 10:00:00,GMT+07 04/01/2026 SELL 50 30.00 1500.00 1497.93 1.00 0.07 NASDAQ",
+          "PORTFOLIO SUMMARY",
+        ];
+        const pfFile = new File(
+          [makePdf(pfLines) as BlobPart],
+          "w2-per-stock.pdf",
+          { type: "application/pdf" }
+        );
+        const pfFd = new FormData();
+        pfFd.append("file", pfFile);
+        const up = await uploadRoute.action({
+          request: new Request("http://test.local/api/v1/statements/upload", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${pfToken}` },
+            body: pfFd,
+          }),
+        } as never);
+        const upBody = (await up.json()) as {
+          data?: { documentId?: string; saved?: number };
+        };
+        const pfDocId = upBody.data?.documentId;
+        ok(
+          up.status === 200 && !!pfDocId && (upBody.data?.saved ?? 0) === 3,
+          "REG-pf: per-stock fixture upload commits 3 VRMAX rows (2 BUY + 1 SELL)"
+        );
+
+        // Optional stock_prices seed (0017) — quote path only when the table exists.
+        const quoteTable =
+          await client`SELECT 1 FROM information_schema.tables WHERE table_name = 'stock_prices'`;
+        if (quoteTable.length > 0 && pfUserId) {
+          await client`
+            INSERT INTO stock_prices
+              (id, symbol, price_date, close_price, currency, source, created_at, updated_at)
+            VALUES
+              ('00000000-0000-0000-0000-0000000000ab', 'VRMAX', '2026-09-11', '25.00', 'USD', 'yahoo-finance', now(), now())
+            ON CONFLICT (symbol, price_date) DO UPDATE SET close_price = '25.00', updated_at = now()`;
+        }
+
+        const portfolioRequest = (token: string, symbol: string) =>
+          portfolioRoute.loader({
+            request: authedRequest("GET", token),
+            params: { symbol },
+          } as never);
+
+        if (pfDocId) {
+          // 2. Owner reads the per-stock detail (200, full data).
+          const own = await portfolioRequest(pfToken, "VRMAX");
+          const ownBody = (await own.json()) as {
+            success?: boolean;
+            data?: {
+              symbol?: string;
+              trades?: Array<{ side?: string | null }>;
+              holding?: {
+                quantity?: string;
+                avgCost?: string;
+                totalCost?: string;
+                marketValue?: string | null;
+                unrealizedPnl?: string | null;
+              } | null;
+              quote?: {
+                close?: string;
+                currency?: string;
+                priceDate?: string;
+              } | null;
+              totals?: {
+                tradeCount?: number;
+                buyCount?: number;
+                sellCount?: number;
+                cashCount?: number;
+                computableSellCount?: number;
+                nonComputableSellCount?: number;
+                totalRealizedThb?: string | null;
+              };
+            };
+          };
+          ok(
+            own.status === 200 && ownBody.data?.symbol === "VRMAX",
+            "REG-pf: owner reads the per-stock detail (200, symbol echoed uppercase)"
+          );
+          ok(
+            (ownBody.data?.trades?.length ?? 0) === 3 &&
+              (ownBody.data?.totals?.tradeCount ?? 0) === 3,
+            "REG-pf: all 3 of the stock's ledger rows are returned"
+          );
+          ok(
+            ownBody.data?.totals?.buyCount === 2 &&
+              ownBody.data?.totals?.sellCount === 1 &&
+              ownBody.data?.totals?.computableSellCount === 1 &&
+              ownBody.data?.totals?.nonComputableSellCount === 0,
+            "REG-pf: per-stock totals classify the trades server-side (2 BUY / 1 computable SELL)"
+          );
+          ok(
+            Number(ownBody.data?.totals?.totalRealizedThb) === 26491.68,
+            "REG-pf: realized P&L total is the server-authoritative THB sum (net 1497.93 − basis 750 = 747.93, × 35.42 = 26491.68)"
+          );
+          ok(
+            Number(ownBody.data?.holding?.quantity) === 150 &&
+              Number(ownBody.data?.holding?.avgCost) === 15 &&
+              Number(ownBody.data?.holding?.totalCost) === 2250,
+            "REG-pf: holding from cost_basis_state (150 @ avg 15, total 2250)"
+          );
+          if (quoteTable.length > 0) {
+            ok(
+              Number(ownBody.data?.quote?.close) === 25 &&
+                ownBody.data?.quote?.currency === "USD" &&
+                Number(ownBody.data?.holding?.marketValue) === 3750 &&
+                Number(ownBody.data?.holding?.unrealizedPnl) === 1500,
+              "REG-pf: latest close + market value + unrealized P&L are server-computed (25 × 150 / (25−15) × 150)"
+            );
+          } else {
+            ok(
+              ownBody.data?.quote === null,
+              "REG-pf: quote stays null when no stock_prices table (honest '-')"
+            );
+          }
+
+          // 3. Symbol is case-insensitive (uppercased server-side).
+          const lower = await portfolioRequest(pfToken, "vrmax");
+          const lowerBody = (await lower.json()) as {
+            data?: { trades?: unknown[] };
+          };
+          ok(
+            lower.status === 200 && (lowerBody.data?.trades?.length ?? 0) === 3,
+            "REG-pf: lowercase symbol resolves to the same uppercase detail"
+          );
+
+          // 4. Cross-user read is a safe 404.
+          if (otherToken) {
+            const cross = await portfolioRequest(otherToken, "VRMAX");
+            ok(
+              cross.status === 404,
+              "REG-pf: another user reading this stock's detail is a safe 404"
+            );
+          }
+
+          // 5. Unknown symbol for the OWNER is also a safe 404.
+          const unknown = await portfolioRequest(pfToken, "ZZZZQ");
+          ok(
+            unknown.status === 404,
+            "REG-pf: a symbol with no trades/holding for the owner is a 404"
+          );
+
+          // 6. Invalid / oversized symbols are rejected (400).
+          const invalid = await portfolioRoute.loader({
+            request: authedRequest("GET", pfToken),
+            params: { symbol: "BAD@SYMBOL" },
+          } as never);
+          const oversized = await portfolioRoute.loader({
+            request: authedRequest("GET", pfToken),
+            params: { symbol: "ABCDEFGHIJKLMNOPQRSTUVWXYZ" },
+          } as never);
+          ok(
+            invalid.status === 400 && oversized.status === 400,
+            "REG-pf: non-ticker and oversized symbols are rejected (400)"
+          );
+
+          // 7. Read-only: action (POST) → 405.
+          const act = await portfolioRoute.action();
+          ok(
+            act.status === 405,
+            "REG-pf: POST to the per-stock route is rejected (405, read-only)"
+          );
+        }
+
+        // cleanup: rows, document, cost basis, notifications, postings, quotes, file
+        if (pfDocId) {
+          await client`DELETE FROM journal_entry_lines WHERE user_id = ${pfUserId}`;
+          await client`DELETE FROM journal_entries WHERE user_id = ${pfUserId}`;
+        }
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${pfUserId}`;
+        await client`DELETE FROM documents WHERE user_id = ${pfUserId}`;
+        await client`DELETE FROM cost_basis_state WHERE user_id = ${pfUserId}`;
+        await client`DELETE FROM notifications WHERE user_id = ${pfUserId}`;
+        if (quoteTable.length > 0) {
+          await client`DELETE FROM stock_prices WHERE symbol = 'VRMAX' AND price_date = '2026-09-11'`;
+        }
+        if (pfDocId) {
+          await deleteStoredFile(`statements/${pfUserId}/${pfDocId}.pdf`).catch(
+            () => {}
+          );
+        }
+        console.log("  Removed per-stock detail fixture data.");
+      }
+    }
+  }
+
+  // ================= REG: GAIN/LOSS BACKFILL (FROZEN SELL) =================
+  // Heals AI_PARSED SELL rows whose realized gain/loss was frozen at import
+  // because the supporting BUY arrived in a LATER statement. Walks the real DB
+  // wrapper (backfillComputedGainLoss): out-of-order rows are replayed
+  // chronologically and the SELL's stored costBasis/proceeds/realized gain is
+  // filled from the authoritative net_amount — while a MANUAL SELL with the
+  // same basis is left untouched. Requires the 0016 migration (net_amount) —
+  // skipped (with a note) when the column is absent.
+  {
+    const netCol =
+      await client`SELECT column_name FROM information_schema.columns WHERE table_name = 'Capital_Transactions' AND column_name = 'net_amount'`;
+    const netColPresent = netCol.length > 0;
+    if (!netColPresent) {
+      console.log(
+        "\n  SKIP  REG-backfill: net_amount column absent (run the 0016 migration)"
+      );
+    } else {
+      console.log("\n=== REG: GAIN/LOSS BACKFILL (FROZEN SELL) ===");
+      const { randomUUID } = await import("node:crypto");
+      const registerRoute = await import("../app/routes/api/auth/register");
+      const backfillPath = await import("../app/lib/statement-pipeline");
+      const bfEmail = `bf-${randomUUID()}@test.local`;
+      const bfRes = await registerRoute.action({
+        request: new Request("http://test.local/api/v1/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: bfEmail, password: "BfPass!234" }),
+        }),
+      } as never);
+      const bfJson = (await bfRes.json()) as { data?: { user?: { id?: string } } };
+      const bfUserId = bfJson.data?.user?.id;
+      if (!bfUserId) {
+        ok(false, "REG-backfill: register failed to create the backfill test user");
+      } else {
+        smokeUserIds.push(bfUserId);
+        const sellId = randomUUID();
+        // Out-of-order history: the SELL (02-05) is present, the supporting BUY
+        // (01-20) was imported in a later statement. Both AI_PARSED, SELL NULL.
+        await client`
+          INSERT INTO "Capital_Transactions"
+            (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, symbol, side, quantity, unit_price, gross_amount, fees, net_amount, fx_rate_effective)
+          VALUES
+            (${randomUUID()}, ${bfUserId}, '200.00', 'USD', '2026-01-20', '7084.00', 'CASH_OUT', 'AI_PARSED', 'BFZ', 'BUY', '10', '20', '200', '1', '199', '35.42'),
+            (${sellId}, ${bfUserId}, '300.00', 'USD', '2026-02-05', '10626.00', 'CASH_IN', 'AI_PARSED', 'BFZ', 'SELL', '5', '60', '300', '10', '290', '35.42')`;
+        // A MANUAL SELL with the same kind of sufficient basis (BUY first).
+        const manSellId = randomUUID();
+        await client`
+          INSERT INTO "Capital_Transactions"
+            (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, symbol, side, quantity, unit_price, gross_amount, fees, net_amount, fx_rate_effective)
+          VALUES
+            (${randomUUID()}, ${bfUserId}, '40.00', 'USD', '2026-01-10', '1416.80', 'CASH_OUT', 'AI_PARSED', 'BFM', 'BUY', '1', '40', '40', '0', '40', '35.42'),
+            (${manSellId}, ${bfUserId}, '100.00', 'USD', '2026-02-06', '3542.00', 'CASH_IN', 'MANUAL', 'BFM', 'SELL', '1', '100', '100', '0', '100', '35.42')`;
+
+        const preRows = await client`SELECT realized_gain_loss_thb FROM "Capital_Transactions" WHERE transaction_id = ${sellId}`;
+        ok(
+          preRows.length === 1 && preRows[0].realized_gain_loss_thb === null,
+          "REG-backfill: frozen SELL starts with a NULL realized gain (non-computable at its import)"
+        );
+
+        const stats = await backfillPath.backfillComputedGainLoss(bfUserId);
+        ok(
+          stats.filled === 1 && stats.skippedManual === 1,
+          "REG-backfill: backfill fills the frozen AI_PARSED SELL and skips the MANUAL SELL"
+        );
+
+        const filled = await client`
+          SELECT cost_basis, proceeds, realized_gain_loss, realized_gain_loss_thb
+          FROM "Capital_Transactions" WHERE transaction_id = ${sellId}`;
+        ok(
+          filled.length === 1 &&
+            filled[0].cost_basis === "100.00" &&
+            filled[0].proceeds === "290.00" &&
+            filled[0].realized_gain_loss === "190.00" &&
+            filled[0].realized_gain_loss_thb === "6729.80",
+          "REG-backfill: SELL filled from authoritative data (basis avg20*5=100 / proceeds net 290 / gain 190 / THB 190*35.42)"
+        );
+
+        const manStill = await client`SELECT realized_gain_loss_thb FROM "Capital_Transactions" WHERE transaction_id = ${manSellId}`;
+        ok(
+          manStill.length === 1 && manStill[0].realized_gain_loss_thb === null,
+          "REG-backfill: MANUAL SELL keeps its NULL value (backfill NEVER touches manual rows)"
+        );
+
+        // Clean up this fixture user's rows so CLEANUP can delete the user.
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${bfUserId}`;
+      }
+    }
+  }
+
+  // ============= REG: WEBULL AVERAGE COST RECOMPUTE =============
+  // Proves the one-shot Webull method against the REAL engine + DB path used by
+  // scripts/recompute-cost-basis-webull.mts: a symbol with a partial SELL and a
+  // LATER re-buy keeps the LIFETIME average (cumulative cost ÷ cumulative BUY
+  // qty), so the stored OLD-method realized values must be OVERWRITTEN, the
+  // MANUAL SELL left untouched, and cost_basis_state rewritten with the cum
+  // accumulator (cum_cost / cum_quantity === avg_cost) whose SELL keeps qty
+  // unchanged. Requires the 0019 migration (cum columns) — skipped when absent.
+  {
+    const cumCol = await client`SELECT column_name FROM information_schema.columns WHERE table_name = 'cost_basis_state' AND column_name = 'cum_quantity'`;
+    if (cumCol.length === 0) {
+      console.log(
+        "\n  SKIP  REG-webull-average-cost: cust_basis_state has no cum_quantity (run the 0019 migration)"
+      );
+    } else {
+      console.log("\n=== REG: WEBULL AVERAGE COST RECOMPUTE ===");
+      const { randomUUID } = await import("node:crypto");
+      const registerRoute = await import("../app/routes/api/auth/register");
+      const pipeline = await import("../app/lib/statement-pipeline");
+      const wlEmail = `wl-${randomUUID()}@test.local`;
+      const wlRes = await registerRoute.action({
+        request: new Request("http://test.local/api/v1/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: wlEmail, password: "WlPass!234" }),
+        }),
+      } as never);
+      const wlJson = (await wlRes.json()) as { data?: { user?: { id?: string } } };
+      const wlUserId = wlJson.data?.user?.id;
+      if (!wlUserId) {
+        ok(false, "REG-webull-avg: register failed to create the test user");
+      } else {
+        smokeUserIds.push(wlUserId);
+        const sellId = randomUUID();
+        // WBLL: BUY 1000@300, BUY 200@350, then SELL 500 — old method avg would
+        // be 314.29 (157142.86 basis); Webull lifetime avg = 370000/1200 =
+        // 308.33 (154166.67 basis). Stored as the OLD method so the recompute
+        // must prove it OVERWRITES.
+        await client`
+          INSERT INTO "Capital_Transactions"
+            (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, symbol, side, quantity, unit_price, gross_amount, fees, net_amount, fx_rate_effective, cost_basis, proceeds, realized_gain_loss, realized_gain_loss_thb)
+          VALUES
+            (${randomUUID()}, ${wlUserId}, '300000.00', 'USD', '2026-01-02', '10626000.00', 'CASH_OUT', 'AI_PARSED', 'WBLL', 'BUY', '1000', '300', '300000', '0', '300000', '35.42', NULL, NULL, NULL, NULL),
+            (${randomUUID()}, ${wlUserId}, '70000.00', 'USD', '2026-02-02', '2479400.00', 'CASH_OUT', 'AI_PARSED', 'WBLL', 'BUY', '200', '350', '70000', '0', '70000', '35.42', NULL, NULL, NULL, NULL),
+            (${sellId}, ${wlUserId}, '165000.00', 'USD', '2026-02-10', '5844300.00', 'CASH_IN', 'AI_PARSED', 'WBLL', 'SELL', '500', '330', '165000', '0', '165000', '35.42', '157142.86', '165000.00', '7857.14', '278300.00')`;
+        // A MANUAL SELL with available basis must be skipped (own symbol, so the
+        // WBLL fixture numbers stay isolated).
+        const manSellId = randomUUID();
+        await client`
+          INSERT INTO "Capital_Transactions"
+            (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, symbol, side, quantity, unit_price, gross_amount, fees, net_amount, fx_rate_effective)
+          VALUES
+            (${randomUUID()}, ${wlUserId}, '500.00', 'USD', '2026-01-05', '17710.00', 'CASH_IN', 'MANUAL', 'WBML', 'SELL', '10', '50', '500', '0', '500', '35.42')`;
+
+        const rows = await client`
+          SELECT transaction_id, source_type, transaction_date, symbol, side, quantity, unit_price,
+                 gross_amount, fees, net_amount, currency, fx_rate_effective, realized_gain_loss_thb
+          FROM "Capital_Transactions" WHERE user_id = ${wlUserId}`;
+        const engine = pipeline.recomputeAllGainLoss(
+          rows.map((r: any) => ({
+            transactionId: r.transaction_id,
+            sourceType: r.source_type,
+            transactionDate: r.transaction_date,
+            symbol: r.symbol,
+            side: r.side,
+            quantity: r.quantity,
+            unitPrice: r.unit_price,
+            grossAmount: r.gross_amount,
+            fees: r.fees,
+            netAmount: r.net_amount,
+            currency: r.currency,
+            fxRateEffective: r.fx_rate_effective,
+            realizedGainLossThb: r.realized_gain_loss_thb,
+          })),
+          []
+        );
+        ok(
+          engine.stats.recomputed === 1 && engine.stats.skippedManual === 1,
+          "REG-webull-avg: full recompute targets the AI_PARSED SELL and skips the MANUAL SELL"
+        );
+        ok(
+          engine.updates[0].update.costBasis === "154166.67" &&
+            engine.updates[0].update.realizedGainLoss === "10833.33",
+          "REG-webull-avg: Webull lifetime avg 308.33 → basis 154166.67 (was old-method 157142.86)"
+        );
+
+        // Apply exactly like scripts/recompute-cost-basis-webull.mts.
+        await client`
+          UPDATE "Capital_Transactions"
+          SET cost_basis = ${engine.updates[0].update.costBasis},
+              proceeds = ${engine.updates[0].update.proceeds},
+              realized_gain_loss = ${engine.updates[0].update.realizedGainLoss},
+              realized_gain_loss_thb = ${engine.updates[0].update.realizedGainLossThb}
+          WHERE transaction_id = ${sellId}`;
+        await pipeline.rebuildCostBasisStateFromLedger(wlUserId);
+
+        const after = await client`
+          SELECT cost_basis, realized_gain_loss, realized_gain_loss_thb
+          FROM "Capital_Transactions" WHERE transaction_id = ${sellId}`;
+        ok(
+          after.length === 1 &&
+            after[0].cost_basis === "154166.67" &&
+            after[0].realized_gain_loss === "10833.33" &&
+            after[0].realized_gain_loss_thb === "383716.55",
+          "REG-webull-avg: stored SELL overwritten with the Webull basis/gain (THB 10833.33 × 35.42)"
+        );
+        const manStill = await client`SELECT realized_gain_loss_thb FROM "Capital_Transactions" WHERE transaction_id = ${manSellId}`;
+        ok(
+          manStill.length === 1 && manStill[0].realized_gain_loss_thb === null,
+          "REG-webull-avg: MANUAL SELL keeps NULL realized gain (never touched)"
+        );
+        const basis = await client`SELECT symbol, quantity, avg_cost, cum_quantity, cum_cost FROM cost_basis_state WHERE user_id = ${wlUserId}`;
+        ok(
+          basis.length === 1 &&
+            basis[0].quantity === "700" &&
+            basis[0].cum_quantity === "1200" &&
+            basis[0].cum_cost === "370000",
+          "REG-webull-avg: cost_basis_state qty 700 (SELL reduced live qty) but cum divisor 1200 with cost 370000"
+        );
+        ok(
+          Math.abs(parseFloat(basis[0].avg_cost) - 370000 / 1200) < 1e-6,
+          "REG-webull-avg: avg_cost === cum_cost / cum_quantity (308.33)"
+        );
+
+        // Clean up this fixture user's rows so CLEANUP can delete the user.
+        await client`DELETE FROM cost_basis_state WHERE user_id = ${wlUserId}`;
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${wlUserId}`;
+      }
+    }
+  }
+
+  // ================= REG: STOCK PRICES (DAILY CLOSE) =================
+  // Validates the real /api/v1/stock-prices + /stock-prices/refresh routes
+  // against a MOCKED provider (global fetch) so no live Yahoo call ever happens:
+  // unauthenticated/role guards, browser-safe 405 on the bare GET loader, an
+  // ADMIN-triggered sweep, and a fresh cached close served without re-hitting
+  // the provider. Requires the 0017 migration (stock_prices) — skipped (with a
+  // note) when the table is absent.
+  {
+    const priceCol =
+      await client`SELECT column_name FROM information_schema.columns WHERE table_name = 'stock_prices' AND column_name = 'close_price'`;
+    if (priceCol.length === 0) {
+      console.log(
+        "\n  SKIP  REG-stock-prices: stock_prices table absent (run the 0017 migration)"
+      );
+    } else {
+      console.log("\n=== REG: STOCK PRICES (DAILY CLOSE) ===");
+      const stockPricesRoute = await import("../app/routes/api/stock-prices");
+      const stockPricesRefreshRoute = await import(
+        "../app/routes/api/stock-prices/refresh"
+      );
+      const savedFetch = globalThis.fetch;
+
+      const stockRequest = (token: string | undefined, query = "") =>
+        stockPricesRoute.loader({
+          request: new Request(
+            `http://test.local/api/v1/stock-prices?${query}`,
+            {
+              method: "GET",
+              headers: token ? { Authorization: `Bearer ${token}` } : {},
+            }
+          ),
+        } as never);
+
+      const refreshAction = (
+        token: string | undefined,
+        extraHeaders: Record<string, string> = {}
+      ) =>
+        stockPricesRefreshRoute.action({
+          request: new Request(
+            "http://test.local/api/v1/stock-prices/refresh",
+            {
+              method: "POST",
+              headers: {
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                ...extraHeaders,
+              },
+            }
+          ),
+        } as never);
+
+      const anonGet = await stockRequest("");
+      ok(
+        anonGet.status === 401,
+        "REG-stock: unauthenticated quote read rejected (401)"
+      );
+
+      const anonRefresh = await refreshAction("");
+      ok(
+        anonRefresh.status === 401,
+        "REG-stock: unauthenticated refresh rejected (401)"
+      );
+
+      const bareLoader = await stockPricesRefreshRoute.loader({
+        request: new Request(
+          "http://test.local/api/v1/stock-prices/refresh",
+          { method: "GET" }
+        ),
+      } as never);
+      ok(
+        bareLoader.status === 405,
+        "REG-stock: bare GET refresh without cron secret -> 405 (browser-safe, never auto-runs)"
+      );
+
+      if (tokenA) {
+        let providerCalled = false;
+        globalThis.fetch = (async () => {
+          providerCalled = true;
+          return new Response("{}", { status: 500 }) as Response;
+        }) as typeof fetch;
+        const emptyRes = await stockRequest(tokenA, "");
+        const emptyBody = (await emptyRes.json()) as {
+          success?: boolean;
+          data?: unknown[];
+        };
+        ok(
+          emptyRes.status === 200 &&
+            Array.isArray(emptyBody.data) &&
+            emptyBody.data.length === 0,
+          "REG-stock: empty symbols query -> empty array"
+        );
+        ok(
+          providerCalled === false,
+          "REG-stock: empty query never touches the provider"
+        );
+      }
+
+      const userRefresh = await refreshAction(tokenB);
+      ok(
+        userRefresh.status === 403,
+        "REG-stock: USER-role refresh rejected (403)"
+      );
+
+      if (tokenAd) {
+        // Seed one cached close so the read path is deterministic.
+        const ts = new Date(Date.UTC(2026, 8, 10)).getTime() / 1000;
+        await client`
+          INSERT INTO stock_prices
+            (id, symbol, price_date, close_price, currency, source, created_at, updated_at)
+          VALUES
+            ('00000000-0000-0000-0000-00000000sp1', 'NVDA', '2026-09-10', '123.45', 'USD', 'yahoo-finance', now(), now())
+          ON CONFLICT (symbol, price_date) DO UPDATE SET close_price = '123.45', updated_at = now()`;
+
+        // ADMIN-triggered sweep with a MOCKED Yahoo chart payload.
+        globalThis.fetch = (async (input: string | URL | Request) => {
+          const url = String(input);
+          ok(
+            url.includes("query1.finance.yahoo.com") &&
+              url.includes("/v8/finance/chart/"),
+            "REG-stock: provider fetch targets the keyless Yahoo chart API"
+          );
+          return new Response(
+            JSON.stringify({
+              chart: {
+                result: [
+                  {
+                    meta: { currency: "USD" },
+                    timestamp: [ts],
+                    indicators: { quote: [{ close: [123.45] }] },
+                  },
+                ],
+                error: null,
+              },
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }
+          ) as Response;
+        }) as typeof fetch;
+
+        const refreshRes = await refreshAction(tokenAd);
+        const refreshBody = (await refreshRes.json()) as {
+          success?: boolean;
+          data?: {
+            requested?: number;
+            updated?: number;
+            failed?: string[];
+          };
+        };
+        ok(
+          refreshRes.status === 200 && refreshBody.success === true,
+          "REG-stock: ADMIN triggers a refresh sweep (200)"
+        );
+        ok(
+          typeof refreshBody.data?.requested === "number" &&
+            typeof refreshBody.data?.updated === "number" &&
+            Array.isArray(refreshBody.data?.failed) &&
+            refreshBody.data.updated === refreshBody.data.requested,
+          "REG-stock: refresh stats are consistent (updated === requested, no failures)"
+        );
+
+        // Fresh cached close is served WITHOUT calling the provider again.
+        let providerCalledAfter = false;
+        globalThis.fetch = (async () => {
+          providerCalledAfter = true;
+          return new Response("{}", { status: 500 }) as Response;
+        }) as typeof fetch;
+        const nvda = await stockRequest(tokenA, "symbols=NVDA");
+        const nvdaBody = (await nvda.json()) as {
+          success?: boolean;
+          data?: Array<{
+            symbol?: string;
+            close?: number;
+            currency?: string;
+          }>;
+        };
+        ok(
+          nvda.status === 200 &&
+            Array.isArray(nvdaBody.data) &&
+            nvdaBody.data.length >= 1 &&
+            nvdaBody.data[0]?.symbol === "NVDA" &&
+            nvdaBody.data[0]?.close === 123.45 &&
+            nvdaBody.data[0]?.currency === "USD",
+          "REG-stock: cached close is served after the refresh (123.45 USD)"
+        );
+        ok(
+          providerCalledAfter === false,
+          "REG-stock: a fresh cache hit never re-hits the provider"
+        );
+
+        // x-cron-secret matching CRON_SECRET is authorized even without a JWT.
+        const prevSecret = process.env.CRON_SECRET;
+        process.env.CRON_SECRET = "test-cron-secret-xyz";
+        globalThis.fetch = (async (_input: string | URL | Request) =>
+          new Response(
+            JSON.stringify({
+              chart: {
+                result: [
+                  {
+                    meta: { currency: "USD" },
+                    timestamp: [ts],
+                    indicators: { quote: [{ close: [9.99] }] },
+                  },
+                ],
+                error: null,
+              },
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }
+          ) as Response) as typeof fetch;
+        const cronRes = await refreshAction("", {
+          "x-cron-secret": "test-cron-secret-xyz",
+        });
+        const cronBody = (await cronRes.json()) as {
+          success?: boolean;
+          data?: unknown;
+        };
+        ok(
+          cronRes.status === 200 && !!cronBody.data,
+          "REG-stock: x-cron-secret matching CRON_SECRET -> refresh allowed"
+        );
+        if (prevSecret === undefined) delete process.env.CRON_SECRET;
+        else process.env.CRON_SECRET = prevSecret;
+      }
+
+      globalThis.fetch = savedFetch;
+      await client`DELETE FROM stock_prices WHERE created_at >= ${startTime}`;
+      console.log("  Removed stock_prices rows written during this test window.");
+    }
+  }
+
+  // ================= REG: CASH SUMMARY (EQUITY MONTHLY) =================
+  {
+    console.log("\n=== REG: CASH SUMMARY (EQUITY MONTHLY) ===");
+    const cashSummaryRoute = await import("../app/routes/api/cash-summary");
+    const cashRequest = (token: string | undefined) =>
+      cashSummaryRoute.loader({
+        request: new Request("http://test.local/api/v1/cash-summary", {
+          method: "GET",
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        }),
+      } as never);
+
+    const anonCash = await cashRequest("");
+    ok(
+      anonCash.status === 401,
+      "REG-cash: unauthenticated summary rejected (401)"
+    );
+
+    if (tokenA) {
+      const emptyRes = await cashRequest(tokenA);
+      const emptyBody = (await emptyRes.json()) as {
+        success?: boolean;
+        data?: { months: unknown[]; totalCashInThb?: string };
+      };
+      ok(
+        emptyRes.status === 200 &&
+          emptyBody.success === true &&
+          Array.isArray(emptyBody.data?.months) &&
+          typeof emptyBody.data?.totalCashInThb === "string",
+        "REG-cash: authenticated summary loads with monthly rows + string totals"
+      );
+
+      // Insert fresh MANUAL transfer rows through the REAL POST route so the
+      // category='equity' stamp is exercised, then re-read.
+      const inRes = await ledgersRoute.action({
+        request: jsonBody(
+          {
+            amountForeign: "1200.00",
+            currency: "USD",
+            transactionDate: "2026-07-15",
+            fxRateBot: "33.00",
+            amountThb: "39600.00",
+            type: "CASH_IN",
+            sourceType: "MANUAL",
+          },
+          "POST",
+          tokenA
+        ),
+      } as never);
+      const inBody = (await inRes.json()) as {
+        success?: boolean;
+        data?: { transactionId: string };
+      };
+      const inId = inBody.success ? inBody.data?.transactionId : undefined;
+      ok(
+        inRes.status === 201 && typeof inId === "string",
+        "REG-cash: manual CASH_IN created (201)"
+      );
+
+      const outRes = await ledgersRoute.action({
+        request: jsonBody(
+          {
+            amountForeign: "400.00",
+            currency: "USD",
+            transactionDate: "2026-07-16",
+            fxRateBot: "33.00",
+            amountThb: "13200.00",
+            type: "CASH_OUT",
+            sourceType: "MANUAL",
+          },
+          "POST",
+          tokenA
+        ),
+      } as never);
+      const outBody = (await outRes.json()) as {
+        success?: boolean;
+        data?: { transactionId: string };
+      };
+      const outId = outBody.success ? outBody.data?.transactionId : undefined;
+      ok(
+        outRes.status === 201 && typeof outId === "string",
+        "REG-cash: manual CASH_OUT created (201)"
+      );
+
+      const sumRes = await cashRequest(tokenA);
+      const sumBody = (await sumRes.json()) as {
+        success?: boolean;
+        data?: {
+          months: {
+            month: string;
+            cashInThb: string;
+            cashOutThb: string;
+            netThb: string;
+          }[];
+        };
+      };
+      const july = sumBody.data?.months?.find((m) => m.month === "2026-07");
+      ok(
+        july?.cashInThb === "39600" &&
+          july?.cashOutThb === "13200" &&
+          july?.netThb === "26400",
+        "REG-cash: manual rows land in July with in/out/net"
+      );
+
+      // Journal as SSOT: every manual cash row is ALSO mirrored in the journal
+      // (the cash summary above is served FROM those journal entries).
+      if (inId) {
+        const je = await client`SELECT id, type, amount::float8 AS amount, amount_thb::float8 AS amount_thb, fx_rate_effective FROM journal_entries WHERE source_transaction_id = ${inId}`;
+        ok(
+          je.length === 1 &&
+            je[0].type === "CASH_IN" &&
+            Number(je[0].amount) === 1200 &&
+            Number(je[0].amount_thb) === 39600 &&
+            String(je[0].fx_rate_effective) === "33",
+          "REG-cash: manual CASH_IN mirrored in journal (type + amount + THB + fx)"
+        );
+        const lineCountIn = await client`SELECT COUNT(*)::int AS c FROM journal_entry_lines WHERE journal_entry_id = ${je[0].id}`;
+        ok(
+          lineCountIn[0].c === 2,
+          "REG-cash: manual CASH_IN journal entry has 2 posting lines"
+        );
+      }
+      if (outId) {
+        const je = await client`SELECT id, type, amount::float8 AS amount FROM journal_entries WHERE source_transaction_id = ${outId}`;
+        ok(
+          je.length === 1 && je[0].type === "CASH_OUT" && Number(je[0].amount) === 400,
+          "REG-cash: manual CASH_OUT mirrored in journal (type + amount)"
+        );
+        const lineCountOut = await client`SELECT COUNT(*)::int AS c FROM journal_entry_lines WHERE journal_entry_id = ${je[0].id}`;
+        ok(
+          lineCountOut[0].c === 2,
+          "REG-cash: manual CASH_OUT journal entry has 2 posting lines"
+        );
+      }
+
+      if (inId) {
+        // Journal rows first (entry_lines -> entries), then the capital row.
+        await client`DELETE FROM "journal_entry_lines" WHERE journal_entry_id IN (SELECT id FROM "journal_entries" WHERE source_transaction_id = ${inId})`;
+        await client`DELETE FROM "journal_entries" WHERE source_transaction_id = ${inId}`;
+        await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ${inId}`;
+      }
+      if (outId) {
+        await client`DELETE FROM "journal_entry_lines" WHERE journal_entry_id IN (SELECT id FROM "journal_entries" WHERE source_transaction_id = ${outId})`;
+        await client`DELETE FROM "journal_entries" WHERE source_transaction_id = ${outId}`;
+        await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ${outId}`;
+      }
+      console.log("  Removed the manual cash rows + mirrored journals written during this test window.");
+    }
+  }
+
+  // ================= REG: TRADING JOURNAL NOTES (investor annotations) =================
+  // The investor's own note on one journal row (PUT/DELETE
+  // /api/v1/trading-journal/:transactionId/note): owner-scoped, safe 404
+  // cross-user, loader 405, invalid JSON / over-long notes 400. The note
+  // flows back through GET /api/v1/trading-journal entries verbatim.
+  // Requires the 0022 migration (journal_entries.note) — skipped with a note
+  // when the column is absent.
+  {
+    const noteCol =
+      await client`SELECT column_name FROM information_schema.columns WHERE table_name = 'journal_entries' AND column_name = 'note'`;
+    if (noteCol.length === 0) {
+      console.log(
+        "\n  SKIP  REG-journal-notes: note column absent (run the 0022 migration)"
+      );
+    } else {
+      console.log("\n=== REG: TRADING JOURNAL NOTES ===");
+      const { randomUUID } = await import("node:crypto");
+      const registerRoute = await import("../app/routes/api/auth/register");
+      const noteRoute = await import(
+        "../app/routes/api/trading-journal.$transactionId.note"
+      );
+      const journalRoute = await import("../app/routes/api/trading-journal");
+      const noteEmail = `note-${randomUUID()}@test.local`;
+      const notePass = "NotePass!234";
+      const noteReg = await registerRoute.action({
+        request: new Request("http://test.local/api/v1/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: noteEmail, password: notePass }),
+        }),
+      } as never);
+      const noteJson = (await noteReg.json()) as {
+        data?: { user?: { id?: string } };
+      };
+      const noteUserId = noteJson.data?.user?.id;
+      if (!noteUserId) {
+        ok(false, "REG-notes: register failed to create the notes test user");
+      } else {
+        smokeUserIds.push(noteUserId);
+        const noteLogin = await loginAs(noteEmail, notePass);
+        const noteToken = noteLogin.data?.accessToken as string | undefined;
+        if (!noteToken) {
+          ok(false, "REG-notes: notes user could not log in");
+        } else {
+          const otherEmail = `note-other-${randomUUID()}@test.local`;
+          const otherReg = await registerRoute.action({
+            request: new Request("http://test.local/api/v1/auth/register", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ email: otherEmail, password: "NoteOther!234" }),
+            }),
+          } as never);
+          const otherJson = (await otherReg.json()) as {
+            data?: { user?: { id?: string } };
+          };
+          if (otherJson.data?.user?.id) smokeUserIds.push(otherJson.data.user.id);
+          const otherLogin = await loginAs(otherEmail, "NoteOther!234");
+          const otherToken = otherLogin.data?.accessToken as string | undefined;
+
+          // One journal row backed by a capital-transaction id (no postings).
+          const noteTxId = randomUUID();
+          const nowIso = new Date().toISOString();
+          await client`
+            INSERT INTO journal_entries
+              (id, user_id, entry_no, entry_date, description, source_type, source_transaction_id, status, created_at, updated_at, category, symbol, side, quantity, unit_price, currency, amount, amount_thb, fx_rate_effective, is_fx_conversion, posting_state)
+            VALUES
+              (${randomUUID()}, ${noteUserId}, 1, '2026-02-10', 'ซื้อ NOTEX', 'STATEMENT', ${noteTxId}, 'POSTED', ${nowIso}, ${nowIso}, 'asset', 'NOTEX', 'BUY', '10', '15.00', 'USD', '150.00', '5325.00', '35.50', false, 'SKIPPED')`;
+
+          const putNote = (token: string, txId: string, body: unknown) =>
+            noteRoute.action({
+              request: new Request(
+                `http://test.local/api/v1/trading-journal/${txId}/note`,
+                {
+                  method: "PUT",
+                  headers: {
+                    Authorization: `Bearer ${token}`,
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify(body),
+                }
+              ),
+              params: { transactionId: txId },
+            } as never);
+
+          // 1. Owner sets a note.
+          const putRes = await putNote(noteToken, noteTxId, {
+            note: "เหตุผลที่ซื้อ NOTEX",
+          });
+          const putBody = (await putRes.json()) as {
+            data?: { note?: string | null };
+          };
+          ok(
+            putRes.status === 200 && putBody.data?.note === "เหตุผลที่ซื้อ NOTEX",
+            "REG-notes: owner sets a note on their own row (200)"
+          );
+
+          // 2. The note flows back through the journal list verbatim.
+          const listRes = await journalRoute.loader({
+            request: new Request("http://test.local/api/v1/trading-journal", {
+              headers: { Authorization: `Bearer ${noteToken}` },
+            }),
+          } as never);
+          const listBody = (await listRes.json()) as {
+            data?: { entries?: { transactionId?: string; note?: string | null }[] };
+          };
+          const listed = listBody.data?.entries?.find(
+            (e) => e.transactionId === noteTxId
+          );
+          ok(
+            listRes.status === 200 && listed?.note === "เหตุผลที่ซื้อ NOTEX",
+            "REG-notes: note is served back through GET /api/v1/trading-journal"
+          );
+
+          // 3. Blank clears the note (back to honest null).
+          const clearRes = await putNote(noteToken, noteTxId, { note: "   " });
+          const clearBody = (await clearRes.json()) as {
+            data?: { note?: string | null };
+          };
+          ok(
+            clearRes.status === 200 && clearBody.data?.note === null,
+            "REG-notes: blank note clears back to null"
+          );
+
+          // 4. Another user cannot annotate this row.
+          if (otherToken) {
+            const crossRes = await putNote(otherToken, noteTxId, { note: "x" });
+            ok(
+              crossRes.status === 404,
+              "REG-notes: cross-user note write is a safe 404"
+            );
+          }
+
+          // 5. Missing row + bad input + wrong method.
+          const missingRes = await putNote(noteToken, randomUUID(), { note: "x" });
+          ok(
+            missingRes.status === 404,
+            "REG-notes: note on a missing row is 404"
+          );
+          const badRes = await putNote(noteToken, noteTxId, { note: 42 });
+          ok(
+            badRes.status === 400,
+            "REG-notes: non-string note is rejected (400)"
+          );
+          const longRes = await putNote(noteToken, noteTxId, {
+            note: "y".repeat(2001),
+          });
+          ok(
+            longRes.status === 400,
+            "REG-notes: over-long note is rejected (400)"
+          );
+          const getRes = await noteRoute.loader();
+          ok(getRes.status === 405, "REG-notes: note loader is GET-rejected (405)");
+        }
+      }
+    }
+  }
+
+  // ================= REG: SPIN_OFF FMV (cost-basis allocation) =================
+  // Spin-offs with an FMV pair split the parent's cumCost pro-rata by total
+  // FMV (parent FMV x held shares : child FMV x shares received); legacy rows
+  // without the pair keep the old valuation and surface needsReview: true.
+  // Requires the 0023 migration (parent/child FMV columns) — skipped when absent.
+  {
+    const fmvCol =
+      await client`SELECT column_name FROM information_schema.columns WHERE table_name = 'corporate_actions' AND column_name = 'parent_fmv_per_share'`;
+    if (fmvCol.length === 0) {
+      console.log(
+        "\n  SKIP  REG-spin-fmv: FMV columns absent (run the 0023 migration)"
+      );
+    } else {
+      console.log("\n=== REG: SPIN_OFF FMV ===");
+      const { randomUUID } = await import("node:crypto");
+      const registerRoute = await import("../app/routes/api/auth/register");
+      const caRoute = await import("../app/routes/api/corporate-actions");
+      const spinEmail = `spin-${randomUUID()}@test.local`;
+      const spinPass = "SpinPass!234";
+      const spinReg = await registerRoute.action({
+        request: new Request("http://test.local/api/v1/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: spinEmail, password: spinPass }),
+        }),
+      } as never);
+      const spinJson = (await spinReg.json()) as {
+        data?: { user?: { id?: string } };
+      };
+      const spinUserId = spinJson.data?.user?.id;
+      if (!spinUserId) {
+        ok(false, "REG-spin: register failed to create the spin test user");
+      } else {
+        smokeUserIds.push(spinUserId);
+        const spinLogin = await loginAs(spinEmail, spinPass);
+        const spinToken = spinLogin.data?.accessToken as string | undefined;
+        if (!spinToken) {
+          ok(false, "REG-spin: spin user could not log in");
+        } else {
+          const postCa = (token: string, body: unknown) =>
+            caRoute.action({
+              request: new Request("http://test.local/api/v1/corporate-actions", {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify(body),
+              }),
+            } as never);
+          const listCa = (token: string) =>
+            caRoute.loader({
+              request: new Request("http://test.local/api/v1/corporate-actions", {
+                headers: { Authorization: `Bearer ${token}` },
+              }),
+            } as never);
+
+          // 1. One-sided FMV is rejected (both-or-neither, never guessed).
+          const oneSided = await postCa(spinToken, {
+            symbol: "MOM",
+            actionType: "SPIN_OFF",
+            transactionDate: "2026-03-01",
+            sharesOut: "10",
+            priceOut: "10",
+            parentFmvPerShare: "90",
+          });
+          ok(oneSided.status === 422, "REG-spin: one-sided FMV spin-off rejected (422)");
+
+          // 2. FMV pair accepted.
+          const fmvRes = await postCa(spinToken, {
+            symbol: "MOM",
+            actionType: "SPIN_OFF",
+            transactionDate: "2026-03-01",
+            sharesOut: "10",
+            priceOut: "10",
+            newSymbol: "KID",
+            parentFmvPerShare: "90",
+            childFmvPerShare: "10",
+          });
+          ok(fmvRes.status === 201, "REG-spin: FMV-pair spin-off created (201)");
+
+          // 3. Legacy spin-off (no FMV) accepted and flagged for review.
+          const legacyRes = await postCa(spinToken, {
+            symbol: "MOM",
+            actionType: "SPIN_OFF",
+            transactionDate: "2026-03-02",
+            sharesOut: "5",
+            priceOut: "8",
+            newSymbol: "KID2",
+          });
+          ok(legacyRes.status === 201, "REG-spin: legacy spin-off without FMV created (201)");
+
+          const listRes = await listCa(spinToken);
+          const listBody = (await listRes.json()) as {
+            data?: { newSymbol?: string | null; needsReview?: boolean }[];
+          };
+          const kid = listBody.data?.find((r) => r.newSymbol === "KID");
+          const kid2 = listBody.data?.find((r) => r.newSymbol === "KID2");
+          ok(
+            listRes.status === 200 && kid?.needsReview === false,
+            "REG-spin: FMV spin-off lists with needsReview false"
+          );
+          ok(
+            listRes.status === 200 && kid2?.needsReview === true,
+            "REG-spin: legacy spin-off lists with needsReview true"
+          );
+
+          // Self-cleaning so CLEANUP can delete the user (FK has no cascade).
+          await client`DELETE FROM corporate_actions WHERE user_id = ${spinUserId}`;
+          await client`DELETE FROM cost_basis_state WHERE user_id = ${spinUserId}`;
+        }
+      }
+    }
+  }
+
+  // ================= REG: TRADING JOURNAL SCOPE (replay + current-holdings) =================
+  // The journal page's avgCostAtTime must be replayed over the FULL lifetime
+  // history BEFORE the from/to/symbol filters are applied (a date window that
+  // truncates the replay used to rewrite/erase the averages landing inside
+  // it), and the per-stock summary must list ONLY currently-held symbols (a
+  // fully-sold position has no cost_basis_state row, so no card — its trades
+  // stay in the journal table). Requires the 0020 trade-detail columns.
+  {
+    const detailCol =
+      await client`SELECT column_name FROM information_schema.columns WHERE table_name = 'journal_entries' AND column_name = 'gross_amount'`;
+    if (detailCol.length === 0) {
+      console.log(
+        "\n  SKIP  REG-journal-scope: trade-detail columns absent (run the 0020 migration)"
+      );
+    } else {
+      console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
+      const { randomUUID } = await import("node:crypto");
+      const registerRoute = await import("../app/routes/api/auth/register");
+      const scopedJournalRoute = await import("../app/routes/api/trading-journal");
+      const scopeEmail = `scope-${randomUUID()}@test.local`;
+      const scopePass = "ScopePass!234";
+      const scopeReg = await registerRoute.action({
+        request: new Request("http://test.local/api/v1/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: scopeEmail, password: scopePass }),
+        }),
+      } as never);
+      const scopeJson = (await scopeReg.json()) as {
+        data?: { user?: { id?: string } };
+      };
+      const scopeUserId = scopeJson.data?.user?.id;
+      if (!scopeUserId) {
+        ok(false, "REG-scope: register failed to create the scope test user");
+      } else {
+        smokeUserIds.push(scopeUserId);
+        const scopeLogin = await loginAs(scopeEmail, scopePass);
+        const scopeToken = scopeLogin.data?.accessToken as string | undefined;
+        if (!scopeToken) {
+          ok(false, "REG-scope: scope user could not log in");
+        } else {
+          const nowIso = new Date().toISOString();
+          const insertRow = (
+            entryNo: number,
+            entryDate: string,
+            txId: string,
+            values: Record<string, string | null | boolean>
+          ) =>
+            client`
+              INSERT INTO journal_entries
+                (id, user_id, entry_no, entry_date, description, source_type, source_transaction_id, status, created_at, updated_at, category, symbol, side, quantity, unit_price, gross_amount, fees, net_amount, currency, amount, amount_thb, fx_rate_effective, is_fx_conversion, posting_state)
+              VALUES
+                (${randomUUID()}, ${scopeUserId}, ${entryNo}, ${entryDate}, ${`REG ${txId}`}, 'STATEMENT', ${txId}, 'POSTED', ${nowIso}, ${nowIso}, 'asset', ${values.symbol}, ${values.side}, ${values.quantity}, ${values.unitPrice}, ${values.grossAmount}, ${values.fees}, ${values.netAmount}, 'USD', ${values.amount}, ${values.amountThb}, '35.50', false, 'SKIPPED')`;
+          // SCOPX: one BUY before 2026-01-01, then BUY + SELL inside the window.
+          // Full-lifetime Webull replay: avg 10 -> (100+300)/20 = 20 for both.
+          await insertRow(1, "2025-11-01", randomUUID(), {
+            symbol: "SCOPX", side: "BUY", quantity: "10", unitPrice: "10.00",
+            grossAmount: "100.00", fees: "0.05", netAmount: "100.05",
+            amount: "100.00", amountThb: "3550.00",
+          });
+          await insertRow(2, "2026-02-01", randomUUID(), {
+            symbol: "SCOPX", side: "BUY", quantity: "10", unitPrice: "30.00",
+            grossAmount: "300.00", fees: "0.05", netAmount: "300.05",
+            amount: "300.00", amountThb: "10650.00",
+          });
+          await insertRow(3, "2026-03-01", randomUUID(), {
+            symbol: "SCOPX", side: "SELL", quantity: "5", unitPrice: "40.00",
+            grossAmount: "200.00", fees: "0.05", netAmount: "199.95",
+            amount: "200.00", amountThb: "7100.00",
+          });
+          // SOLDX: journal trade with NO cost_basis_state row (fully sold).
+          await insertRow(4, "2026-04-01", randomUUID(), {
+            symbol: "SOLDX", side: "BUY", quantity: "10", unitPrice: "5.00",
+            grossAmount: "50.00", fees: "0.05", netAmount: "50.05",
+            amount: "50.00", amountThb: "1775.00",
+          });
+          // HELDX: currently held (has a cost_basis_state row).
+          await insertRow(5, "2026-04-02", randomUUID(), {
+            symbol: "HELDX", side: "BUY", quantity: "5", unitPrice: "10.00",
+            grossAmount: "50.00", fees: "0.05", netAmount: "50.05",
+            amount: "50.00", amountThb: "1775.00",
+          });
+          await client`
+            INSERT INTO cost_basis_state
+              (id, user_id, symbol, quantity, avg_cost, cum_quantity, cum_cost, updated_at)
+            VALUES
+              (${randomUUID()}, ${scopeUserId}, 'HELDX', '5', '10.00', '5', '50.00', ${nowIso})`;
+
+          const getJournal = (qs: string) =>
+            scopedJournalRoute.loader({
+              request: new Request(`http://test.local/api/v1/trading-journal${qs}`, {
+                headers: { Authorization: `Bearer ${scopeToken}` },
+              }),
+            } as never);
+          const readEntries = async (qs: string) => {
+            const res = await getJournal(qs);
+            const body = (await res.json()) as {
+              data?: {
+                entries?: {
+                  transactionId?: string; date?: string; side?: string;
+                  symbol?: string | null; avgCostAtTime?: number | null;
+                }[];
+                holdings?: { symbol?: string }[];
+              };
+            };
+            ok(res.status === 200, `REG-scope: GET /api/v1/trading-journal${qs || " (unfiltered)"} is 200`);
+            return body.data;
+          };
+          const unfiltered = await readEntries("");
+          const windowed = await readEntries("?from=2026-01-01");
+          const avgOf = (
+            rows: { symbol?: string | null; side?: string; date?: string; avgCostAtTime?: number | null }[] | undefined,
+            side: string,
+            symbol: string,
+            date: string
+          ) =>
+            rows?.find((e) => e.side === side && e.symbol === symbol && e.date === date)
+              ?.avgCostAtTime ?? null;
+          const fullBuy = avgOf(unfiltered?.entries, "BUY", "SCOPX", "2026-02-01");
+          const fullSell = avgOf(unfiltered?.entries, "SELL", "SCOPX", "2026-03-01");
+          const winBuy = avgOf(windowed?.entries, "BUY", "SCOPX", "2026-02-01");
+          const winSell = avgOf(windowed?.entries, "SELL", "SCOPX", "2026-03-01");
+          ok(
+            fullBuy === 20 && fullSell === 20,
+            "REG-scope: unfiltered SCOPX replay reports the lifetime average 20 for the in-window BUY and SELL"
+          );
+          ok(
+            winBuy === fullBuy && winSell === fullSell,
+            "REG-scope: ?from=2026-01-01 does not rewrite the averages (was null/30 before the full-lifetime replay fix)"
+          );
+          ok(
+            unfiltered?.entries?.some((e) => e.symbol === "SOLDX") === true,
+            "REG-scope: fully-sold SOLDX stays in the journal table"
+          );
+          ok(
+            unfiltered?.holdings?.some((h) => h.symbol === "HELDX") === true &&
+              unfiltered?.holdings?.some((h) => h.symbol === "SOLDX") === false,
+            "REG-scope: summary lists the currently-held HELDX but not the fully-sold SOLDX"
+          );
+
+          // Self-cleaning (shared CLEANUP also removes this user's journal rows).
+          await client`DELETE FROM cost_basis_state WHERE user_id = ${scopeUserId}`;
+          await client`DELETE FROM journal_entries WHERE user_id = ${scopeUserId}`;
+        }
+      }
+    }
+  }
+
   // ================= CLEANUP =================
   console.log("\n=== CLEANUP ===");
   const cleanIds: string[] = [];
@@ -1537,7 +3203,18 @@ async function main() {
   }
   await client`DELETE FROM audit_logs WHERE created_at >= ${startTime}`;
   await client`DELETE FROM notifications WHERE created_at >= ${startTime}`;
+  // Ledger rows are FK-bound to accounts/entries: remove lines -> entries ->
+  // accounts for every smoke user (register now seeds a chart of accounts) and
+  // for USER A (whose statement uploads lazily-seeded accounts + postings).
+  if (userARow) {
+    await client`DELETE FROM journal_entry_lines WHERE user_id = ${userARow.id}`;
+    await client`DELETE FROM journal_entries WHERE user_id = ${userARow.id}`;
+    await client`DELETE FROM accounts WHERE user_id = ${userARow.id}`;
+  }
   for (const sid of smokeUserIds) {
+    await client`DELETE FROM journal_entry_lines WHERE user_id = ${sid}`;
+    await client`DELETE FROM journal_entries WHERE user_id = ${sid}`;
+    await client`DELETE FROM accounts WHERE user_id = ${sid}`;
     await client`DELETE FROM "User" WHERE id = ${sid}`;
   }
   console.log("  Removed test audit rows, transient records, and smoke-test users.");

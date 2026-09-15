@@ -68,9 +68,8 @@ export async function loader({ request }: Route.LoaderArgs) {
 
     const fxProviderOk = true; // keyless built-in historical FX provider
     const geminiOk = isGeminiConfigured();
-    const taxEngineOk = true;
-    const connectedApis = [fxProviderOk, geminiOk, taxEngineOk].filter(Boolean).length;
-    const totalApis = 3;
+    const connectedApis = [fxProviderOk, geminiOk].filter(Boolean).length;
+    const totalApis = 2;
 
     return Response.json(
       {
@@ -90,7 +89,6 @@ export async function loader({ request }: Route.LoaderArgs) {
             total: totalApis,
             fxProvider: { configured: fxProviderOk },
             gemini: { configured: geminiOk },
-            taxEngine: { configured: taxEngineOk },
           },
         },
       },

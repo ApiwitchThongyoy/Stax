@@ -43,16 +43,27 @@ export interface ExtractedTransaction {
   realizedGainLoss?: number; // proceeds - costBasis (เฉพาะ SELL ที่คำนวณได้)
   netAmount?: number; // ยอดเงินสุทธิที่โบรกเกอร์ระบุ (fees ถูกหัก/รวมแล้ว) — authoritative
   exchange?: string; // ตลาดที่ซื้อขาย เช่น NASDAQ / NYSE / NYSEARCA
+  // ---- Currency-exchange FROM side (CURRENCY EXCHANGE RECORDS block) ----
+  // These carry the source side the bank printed so the cash page can show
+  // "from Ccy fromAmt -> to Ccy toAmt (rate)" without re-parsing.
+  exchangeFromCurrency?: string;
+  exchangeFromAmount?: number;
+  exchangeRate?: number;
 }
 
-// ---------- ต้นทุนเฉลี่ยสะสม (running average cost) ต่อสัญลักษณ์หุ้น ----------
+// ---------- ต้นทุนเฉลี่ยสะสม (Webull Average Cost) ต่อสัญลักษณ์หุ้น ----------
 // เก็บสถานะนี้ไว้ข้าม session (localStorage) เพื่อให้แม่นยำขึ้นเรื่อยๆ ทุกครั้งที่ import statement เดือนใหม่
 // Key ถูก scope ตาม userId เพื่อไม่ให้ข้อมูลต้นทุนของอีกบัญชีหลุดข้ามมา
-export interface CostBasisEntry {
-  quantity: number;
-  avgCost: number; // ต้นทุนเฉลี่ยต่อหุ้น ในสกุลเงินของหุ้นตัวนั้น
-}
-export type CostBasisMap = Record<string, CostBasisEntry>;
+// ประเภทเดียวกันกับที่ server ใช้ (cost-basis-engine) — parser/การ replay/backfill
+// ใช้คณิตศาสตร์ Webull Average Cost เดียวกันทั้งหมด
+import {
+  applyAverageCostTrade,
+  type CostBasisMap,
+  type CostBasisPosition,
+} from "./cost-basis-engine";
+export type { CostBasisMap } from "./cost-basis-engine";
+/** Local alias kept for legacy importers of the parser's position type. */
+export type CostBasisEntry = CostBasisPosition;
 
 function costBasisStorageKey(userId: string): string {
   return `stax_cost_basis_${userId}`;
@@ -63,7 +74,25 @@ export function loadCostBasis(userId: string): CostBasisMap {
   if (!userId) return {};
   try {
     const raw = window.localStorage.getItem(costBasisStorageKey(userId));
-    return raw ? (JSON.parse(raw) as CostBasisMap) : {};
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, Partial<CostBasisPosition>>;
+    const map: CostBasisMap = {};
+    for (const [symbol, p] of Object.entries(parsed)) {
+      const quantity = Number(p?.quantity);
+      const avgCost = Number(p?.avgCost);
+      if (!Number.isFinite(quantity) || !Number.isFinite(avgCost)) continue;
+      // Legacy rows (pre-Webull) only stored quantity/avgCost — hydrate the
+      // cumulative fields as "everything bought at the stored average".
+      const cumQuantity = Number(p?.cumQuantity);
+      const cumCost = Number(p?.cumCost);
+      map[symbol] = {
+        quantity,
+        avgCost,
+        cumQuantity: Number.isFinite(cumQuantity) && cumQuantity > 0 ? cumQuantity : quantity,
+        cumCost: Number.isFinite(cumCost) && cumCost > 0 ? cumCost : quantity * avgCost,
+      };
+    }
+    return map;
   } catch {
     return {};
   }
@@ -191,7 +220,16 @@ function parsePortfolioSummary(fullText: string): Record<string, CostBasisEntry>
     }
     const m = line.match(summaryRowPattern);
     if (m && currentSymbol) {
-      summary[currentSymbol] = { quantity: toNumber(m[1]), avgCost: toNumber(m[2]) };
+      // Webull Average Cost baseline: the statement's own displayed average is
+      // the authoritative starting point for this holding.
+      const qty = toNumber(m[1]);
+      const avg = toNumber(m[2]);
+      summary[currentSymbol] = {
+        quantity: qty,
+        avgCost: avg,
+        cumQuantity: qty,
+        cumCost: qty * avg,
+      };
       currentSymbol = null; // จับคู่ครบแล้ว รอสัญลักษณ์ตัวถัดไป
     }
   }
@@ -401,6 +439,9 @@ export function parseStatementRows(
         rate,
         section: "แลกเปลี่ยนสกุลเงิน",
         included: false,
+        exchangeFromCurrency: fromCcy,
+        exchangeFromAmount: toNumber(fromAmt),
+        exchangeRate: toNumber(rate),
       });
     }
   }
@@ -649,48 +690,33 @@ export function parseStatementRows(
     // proceeds = broker net, costBasis = avgCost*qty, realized gain/loss.
     let realizedMeta: { proceeds: number; costBasis: number; realizedGainLoss: number } | undefined;
 
-    if (ev.side === "BUY") {
-      const existing = workingCostBasis[ev.symbol];
-      const priceNum = toNumber(ev.price);
-      const prevQty = existing?.quantity ?? 0;
-      const prevAvgCost = existing?.avgCost ?? priceNum;
-      const newQty = prevQty + ev.qty;
-      const newAvgCost =
-        newQty > 0 ? (prevQty * prevAvgCost + ev.qty * priceNum) / newQty : priceNum;
-      workingCostBasis[ev.symbol] = { quantity: newQty, avgCost: newAvgCost };
-    } else {
-      // SELL: ใช้ต้นทุนเฉลี่ยที่มีอยู่ ณ ตอนนี้ (จากประวัติสะสม) ก่อน แล้วค่อย fallback ไปใช้ค่าจากตาราง Portfolio Summary
-      // ของไฟล์นี้เอง (กรณีไม่เคยมีประวัติสะสมของสัญลักษณ์นี้มาก่อนเลย)
-      const existing = workingCostBasis[ev.symbol];
-      const seed = portfolioSummary[ev.symbol];
-      const availableQty = existing?.quantity ?? seed?.quantity ?? 0;
-      const saleAvgCost =
-        existing?.quantity !== undefined && existing?.quantity >= 0
-          ? existing.avgCost
-          : seed?.avgCost;
+    // Webull Average Cost: BUY accumulates (price×qty, fees excluded) into the
+    // lifetime average; SELL reduces the live quantity only, keeps the average.
+    // A SELL with no prior history falls back to this statement's own
+    // PORTFOLIO SUMMARY (seed) as the "held before records" baseline.
+    const seed = portfolioSummary[ev.symbol];
+    const { sellBasis } = applyAverageCostTrade(
+      workingCostBasis,
+      ev.symbol,
+      ev.side,
+      ev.qty,
+      toNumber(ev.price),
+      seed
+    );
 
-      // จำนวนที่ขายต้องไม่เกินจำนวนที่ถืออยู่จริง (จากประวัติสะสมหรือ Portfolio Summary)
-      // ถ้าไม่มีต้นทุนเฉลี่ย หรือขายเกินจำนวนที่ถือ -> คำนวณไม่ได้ (non-computable)
-      const sufficient = availableQty > 0 && availableQty >= ev.qty;
-      if (saleAvgCost !== undefined && sufficient) {
-        // ใช้ "Net Amount" ที่โบรกเกอร์ระบุ (หักค่าธรรมเนียมแล้ว) เป็นยอดขายสุทธิ (authoritative)
-        // แทนการสร้างยอดใหม่เอง: realized  = netProceeds - avgCost*qty
-        pnlAmount = ev.net - saleAvgCost * ev.qty;
-        realizedMeta = {
-          proceeds: ev.net,
-          costBasis: saleAvgCost * ev.qty,
-          realizedGainLoss: pnlAmount,
-        };
-      } else {
-        pnlNote = " (ไม่พบต้นทุนเฉลี่ย หรือจำนวนขายเกินจำนวนที่ถือ จึงไม่นับกำไร/ขาดทุนส่วนนี้)";
-      }
-
-      const remainingQty = Math.max(availableQty - ev.qty, 0);
-      const prevAvgCost = existing?.avgCost ?? saleAvgCost ?? toNumber(ev.price);
-      workingCostBasis[ev.symbol] = {
-        quantity: remainingQty,
-        avgCost: prevAvgCost, // ต้นทุนเฉลี่ยไม่เปลี่ยนตอนขาย เปลี่ยนแค่ตอนซื้อเพิ่ม
+    if (ev.side === "SELL" && sellBasis !== null) {
+      // ใช้ "Net Amount" ที่โบรกเกอร์ระบุ (หักค่าธรรมเนียมแล้ว) เป็นยอดขายสุทธิ (authoritative)
+      // แทนการสร้างยอดใหม่เอง: realized  = netProceeds - avgCost*qty
+      // ตั้งใจไม่ปัดทศนิยมที่นี่ — การปัด 2dp (2-stage: gain ก่อน แล้วค่อย ×fx)
+      // เกิดที่ statement-pipeline (mapToCapitalRow / realizedUpdateFor) เท่านั้น
+      pnlAmount = ev.net - sellBasis * ev.qty;
+      realizedMeta = {
+        proceeds: ev.net,
+        costBasis: sellBasis * ev.qty,
+        realizedGainLoss: pnlAmount,
       };
+    } else if (ev.side === "SELL") {
+      pnlNote = " (ไม่พบต้นทุนเฉลี่ย หรือจำนวนขายเกินจำนวนที่ถือ จึงไม่นับกำไร/ขาดทุนส่วนนี้)";
     }
 
     const priceNum = toNumber(ev.price);

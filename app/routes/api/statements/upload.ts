@@ -12,13 +12,14 @@ import { computeContentHash, buildDuplicatePayload } from "~/lib/statement-hash"
 import { extractTextFromPdfBytes } from "~/lib/pdf-text-extractor";
 import {
   buildStatementTransactions,
-  insertStatementTransactions,
   applyFxRateFallback,
   hasSavedDocumentRows,
   loadCostBasisState,
   saveCostBasisState,
+  backfillComputedGainLoss,
   summarizeRows,
 } from "~/lib/statement-pipeline";
+import { insertStatementImport } from "~/lib/ledger-service";
 import { resolveHistoricalFxRate } from "~/lib/historical-fx-provider";
 import {
   parseStatementWithGemini,
@@ -139,6 +140,28 @@ async function runGeminiAnalysis(
 }
 
 /**
+ * Journal stats for the remaining "posting" transport shape. The journal is now
+ * written ATOMICALLY with the Capital_Transactions rows (insertStatementImport),
+ * so any row that could not be posted is recorded as a SKIPPED entry IN the
+ * journal (never silently dropped, never written outside the transaction).
+ * skippedWrite stays [] — a write-level failure can no longer happen "after"
+ * a committed import (it would roll the whole import back instead).
+ */
+function toPostingView(journal: {
+  postedCount: number;
+  entryNumbers: number[];
+  skipped: { transactionId: string; reason: string }[];
+}) {
+  return {
+    posted: journal.postedCount,
+    entryNumbers: journal.entryNumbers,
+    skippedRows: journal.skipped.length,
+    skippedWrite: [],
+    skipped: journal.skipped.map((s) => ({ transactionId: s.transactionId, reason: s.reason })),
+  };
+}
+
+/**
  * Re-import/rebuild path for a document whose derived ledger rows were deleted.
  *
  * Re-extracts the text from the uploaded bytes (identical content hash), re-parses,
@@ -210,15 +233,29 @@ async function rebuildStatementImport(input: {
     await notifyAnalysisComplete(userId, fileName, documentId);
   }
 
-  // Insert authority FIRST, then reconcile the cost-basis cache so the cache is
-  // only ever rewritten from rows that actually committed. Best-effort: a
-  // basis-write failure must not surface as a 500 once the rows are committed.
-  const result = await insertStatementTransactions(userId, fallbackRows);
+  // Insert authority FIRST (rows AND their journal entries commit atomically),
+  // then reconcile the cost-basis cache so the cache is only ever rewritten from
+  // rows that actually committed. Best-effort: a basis-write failure must not
+  // surface as a 500 once the rows are committed.
+  const result = await insertStatementImport(userId, fallbackRows);
   try {
     await saveCostBasisState(userId, built.updatedCostBasis);
   } catch (basisError) {
     console.error("Statement rebuild: cost-basis persist failed", basisError);
   }
+
+  // Heal any legacy frozen SELL rows whose realized gain/loss only became
+  // computable once this (or another) statement's buys are in the ledger.
+  // Best-effort — never fails an already-committed rebuild.
+  try {
+    await backfillComputedGainLoss(userId);
+  } catch (backfillError) {
+    console.error("Statement rebuild: gain-loss backfill failed", backfillError);
+  }
+
+  // The journal was written inside the same transaction as the rows above
+  // (every row -> POSTED or SKIPPED journal entry). Nothing left to post here.
+  const posting = toPostingView(result.journal);
 
   const stats = summarizeRows(fallbackRows);
   await insertAuditLog({
@@ -232,6 +269,11 @@ async function rebuildStatementImport(input: {
       result: "reimported",
       insertedCount: result.insertedCount,
       stats,
+      posting: {
+        posted: posting.posted,
+        skippedRows: posting.skippedRows,
+        skippedWrite: posting.skippedWrite.length,
+      },
     },
   });
   await notifyStatementImported(userId, fileName, result.insertedCount, documentId);
@@ -248,6 +290,13 @@ async function rebuildStatementImport(input: {
       rebuilt: true,
       duplicateDecision: "rebuilt",
       stats,
+      posting: {
+        posted: posting.posted,
+        entryNumbers: posting.entryNumbers,
+        skippedRows: posting.skippedRows,
+        skippedWrite: posting.skippedWrite.length,
+        skipped: posting.skipped,
+      },
       ai: aiResult,
     },
   });
@@ -464,8 +513,10 @@ export async function action({ request }: Route.ActionArgs) {
       });
     }
 
-    // 5. Atomic insert into Capital_Transactions FIRST — the authoritative step.
-    const result = await insertStatementTransactions(auth.userId, fallbackRows);
+    // 5. Atomic insert into Capital_Transactions + journal_entries (every row
+    //    gets its POSTED or SKIPPED journal entry in the SAME transaction) —
+    //    the authoritative SSOT step.
+    const result = await insertStatementImport(auth.userId, fallbackRows);
 
     // 5a. Persist the updated running-average cost basis only AFTER the rows
     //     have actually committed, so the derived cache can never be written
@@ -478,6 +529,19 @@ export async function action({ request }: Route.ActionArgs) {
       console.error("Statement upload: cost-basis persist failed", basisError);
     }
 
+    // 5a2. Heal any legacy frozen SELL rows whose realized gain/loss only
+    //     became computable once this (or historical) statement's buys are in
+    //     the ledger. Best-effort — never fails an already-committed import.
+    try {
+      await backfillComputedGainLoss(auth.userId);
+    } catch (backfillError) {
+      console.error("Statement upload: gain-loss backfill failed", backfillError);
+    }
+
+    // 5b. The journal was written inside the same transaction as the rows above
+    //     (every row -> POSTED or SKIPPED journal entry). Nothing more to post.
+    const posting = toPostingView(result.journal);
+
     await insertAuditLog({
       userId: auth.userId,
       action: AuditAction.STATEMENT_IMPORT,
@@ -489,6 +553,11 @@ export async function action({ request }: Route.ActionArgs) {
         result: "imported",
         insertedCount: result.insertedCount,
         stats: summarizeRows(fallbackRows),
+        posting: {
+          posted: posting.posted,
+          skippedRows: posting.skippedRows,
+          skippedWrite: posting.skippedWrite.length,
+        },
       },
     });
 
@@ -506,6 +575,13 @@ export async function action({ request }: Route.ActionArgs) {
         rebuilt: false,
         duplicateDecision: "fresh",
         stats: summarizeRows(fallbackRows),
+        posting: {
+          posted: posting.posted,
+          entryNumbers: posting.entryNumbers,
+          skippedRows: posting.skippedRows,
+          skippedWrite: posting.skippedWrite.length,
+          skipped: posting.skipped,
+        },
         ai: aiResult,
       },
     });

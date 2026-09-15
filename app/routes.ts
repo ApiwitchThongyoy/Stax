@@ -27,8 +27,32 @@ export default [
 
   route("api/v1/capital-ledgers", "routes/api/capital-ledgers.ts"),
   route("api/v1/capital-ledgers/:id", "routes/api/capital-ledgers.$id.ts"),
+  route("api/v1/cash-summary", "routes/api/cash-summary.ts"),
+
+  route("api/v1/corporate-actions", "routes/api/corporate-actions.ts"),
+  route("api/v1/corporate-actions/:id", "routes/api/corporate-actions.$id.ts"),
+
+  route("api/v1/accounts", "routes/api/accounts.ts"),
+  route("api/v1/journal", "routes/api/journal.ts"),
+  route("api/v1/journal/:id/reverse", "routes/api/journal.$id.reverse.ts"),
+  route("api/v1/ledger/accounts/:accountId", "routes/api/ledger.$accountId.ts"),
+  route("api/v1/ledger/summary", "routes/api/ledger.summary.ts"),
+  route("api/v1/cost-basis", "routes/api/cost-basis.ts"),
+  route("api/v1/portfolio/:symbol", "routes/api/portfolio.$symbol.ts"),
+  route("api/v1/trading-journal", "routes/api/trading-journal.ts"),
+  route(
+    "api/v1/trading-journal/:transactionId/note",
+    "routes/api/trading-journal.$transactionId.note.ts"
+  ),
+
+  route("api/v1/stock-prices", "routes/api/stock-prices.ts"),
+  route("api/v1/stock-prices/refresh", "routes/api/stock-prices/refresh.ts"),
+  route("api/v1/reports/trial-balance", "routes/api/reports/trial-balance.ts"),
+  route("api/v1/reports/income-statement", "routes/api/reports/income-statement.ts"),
+  route("api/v1/reports/balance-sheet", "routes/api/reports/balance-sheet.ts"),
 
   route("api/v1/statements/upload", "routes/api/statements/upload.ts"),
+  route("api/v1/statements/preview", "routes/api/statements/preview.ts"),
 
   route("api/v1/documents", "routes/api/documents.ts"),
   route("api/v1/documents/:id", "routes/api/documents.$id.ts"),
@@ -36,17 +60,13 @@ export default [
     "api/v1/documents/:id/download",
     "routes/api/documents.$id.download.ts"
   ),
-
-  route("api/v1/tax/calculate", "routes/api/tax/calculate.ts"),
+  route(
+    "api/v1/documents/:id/transactions",
+    "routes/api/documents.$id.transactions.ts"
+  ),
 
   route("api/v1/exchange-rates", "routes/api/exchange-rates.ts"),
   route("api/v1/exchange-rates/status", "routes/api/exchange-rates/status.ts"),
-
-  route("api/v1/export", "routes/api/export.ts"),
-
-  route("api/v1/analysis", "routes/api/analysis.ts"),
-
-  route("api/v1/aggregation/daily", "routes/api/aggregation/daily.ts"),
 
   route("api/v1/admin/users", "routes/api/admin/users.ts"),
   route("api/v1/admin/users/:id", "routes/api/admin/users.$id.ts"),

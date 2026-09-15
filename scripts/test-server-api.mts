@@ -1,7 +1,7 @@
 // Server-authoritative frontend wiring tests (pure, no DB, no browser).
 //
 // Covers the mapping used to render server Capital_Transactions rows on the
-// Dashboard / FX page / Calendar:
+// Dashboard / FX page:
 //   - identity is the authoritative transactionId (unique),
 //   - duplicate-looking legitimate rows are both preserved (identical
 //     date/amount do NOT count as duplicates),
@@ -10,10 +10,13 @@
 // Run:  npx tsx scripts/test-server-api.mts
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import "./_load-env.mjs";
 import {
   capitalRowToTransaction,
   capitalLedgerToTransactions,
   type CapitalLedgerRow,
+  holdingTotalCost,
+  holdingCurrency,
 } from "../app/lib/server-api";
 import {
   sumAuthoritativeGainThb,
@@ -151,6 +154,10 @@ function main() {
     "computable SELL row maps pnlAmount to authoritative realizedGainLossThb (THB)"
   );
   ok(
+    sellTx.sourceDocumentId === "b3b598f4-ea24-4b85-be8d-8b93ac5263f3",
+    "sourceDocumentId maps through to the frontend Transaction (Statement-per-day wiring)"
+  );
+  ok(
     sellTx.symbol === "NVDA" &&
       sellTx.side === "SELL" &&
       sellTx.quantity === "0.0160" &&
@@ -176,8 +183,12 @@ function main() {
   );
   const dashSrc = readFileSync(join(process.cwd(), "app/component/DashboardUser/Dashboard.tsx"), "utf8");
   ok(
-    dashSrc.includes("sumAuthoritativeGainThb") && !dashSrc.includes("pnlAmount *"),
-    "Dashboard card uses the THB-sum helper and no longer multiplies pnlAmount by rate"
+    !dashSrc.includes("pnlAmount *"),
+    "Dashboard screen no longer multiplies pnlAmount by rate (no FX re-application in React)"
+  );
+  ok(
+    !dashSrc.includes("sumAuthoritativeGainThb"),
+    "Dashboard screen no longer computes P&L totals in React (the overview moved server-side)"
   );
 
   // 4c. Partial computability: a mixed set (one computable SELL, one null)
@@ -196,11 +207,19 @@ function main() {
     "amount=foreign, rate=FX -> amount*rate gives THB (formula unchanged)"
   );
 
-  // 6. Data source wiring: the frontend fetches from the server endpoints.
+  // 6. Data source wiring: dashboard home fetches the shared server fetchers,
+  //     and the Overview tab from its own server endpoints.
   const dash = readFileSync(join(process.cwd(), "app/component/DashboardUser/Dashboard.tsx"), "utf8");
+  const overview = readFileSync(join(process.cwd(), "app/component/LedgerRedesign/OverviewTab.tsx"), "utf8");
   ok(
-    dash.includes("fetchCapitalLedger") && dash.includes("capitalLedgerToTransactions"),
-    "Dashboard loads transactions from the server ledger (not session state)"
+    dash.includes("fetchCapitalLedger") &&
+      dash.includes("capitalLedgerToTransactions") &&
+      dash.includes("fetchUserDocuments"),
+    "Dashboard feeds the home view from the SHARED server fetchers (server-authoritative)"
+  );
+  ok(
+    overview.includes("fetchLedgerSummary") && overview.includes("fetchCostBasis"),
+    "Overview tab loads numbers from GET /api/v1/ledger/summary + GET /api/v1/cost-basis (server-authoritative)"
   );
   ok(
     !dash.includes("[...mapped, ...prev]"),
@@ -255,6 +274,89 @@ function main() {
       !listDl.includes("getLocalBlobById") &&
       !listDl.includes("getLocalDocumentByName"),
     "Stored Documents List download handler fetches from server (IndexedDB not authoritative)"
+  );
+
+  // ---- holdings display helpers (server fields only, no computed P&L) ----
+  ok(
+    holdingCurrency("NVDA") === "USD" && holdingCurrency("BBAI") === "USD",
+    "holdingCurrency is a display-only label defaulting to USD for US tickers"
+  );
+  ok(
+    holdingTotalCost({
+      symbol: "NVDA",
+      quantity: "15",
+      avgCost: "120.50",
+      updatedAt: "2026-01-31T00:00:00.000Z",
+    }) === "1807.5",
+    "holdingTotalCost = quantity × avgCost (15 × 120.50 = 1807.5)"
+  );
+  ok(
+    holdingTotalCost({
+      symbol: "BBAI",
+      quantity: "1000",
+      avgCost: "3.42",
+      updatedAt: "2026-01-31T00:00:00.000Z",
+    }) === "3420",
+    "holdingTotalCost multiplies server numeric strings for display only"
+  );
+  ok(
+    holdingTotalCost({
+      symbol: "X",
+      quantity: "abc",
+      avgCost: "5",
+      updatedAt: "",
+    }) === "0",
+    "holdingTotalCost returns 0 for non-finite inputs instead of NaN"
+  );
+
+  // ---- per-stock detail (case-by-case) client wiring ----
+  const serverApiSrc = readFileSync(join(process.cwd(), "app/lib/server-api.ts"), "utf8");
+  const routesSrc = readFileSync(join(process.cwd(), "app/routes.ts"), "utf8");
+  ok(
+    serverApiSrc.includes("export interface PortfolioDetail") &&
+      serverApiSrc.includes("export interface PortfolioTotalsDetail") &&
+      serverApiSrc.includes("export async function fetchPortfolioDetail"),
+    "server-api exposes the per-stock PortfolioDetail DTOs + fetchPortfolioDetail helper"
+  );
+  ok(
+    serverApiSrc.includes("/api/v1/portfolio/${encodeURIComponent(symbol.trim().toUpperCase())}"),
+    "fetchPortfolioDetail targets GET /api/v1/portfolio/:symbol (uppercased + encoded)"
+  );
+  ok(
+    serverApiSrc.includes("totalRealizedThb: string | null") &&
+      serverApiSrc.includes("unrealizedPnl: string | null") &&
+      serverApiSrc.includes("P&L is never recomputed on the client"),
+    "PortfolioDetail totals are server-authoritative and explicitly non-recomputed client-side"
+  );
+  ok(
+    routesSrc.includes("api/v1/portfolio/:symbol"),
+    "app/routes.ts registers api/v1/portfolio/:symbol"
+  );
+
+  // ---- journal-as-SSOT client wiring ----
+  ok(
+    serverApiSrc.includes("export interface GeneralLedgerJournalTradeDetail") &&
+      serverApiSrc.includes('postingState: "POSTED" | "SKIPPED"') &&
+      serverApiSrc.includes("skipReason: string | null"),
+    "server-api exposes journal DTOs with postingState + skipReason (SKIPPED entries)"
+  );
+  ok(
+    serverApiSrc.includes("fees: string | null") &&
+      serverApiSrc.includes("currency: string | null") &&
+      serverApiSrc.includes("isFxConversion: boolean"),
+    "journal entry/ledger detail DTOs carry fees + currency + isFxConversion flag"
+  );
+  ok(
+    serverApiSrc.includes("export interface JournalEntryFilters") &&
+      serverApiSrc.includes("sourceType") &&
+      serverApiSrc.includes("postingState"),
+    "server-api exposes JournalEntryFilters (sourceType + postingState for fetchJournal)"
+  );
+  ok(
+    serverApiSrc.includes("export async function fetchJournal") &&
+      serverApiSrc.includes("/api/v1/journal") &&
+      serverApiSrc.includes("journalParams"),
+    "fetchJournal targets GET /api/v1/journal and builds params from period + filters"
   );
 
   console.log(`\n================ SUMMARY ================`);

@@ -5,6 +5,7 @@ import type { Route } from "./+types/register";
 import { db } from "~/lib/drizzle-db";
 import { users } from "~/db/schema";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
+import { seedDefaultChartOfAccounts } from "~/lib/ledger-service";
 
 // Same email format used by login.ts.
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -155,6 +156,15 @@ export async function action({ request }: Route.ActionArgs) {
       { success: false, message: "Internal server error" },
       { status: 500 }
     );
+  }
+
+  // Seed the default chart of accounts for the new user. Best-effort and
+  // non-blocking: a CoA seeding failure must never turn a successful
+  // registration into a 500, and the idempotent seeder re-runs safely later.
+  try {
+    await seedDefaultChartOfAccounts(id);
+  } catch (error) {
+    console.error("Register: failed to seed chart of accounts", error);
   }
 
   await insertAuditLog({
