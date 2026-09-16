@@ -1,3 +1,4 @@
+import { safeErrorLog } from "~/lib/safe-error-log";
 import type { Route } from "./+types/ledger.$accountId";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import { getAccountLedger } from "~/lib/ledger-service";
@@ -48,9 +49,12 @@ export async function loader({ request, params }: Route.LoaderArgs) {
 
   try {
     const ledger = await getAccountLedger(auth.userId, accountId, from, to);
+    if (!ledger) {
+      return Response.json({ success: false, message: "Account not found" }, { status: 404 });
+    }
     return Response.json({ success: true, data: ledger }, { status: 200 });
   } catch (error) {
-    console.error("Ledger GET: failed to query", error);
+    console.error("Ledger GET: failed to query", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }

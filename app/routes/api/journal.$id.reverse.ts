@@ -2,6 +2,7 @@ import type { Route } from "./+types/journal.$id.reverse";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 import { reverseJournalEntry } from "~/lib/ledger-service";
+import { safeErrorLog } from "~/lib/safe-error-log";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
   return (
@@ -46,7 +47,7 @@ export async function action({ request, params }: Route.ActionArgs) {
     if (!result.ok) {
       return Response.json(
         { success: false, message: result.errors.join("; ") },
-        { status: 400 }
+        { status: result.errors.includes("Journal entry not found") ? 404 : 400 }
       );
     }
 
@@ -74,7 +75,7 @@ export async function action({ request, params }: Route.ActionArgs) {
       { status: 200 }
     );
   } catch (error) {
-    console.error("Journal reverse: failed", error);
+    console.error("Journal reverse: failed", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }
