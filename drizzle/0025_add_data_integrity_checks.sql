@@ -2,70 +2,30 @@
 -- numeric columns, derived from the app's OWN constant sets (the values come
 -- from code, not comments — see the constraint comments for the evidence).
 --
--- Two tiers:
+-- Tier layout (final, after upgrade-safety review):
 --   * VALIDATED (plain ADD CONSTRAINT): every writer of the column is audited
 --     code that can only produce the allowed set (tables created/only-written
 --     by this repo's controlled history). Existing rows are verified by the
 --     ALTER; a violating row would fail the migration loudly — desired.
---   * NOT VALID: the column's real-world history includes data whose actual
---     value set can no longer be proven from the repo (pre-repo rows, the
---     removed Webull CSV importer, growing action/notification enums). The
---     existing rows are NOT re-validated (upgrade can never break), but NEW
---     inserts/updates are fully enforced. Validate() can be run later once
---     the legacy set is proven clean.
+--   * NOT VALID: kept ONLY for audit_logs.action. append-only: proven by
+--     code review (zero UPDATE/DELETE statements in the repo). NOT VALID
+--     means existing pre-repo action strings are not re-validated, and since
+--     audit rows are never updated, the CHECK re-evaluation on UPDATE (a
+--     PostgreSQL rule: any UPDATE of a row re-checks ALL its row-level CHECK
+--     constraints) can never break a legacy audit row.
+--
+-- DEFERRED (the other 8 formerly-NOT-VALID constraints) — proven DANGEROUS
+-- by live PostgreSQL 17 testing: NOT VALID skips validation at ADD-time only;
+-- an UPDATE of ANY column re-checks every row-level CHECK on that row. The 8
+-- tables have real UPDATE paths (User heartbeats/logins/status, capital-ledger
+-- PUT edits, notification mark-read), so a legacy row with one out-of-domain
+-- value would break on ANY unrelated UPDATE (SQLSTATE 23514) — the upgrade
+-- would "succeed" but leave affected rows frozen. Service-layer validation
+-- (the same constant sets listed above) already blocks NEW invalid writes, so
+-- deferring these costs nothing while guaranteeing zero legacy breakage.
 --
 -- No ENUM types are introduced (CHECK over ENUM: no casts, no NOT VALID for
 -- enums, no reordering pain, consistent with all write paths that use TEXT).
---> statement-breakpoint
--- User.role — register.ts hard-codes 'USER'; admin-auth.ts:43 / admin routes
--- require exactly 'ADMIN'. NOT VALID: the User table predates the audited
--- code (migration 0000 / shared repo clone), so legacy role values cannot be
--- proven exhaustively; new writes (only ever USER/ADMIN) are fully enforced.
-ALTER TABLE "User" ADD CONSTRAINT "chk_users_role"
-  CHECK ("role" IN ('USER', 'ADMIN')) NOT VALID;
---> statement-breakpoint
--- User.status — auth-middleware.ts:103 rejects anything except 'ACTIVE'
--- ("suspended" enforced via status === 'SUSPENDED'); the admin user endpoint
--- only ever writes 'ACTIVE' | 'SUSPENDED'. NOT VALID: same pre-repo history
--- reasoning as User.role.
-ALTER TABLE "User" ADD CONSTRAINT "chk_users_status"
-  CHECK ("status" IN ('ACTIVE', 'SUSPENDED')) NOT VALID;
---> statement-breakpoint
--- Capital_Transactions.type — statement-pipeline.ts:19 VALID_TRANSACTION_TYPES
--- = ['CASH_IN','CASH_OUT'], capital-ledgers.ts VALID_TRANSACTION_TYPES same.
--- NOT VALID: this table has pre-repo rows AND was once written by the removed
--- Webull CSV importer (migration 0015 legacy csv_import_rows), whose value set
--- is no longer recoverable from the repo.
-ALTER TABLE "Capital_Transactions" ADD CONSTRAINT "chk_capital_transactions_type"
-  CHECK ("type" IN ('CASH_IN', 'CASH_OUT')) NOT VALID;
---> statement-breakpoint
--- Capital_Transactions.source_type — statement-pipeline.ts:33/186 writes
--- 'AI_PARSED'; capital-ledgers.ts VALID_SOURCE_TYPES = ['MANUAL','AI_PARSED'].
--- NOT VALID: same pre-repo + removed-CSV-importer risk as `type`.
-ALTER TABLE "Capital_Transactions" ADD CONSTRAINT "chk_capital_transactions_source_type"
-  CHECK ("source_type" IN ('AI_PARSED', 'MANUAL')) NOT VALID;
---> statement-breakpoint
--- Capital_Transactions.side — schema comment "BUY | SELL for trade rows, else
--- null"; pdfStatementParser.ts:242 side: "BUY" | "SELL". NOT VALID: pre-repo +
--- removed-CSV-importer history (a legacy CSV row could carry a non-trade side).
-ALTER TABLE "Capital_Transactions" ADD CONSTRAINT "chk_capital_transactions_side"
-  CHECK ("side" IS NULL OR "side" IN ('BUY', 'SELL')) NOT VALID;
---> statement-breakpoint
--- Capital_Transactions.category — pdfStatementParser.ts emits exactly
--- 'income' / 'expense' / 'equity' / 'asset' (Financeutils.ts
--- TransactionCategory); schema comment line 46 quotes the same four.
--- NOT VALID: nullable column added in 0012 to an already-old table; legacy and
--- removed-CSV-importer rows are not provably within the set.
-ALTER TABLE "Capital_Transactions" ADD CONSTRAINT "chk_capital_transactions_category"
-  CHECK ("category" IS NULL OR "category" IN ('income', 'expense', 'equity', 'asset')) NOT VALID;
---> statement-breakpoint
--- Capital_Transactions.quantity — cost-basis-engine.ts:57 side "BUY"|"SELL"
--- and the average-cost engine only ever processes positive quantities; the
--- parser rejects qty <= 0; short/negative positions are NOT supported anywhere
--- (the engine caps a drain at 0 and deletes the position). NOT VALID: legacy /
--- removed-CSV-importer rows are not provably > 0.
-ALTER TABLE "Capital_Transactions" ADD CONSTRAINT "chk_capital_transactions_quantity_positive"
-  CHECK ("quantity" IS NULL OR "quantity" > 0) NOT VALID;
 --> statement-breakpoint
 -- corporate_actions.action_type — corporate-action-service.ts:19
 -- VALID_ACTION_TYPES = ['SPLIT','REVERSE_SPLIT','SPIN_OFF','RENAME'], the route
@@ -142,10 +102,9 @@ ALTER TABLE "journal_entry_lines" ADD CONSTRAINT "chk_journal_entry_lines_amount
 -- notifications.type — notification-service.ts NotificationType has six values
 -- (SYSTEM, STATEMENT_UPLOAD, STATEMENT_IMPORT, STATEMENT_DUPLICATE,
 -- ANALYSIS_COMPLETE, ACCOUNT_STATUS) and every notify*() uses one of them.
--- NOT VALID: notifications is an old shared-repo table (migration 0004) whose
--- early rows may carry type strings no longer present in the current enum.
-ALTER TABLE "notifications" ADD CONSTRAINT "chk_notifications_type"
-  CHECK ("type" IN ('SYSTEM', 'STATEMENT_UPLOAD', 'STATEMENT_IMPORT', 'STATEMENT_DUPLICATE', 'ANALYSIS_COMPLETE', 'ACCOUNT_STATUS')) NOT VALID;
+-- DEFERRED (was NOT VALID): proved dangerous by live PG17 testing — a legacy
+-- row with a non-set type makes notifications.$id.read.ts:50 (mark-read)
+-- fail with 23514. Service-layer notify*() already blocks new invalid values.
 --> statement-breakpoint
 -- audit_logs.action — audit-log.ts AuditAction is the single source of all 25
 -- action strings ever emitted; every insertAuditLog call passes one of them.

@@ -23,13 +23,7 @@ export const users = pgTable(
     lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
     lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }),
-  },
-  (table) => [
-    // Data-integrity: role/status are closed sets (see migration 0025;
-    // registered with NOT VALID there so pre-repo rows never break the upgrade).
-    check("chk_users_role", sql`${table.role} IN ('USER', 'ADMIN')`),
-    check("chk_users_status", sql`${table.status} IN ('ACTIVE', 'SUSPENDED')`),
-  ]
+  }
 );
 
 export const capitalTransactions = pgTable(
@@ -122,29 +116,6 @@ export const capitalTransactions = pgTable(
       table.sourceDocumentId
     ),
     index("Capital_Transactions_symbol_idx").on(table.symbol),
-    // Data-integrity closed sets + magnitude guards (migration 0025). NOT VALID
-    // in the DB: this table has pre-repo/removed-CSV-import rows that are not
-    // provably within these sets; new writes are fully enforced.
-    check(
-      "chk_capital_transactions_type",
-      sql`${table.type} IN ('CASH_IN', 'CASH_OUT')`
-    ),
-    check(
-      "chk_capital_transactions_source_type",
-      sql`${table.sourceType} IN ('AI_PARSED', 'MANUAL')`
-    ),
-    check(
-      "chk_capital_transactions_side",
-      sql`${table.side} IS NULL OR ${table.side} IN ('BUY', 'SELL')`
-    ),
-    check(
-      "chk_capital_transactions_category",
-      sql`${table.category} IS NULL OR ${table.category} IN ('income', 'expense', 'equity', 'asset')`
-    ),
-    check(
-      "chk_capital_transactions_quantity_positive",
-      sql`${table.quantity} IS NULL OR ${table.quantity} > 0`
-    ),
   ]
 );
 
@@ -415,13 +386,6 @@ export const notifications = pgTable(
     index("notifications_user_id_idx").on(table.userId),
     index("notifications_user_read_idx").on(table.userId, table.isRead),
     index("notifications_dedup_idx").on(table.userId, table.type, table.entityId),
-    // Data-integrity closed set (migration 0025), matches
-    // notification-service.ts NotificationType. NOT VALID in the DB: early
-    // shared-repo rows may carry type strings no longer in the set.
-    check(
-      "chk_notifications_type",
-      sql`${table.type} IN ('SYSTEM', 'STATEMENT_UPLOAD', 'STATEMENT_IMPORT', 'STATEMENT_DUPLICATE', 'ANALYSIS_COMPLETE', 'ACCOUNT_STATUS')`
-    ),
   ]
 );
 

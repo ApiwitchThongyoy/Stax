@@ -3471,16 +3471,24 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
   }
 
   // ================= REG: DATA INTEGRITY CHECKS (migration 0025) =================
-  // Proves the CHECK constraints added by 0025 are present and enforce the
-  // closed sets + magnitude guards at the DB level: 8 invalid finite-state
-  // values, 7 invalid journal finite-state values, 4 invalid journal-line
-  // magnitudes, the both/neither single-leg defect, negative attempts, and a
-  // valid-value sweep that exercises EVERY allowed state. Invalid inserts must
-  // fail with SQLSTATE 23514. Requires the 0025 migration.
+  // Proves the 14 CHECK constraints that remained after the upgrade-safety
+  // review are present and enforce the closed sets + magnitude guards at the
+  // DB level: invalid journal finite-state values, invalid journal-line
+  // magnitudes, the both/neither single-leg defect, negative attempts, the
+  // audit action closed set, and a valid-value sweep that exercises every
+  // allowed state. Invalid inserts must fail with SQLSTATE 23514. Requires the
+  // 0025 migration.
+  //
+  // The 8 constraints DEFERRED by that review (chk_users_role/status,
+  // chk_capital_transactions_type/source_type/side/category/quantity_positive,
+  // chk_notifications_type) are verified in the upgrade-regression block below:
+  // a legacy row carrying an out-of-domain value must now survive an unrelated
+  // UPDATE (no 23514) — the exact breakage that live PG17 testing proved those
+  // NOT VALID constraints would have caused.
   {
     const checkExists = await client`
       SELECT 1 AS one FROM pg_constraint
-      WHERE conname = 'chk_users_role'
+      WHERE conname = 'chk_audit_logs_action'
       LIMIT 1`;
     if (checkExists.length === 0) {
       console.log(
@@ -3521,15 +3529,11 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
           }
         };
 
-        // ---- Schema shape: all 22 constraints registered with the right tier ----
+        // ---- Schema shape: all 14 surviving constraints registered with the right tier ----
         const chkRows = await client`
           SELECT c.conname, c.convalidated
           FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
           WHERE c.contype = 'c' AND c.conname IN (
-            'chk_users_role','chk_users_status',
-            'chk_capital_transactions_type','chk_capital_transactions_source_type',
-            'chk_capital_transactions_side','chk_capital_transactions_category',
-            'chk_capital_transactions_quantity_positive',
             'chk_corporate_actions_action_type',
             'chk_accounts_type','chk_accounts_opening_balance_non_negative',
             'chk_journal_entries_source_type','chk_journal_entries_status',
@@ -3537,12 +3541,12 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
             'chk_journal_entries_type',
             'chk_journal_entry_lines_debit_positive','chk_journal_entry_lines_credit_positive',
             'chk_journal_entry_lines_fx_rate_effective_positive','chk_journal_entry_lines_amount_thb_positive',
-            'chk_notifications_type','chk_audit_logs_action',
+            'chk_audit_logs_action',
             'chk_auth_rate_limits_attempts_non_negative'
           )`;
         ok(
-          chkRows.length === 22,
-          `REG-di: all 22 data-integrity constraints are registered (found ${chkRows.length})`
+          chkRows.length === 14,
+          `REG-di: all 14 data-integrity constraints are registered (found ${chkRows.length})`
         );
         const nameOf = (n: string) => chkRows.find((r) => r.conname === n);
         const assertTier = (n: string, notValidExpected: boolean) =>
@@ -3550,47 +3554,26 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
             (nameOf(n)?.convalidated === !notValidExpected) === true,
             `REG-di: ${n} is ${notValidExpected ? "NOT VALID (notvalid=true)" : "VALIDATED"}`
           );
-        // NOT VALID tier: pre-repo / removed-CSV / evolving-enum tables.
-        assertTier("chk_users_role", true);
-        assertTier("chk_capital_transactions_type", true);
-        assertTier("chk_notifications_type", true);
+        // NOT VALID tier: only audit_logs (append-only — proven zero UPDATE paths).
         assertTier("chk_audit_logs_action", true);
         // VALIDATED tier: audited repo-only writers.
         assertTier("chk_journal_entries_status", false);
         assertTier("chk_accounts_type", false);
         assertTier("chk_journal_entry_lines_debit_positive", false);
         assertTier("chk_auth_rate_limits_attempts_non_negative", false);
-
-        // ---- Invalid finite-state values (8 fields) ----
-        await expectCheckViolation("bad User.role", () =>
-          client`INSERT INTO "User" (id, email, password_hash, role, status) VALUES (${randomUUID()}, ${`role-${randomUUID()}@test.local`}, 'x', 'SUPER_ADMIN', 'ACTIVE')`
-        );
-        await expectCheckViolation("bad User.status", () =>
-          client`INSERT INTO "User" (id, email, password_hash, role, status) VALUES (${randomUUID()}, ${`status-${randomUUID()}@test.local`}, 'x', 'USER', 'DELETED')`
-        );
-        await expectCheckViolation("bad Capital_Transactions.type", () =>
-          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'TRADE', 'AI_PARSED')`
-        );
-        await expectCheckViolation("bad Capital_Transactions.source_type", () =>
-          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'CASH_IN', 'CSV')`
-        );
-        await expectCheckViolation("bad Capital_Transactions.side", () =>
-          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, side) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'CASH_IN', 'AI_PARSED', 'BUY_SIDE')`
-        );
-        await expectCheckViolation("bad Capital_Transactions.category", () =>
-          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, category) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'CASH_IN', 'AI_PARSED', 'liability')`
-        );
-        await expectCheckViolation("zero Capital_Transactions.quantity", () =>
-          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, quantity) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'CASH_IN', 'AI_PARSED', '0')`
-        );
-        await expectCheckViolation("bad corporate_actions.action_type", () =>
-          client`INSERT INTO corporate_actions (id, user_id, symbol, action_type, transaction_date, created_at, updated_at) VALUES (${randomUUID()}, ${diUserId}, 'NVDA', 'DIVIDEND', '2026-01-01', ${nowIso}, ${nowIso})`
-        );
-        await expectCheckViolation("bad accounts.type", () =>
-          client`INSERT INTO accounts (id, user_id, code, name, type, created_at, updated_at) VALUES (${randomUUID()}, ${diUserId}, '9999', 'X', 'LEDGER', ${nowIso}, ${nowIso})`
-        );
-        await expectCheckViolation("negative accounts.opening_balance", () =>
-          client`INSERT INTO accounts (id, user_id, code, name, type, opening_balance, created_at, updated_at) VALUES (${randomUUID()}, ${diUserId}, '9998', 'X', 'ASSET', '-1.00', ${nowIso}, ${nowIso})`
+        // The 8 deferred constraints must be ABSENT (removed from 0025 after the
+        // upgrade-safety review proved NOT VALID breaks legacy rows on UPDATE).
+        const absentChk = await client`
+          SELECT c.conname FROM pg_constraint c
+          WHERE c.contype = 'c' AND c.conname IN (
+            'chk_users_role','chk_users_status',
+            'chk_capital_transactions_type','chk_capital_transactions_source_type',
+            'chk_capital_transactions_side','chk_capital_transactions_category',
+            'chk_capital_transactions_quantity_positive','chk_notifications_type'
+          )`;
+        ok(
+          absentChk.length === 0,
+          `REG-di: the 8 deferred constraints are absent from the DB (found ${absentChk.length})`
         );
 
         // ---- Invalid journal finite-state values (5 fields) ----
@@ -3650,28 +3633,55 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
           client`INSERT INTO auth_rate_limits (key, attempts) VALUES (${`di-${randomUUID()}`}, -1)`
         );
 
-        // ---- Valid-value sweep: every allowed state writes successfully ----
-        const validUser = await client`
-          INSERT INTO "User" (id, email, password_hash, role, status)
-          VALUES (${randomUUID()}, ${`diadmin-${randomUUID()}@test.local`}, 'x', 'ADMIN', 'SUSPENDED')
-          RETURNING id`;
-        ok(validUser.length === 1, "REG-di: valid User (role ADMIN / status SUSPENDED) passes");
-        await client`DELETE FROM "User" WHERE id = ${validUser[0].id}`;
+        // ---- Upgrade regression: legacy rows with out-of-domain values survive ----
+        // This is the EXACT breakage the 8 deferred constraints would have
+        // caused if kept with NOT VALID: a legacy row holding a value outside
+        // the closed set breaks ANY unrelated UPDATE (SQLSTATE 23514). With them
+        // deferred, the same legacy row must now update freely — no DB gate.
+        // Service-layer validation still blocks NEW invalid writes (the valid
+        // sweep below + the app routes cover that).
+        const legacyUserId = randomUUID();
+        const legacyUserEmail = `legacy-${randomUUID()}@test.local`;
+        await client`
+          INSERT INTO "User" (id, email, password_hash, role, status, created_at)
+          VALUES (${legacyUserId}, ${legacyUserEmail}, 'x', 'PORTFOLIO_VIEWER', 'DEACTIVATED', ${nowIso})`;
+        const legacyUserUpdate = await client`
+          UPDATE "User" SET "last_seen_at" = now()
+          WHERE id = ${legacyUserId} RETURNING id`;
+        ok(
+          legacyUserUpdate.length === 1,
+          "REG-di upgrade-regression: legacy User (role PORTFOLIO_VIEWER / status DEACTIVATED) survives an unrelated heartbeat UPDATE"
+        );
 
-        const validTx = await client`
-          INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, category, side, quantity)
-          VALUES (${randomUUID()}, ${diUserId}, '1000.00', 'USD', '2026-01-01', '35000.00', 'CASH_IN', 'MANUAL', 'equity', NULL, NULL)
-          RETURNING transaction_id`;
-        ok(validTx.length === 1, "REG-di: valid Capital_Transactions (CASH_IN/MANUAL/equity/NULL side) passes");
-        await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ${validTx[0].transaction_id}`;
+        const legacyTxId = `legacy-${randomUUID()}`;
+        await client`
+          INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, side, category, quantity)
+          VALUES (${legacyTxId}, ${legacyUserId}, '100.00', 'USD', '2024-01-15', '3200.00', 'BUY', 'CSV', 'RIGHT', 'liability', '0')`;
+        const legacyTxUpdate = await client`
+          UPDATE "Capital_Transactions" SET "amount_foreign" = '200.00'
+          WHERE transaction_id = ${legacyTxId} RETURNING transaction_id`;
+        ok(
+          legacyTxUpdate.length === 1,
+          "REG-di upgrade-regression: legacy Capital_Transactions (BUY/CSV/RIGHT/liability/qty 0) survives an unrelated amount UPDATE"
+        );
 
-        const validTx2 = await client`
-          INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, category, side, quantity)
-          VALUES (${randomUUID()}, ${diUserId}, '500.00', 'USD', '2026-02-01', '17500.00', 'CASH_IN', 'AI_PARSED', 'asset', 'SELL', '5')
-          RETURNING transaction_id`;
-        ok(validTx2.length === 1, "REG-di: valid trade row (AI_PARSED/asset/SELL/qty 5) passes");
-        await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ${validTx2[0].transaction_id}`;
+        const legacyNotifId = randomUUID();
+        await client`
+          INSERT INTO notifications (id, user_id, title, message, type, is_read, created_at)
+          VALUES (${legacyNotifId}, ${legacyUserId}, 'Legacy', 'old', 'EMAIL_ALERT', false, ${nowIso})`;
+        const legacyNotifUpdate = await client`
+          UPDATE notifications SET is_read = true
+          WHERE id = ${legacyNotifId} RETURNING id`;
+        ok(
+          legacyNotifUpdate.length === 1,
+          "REG-di upgrade-regression: legacy notification (type EMAIL_ALERT) survives a mark-read UPDATE"
+        );
+        // Cleanup the legacy rows (User is dangling-safe: no FK children remain).
+        await client`DELETE FROM notifications WHERE id = ${legacyNotifId}`;
+        await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ${legacyTxId}`;
+        await client`DELETE FROM "User" WHERE id = ${legacyUserId}`;
 
+        // ---- Valid-value sweep: every allowed state still writes successfully ----
         const validAction = await client`
           INSERT INTO corporate_actions (id, user_id, symbol, action_type, transaction_date, created_at, updated_at)
           VALUES (${randomUUID()}, ${diUserId}, 'NVDA', 'SPLIT', '2026-01-01', ${nowIso}, ${nowIso})
