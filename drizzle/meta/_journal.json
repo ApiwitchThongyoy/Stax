@@ -99,6 +99,69 @@
       "when": 1788679916551,
       "tag": "0013_powerful_joshua_kane",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1789516800000,
+      "tag": "0014_add_corporate_action",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1789516800001,
+      "tag": "0015_csv_import_rows",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1789516800002,
+      "tag": "0016_add_capital_transactions_net_amount",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1789516800003,
+      "tag": "0017_add_stock_prices",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1789516800004,
+      "tag": "0019_add_cost_basis_cumulative_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1789516800005,
+      "tag": "0020_add_journal_entry_trade_details",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1789516800006,
+      "tag": "0021_add_exchange_from_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1789516800007,
+      "tag": "0022_add_journal_entry_note",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1789516800008,
+      "tag": "0023_add_spin_off_fmv",
+      "breakpoints": true
     }
   ]
 }
