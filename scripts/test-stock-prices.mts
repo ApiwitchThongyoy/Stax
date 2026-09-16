@@ -22,6 +22,8 @@ import {
   refreshStockPricesCore,
   stockPriceRowFromQuote,
   type StockPriceSource,
+  normalizeStockSymbol,
+  isValidStockQuote,
 } from "../app/lib/stock-price-provider";
 import { readFileSync } from "node:fs";
 import { handleStockPriceRefresh } from "../app/lib/stock-price-refresh-handler.server";
@@ -337,6 +339,94 @@ async function main() {
   }
   const example = readFileSync(new URL("../.env.example", import.meta.url), "utf8");
   ok(/^CRON_SECRET=\s*$/m.test(example), "environment example contains only a blank CRON_SECRET placeholder");
+
+  // Release-critical regressions. All outbound requests and timers are controlled.
+  for (const symbol of ["../secret", "A/B", "AAPL?x=y", "<script>", "A".repeat(13), ""]) {
+    ok(normalizeStockSymbol(symbol) === null, "unsafe symbol is rejected");
+  }
+  ok(normalizeStockSymbol(" brk-b ") === "BRK-B" && normalizeStockSymbol("ptt.bk") === "PTT.BK", "supported tickers normalize");
+  for (const close of ["123junk", "123", true, Infinity, -1]) {
+    ok(parseYahooChartResponse(chartBody({ timestamps: [ts], closes: [close as never] })) === null,
+      "non-numeric/non-positive close cannot become a price");
+  }
+  for (const timestamp of ["123junk", "123", Infinity, 1e100]) {
+    ok(parseYahooChartResponse(chartBody({ timestamps: [timestamp as never], closes: [5] })) === null,
+      "invalid timestamp cannot become a stored date");
+  }
+  ok(!isValidStockQuote({ close: 5, currency: "USD", priceDate: "2026-02-30" }), "invalid calendar date rejected");
+  ok(!isValidStockQuote({ close: 5, currency: "123", priceDate: "2026-09-10" }), "invalid currency rejected");
+  const zonedBody = chartBody({ timestamps: [Date.parse("2026-09-09T23:00:00Z") / 1000], closes: [10] }) as any;
+  zonedBody.chart.result[0].meta.exchangeTimezoneName = "Australia/Sydney";
+  ok(parseYahooChartResponse(zonedBody)?.priceDate === "2026-09-10", "date uses exchange timezone, not server timezone");
+  zonedBody.chart.result[0].meta.exchangeTimezoneName = "not-a-timezone";
+  ok(parseYahooChartResponse(zonedBody) === null, "malformed exchange timezone rejected safely");
+  const openSession = chartBody({ timestamps: [Date.parse("2026-09-09T13:30:00Z") / 1000,
+    Date.parse("2026-09-10T13:30:00Z") / 1000], closes: [10, 20] }) as any;
+  openSession.chart.result[0].meta.currentTradingPeriod = { regular: {
+    start: Date.parse("2026-09-10T13:30:00Z") / 1000, end: Date.parse("2026-09-10T20:00:00Z") / 1000,
+  } };
+  ok(parseYahooChartResponse(openSession, new Date("2026-09-10T15:00:00Z"))?.close === 10,
+    "unfinished daily bar is not published as a daily close");
+  ok(parseYahooChartResponse(openSession, new Date("2026-09-10T22:30:00Z"))?.close === 20,
+    "cron after market close accepts the completed daily bar");
+
+  const secretFixture = "release-secret-must-not-leak";
+  const warnings: unknown[][] = [];
+  const savedWarn = console.warn;
+  const savedFetch = globalThis.fetch;
+  const savedSetTimeout = globalThis.setTimeout;
+  const savedClearTimeout = globalThis.clearTimeout;
+  let timeoutCallback: (() => void) | undefined;
+  let timerCleared = false;
+  try {
+    console.warn = (...args) => { warnings.push(args.map(String)); };
+    for (const status of [404, 429, 500, 503]) {
+      globalThis.fetch = async () => new Response(secretFixture, { status });
+      ok(await yahooFinanceStockSource.getClose("NVDA") === null, `provider ${status} safely returns no price`);
+    }
+    globalThis.fetch = async () => { throw new Error(secretFixture); };
+    ok(await yahooFinanceStockSource.getClose("NVDA") === null, "network exception is safe");
+    globalThis.fetch = async () => new Response("{}");
+    ok(await yahooFinanceStockSource.getClose("NVDA") === null, "empty payload is safe");
+    globalThis.fetch = async () => new Response(secretFixture);
+    ok(await yahooFinanceStockSource.getClose("NVDA") === null, "malformed JSON is safe");
+
+    globalThis.setTimeout = ((callback: () => void) => { timeoutCallback = callback; return 1; }) as never;
+    globalThis.clearTimeout = (() => { timerCleared = true; }) as never;
+    for (const phase of ["headers", "body"]) {
+      timerCleared = false;
+      globalThis.fetch = (async (_url, init) => {
+        const blocked = () => new Promise((_resolve, reject) => {
+          init!.signal!.addEventListener("abort", () => reject(new DOMException(secretFixture, "AbortError")), { once: true });
+          queueMicrotask(() => timeoutCallback!());
+        });
+        return phase === "headers" ? blocked() : { ok: true, json: blocked };
+      }) as typeof fetch;
+      ok(await yahooFinanceStockSource.getClose("NVDA") === null && timerCleared,
+        `timeout covers ${phase} and timer is cleared`);
+    }
+    globalThis.setTimeout = savedSetTimeout;
+    globalThis.clearTimeout = savedClearTimeout;
+
+    const written: string[] = [];
+    const mixed = await refreshStockPricesCore(["FIRST", "THROW", "BADDATE", "DBFAIL", "LAST"], {
+      name: "mock", async getClose(symbol) {
+        if (symbol === "THROW") throw new Error(secretFixture);
+        return { priceDate: symbol === "BADDATE" ? "2026-02-30" : "2026-09-10", close: 10, currency: "USD" };
+      },
+    }, async (quote) => {
+      if (quote.symbol === "DBFAIL") throw new Error(secretFixture);
+      written.push(quote.symbol);
+    }, { delayMs: 0 });
+    ok(mixed.updated === 2 && mixed.failed.join(",") === "THROW,BADDATE,DBFAIL" && written.join(",") === "FIRST,LAST",
+      "provider/write failures are isolated; later symbols still persist");
+    ok(!JSON.stringify(warnings).includes(secretFixture), "provider/refresh logs never expose exception secrets");
+  } finally {
+    globalThis.fetch = savedFetch;
+    console.warn = savedWarn;
+    globalThis.setTimeout = savedSetTimeout;
+    globalThis.clearTimeout = savedClearTimeout;
+  }
 
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);

@@ -1,8 +1,8 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { desc, eq, inArray } from "drizzle-orm";
 import { db } from "./drizzle-db";
 import { stockPrices } from "../db/schema";
 import type { StockQuoteInput } from "./stock-price-provider";
-import { stockPriceRowFromQuote } from "./stock-price-provider";
+import { isValidStockQuote, normalizeStockSymbol, stockPriceRowFromQuote } from "./stock-price-provider";
 
 /**
  * DB cache for daily stock closes. Mirror of exchange-rate-cache: read/get
@@ -72,47 +72,14 @@ export async function getLatestStockPricesForSymbols(
 export async function upsertStockPrice(
   input: StockQuoteInput
 ): Promise<CachedStockPrice> {
-  const now = new Date();
-  const existing = await db
-    .select()
-    .from(stockPrices)
-    .where(
-      and(
-        eq(stockPrices.symbol, input.symbol.toUpperCase()),
-        eq(stockPrices.priceDate, input.priceDate)
-      )
-    )
-    .limit(1)
-    .execute();
-
-  if (existing.length > 0) {
-    const row = existing[0] as CachedStockPrice;
-    await db
-      .update(stockPrices)
-      .set({
-        closePrice: String(input.close),
-        currency: input.currency,
-        updatedAt: now.toISOString(),
-      })
-      .where(eq(stockPrices.id, row.id))
-      .execute();
-    return { ...row, closePrice: String(input.close), currency: input.currency, updatedAt: now.toISOString() };
-  }
-
-  const row = stockPriceRowFromQuote(input, now);
-  await db
-    .insert(stockPrices)
-    .values({
-      id: row.id,
-      symbol: row.symbol,
-      priceDate: row.priceDate,
-      closePrice: row.closePrice,
-      currency: row.currency,
-      source: row.source,
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
+  const symbol = normalizeStockSymbol(input.symbol);
+  if (!symbol || !isValidStockQuote(input)) throw new Error("Invalid stock quote");
+  const row = stockPriceRowFromQuote({ ...input, symbol });
+  const [stored] = await db.insert(stockPrices).values(row)
+    .onConflictDoUpdate({
+      target: [stockPrices.symbol, stockPrices.priceDate],
+      set: { closePrice: row.closePrice, currency: row.currency, updatedAt: row.updatedAt },
     })
-    .execute();
-
-  return row;
+    .returning();
+  return stored;
 }

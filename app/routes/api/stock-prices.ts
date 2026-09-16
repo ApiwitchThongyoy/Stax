@@ -1,6 +1,8 @@
 import type { Route } from "./+types/stock-prices";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import { resolveStockQuotes } from "~/lib/stock-price-refresh";
+import { normalizeStockSymbol } from "~/lib/stock-price-provider";
+import { safeErrorLog } from "~/lib/safe-error-log";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
   return (
@@ -42,11 +44,15 @@ export async function loader({ request }: Route.LoaderArgs) {
     return Response.json({ success: true, data: [] }, { status: 200 });
   }
 
+  if (symbols.some((symbol) => normalizeStockSymbol(symbol) === null)) {
+    return Response.json({ success: false, message: "Invalid stock symbol" }, { status: 400 });
+  }
+
   try {
     const quotes = await resolveStockQuotes(symbols);
     return Response.json({ success: true, data: quotes }, { status: 200 });
   } catch (error) {
-    console.error("Stock prices GET: failed", error);
+    console.error("Stock prices GET: failed", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }
