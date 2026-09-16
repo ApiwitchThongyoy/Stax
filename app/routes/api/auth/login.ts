@@ -6,6 +6,7 @@ import { db } from "../../../lib/drizzle-db";
 import { users } from "~/db/schema";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 import { ACCOUNT_SUSPENDED_MESSAGE } from "~/lib/auth-middleware";
+import { normalizeEmail } from "~/lib/normalize-email";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ACCESS_TOKEN_EXPIRY = "1h";
@@ -58,7 +59,7 @@ export async function action({ request }: Route.ActionArgs) {
     );
   }
 
-  const normalizedEmail = email.trim();
+  const normalizedEmail = normalizeEmail(email);
 
   if (!EMAIL_REGEX.test(normalizedEmail)) {
     return Response.json(
