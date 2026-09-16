@@ -1,4 +1,5 @@
-import { eq } from "drizzle-orm";
+import { safeErrorLog } from "~/lib/safe-error-log";
+import { eq, and } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import type { Route } from "./+types/settings";
 import { db } from "~/lib/drizzle-db";
@@ -101,7 +102,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     const row = await getSettingsRow(auth.userId);
     return Response.json({ success: true, data: toResponse(row) }, { status: 200 });
   } catch (error) {
-    console.error("Settings GET: failed to query", error);
+    console.error("Settings GET: failed to query", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }
@@ -181,7 +182,7 @@ async function handlePatch(
     await db
       .update(userSettings)
       .set({ ...updates, updatedAt: now })
-      .where(eq(userSettings.id, row.id))
+      .where(and(eq(userSettings.id, row.id), eq(userSettings.userId, auth.userId)))
       .execute();
 
     await insertAuditLog({
@@ -200,7 +201,7 @@ async function handlePatch(
     const updatedRows = await db
       .select()
       .from(userSettings)
-      .where(eq(userSettings.id, row.id))
+      .where(and(eq(userSettings.id, row.id), eq(userSettings.userId, auth.userId)))
       .limit(1);
 
     return Response.json(
@@ -208,7 +209,7 @@ async function handlePatch(
       { status: 200 }
     );
   } catch (error) {
-    console.error("Settings PATCH: failed to update", error);
+    console.error("Settings PATCH: failed to update", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }

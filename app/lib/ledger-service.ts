@@ -8,6 +8,8 @@ import { randomUUID } from "node:crypto";
 import { and, asc, eq, gte, lte, max, sql, type SQL } from "drizzle-orm";
 import { Decimal } from "decimal.js";
 import { db } from "./drizzle-db";
+import { assertOwnedReferences } from "./resource-ownership";
+import { safeErrorLog } from "./safe-error-log";
 import {
   accounts,
   capitalTransactions,
@@ -291,6 +293,7 @@ export async function createJournalEntry(
 
   try {
     await db.transaction(async (tx) => {
+      await assertOwnedReferences(tx, userId, entry);
       const entryNo = await nextEntryNo(userId);
       await tx
         .insert(journalEntries)
@@ -355,7 +358,7 @@ export async function createJournalEntry(
       }
     });
   } catch (error) {
-    console.error("createJournalEntry: failed to persist entry", error);
+    console.error("createJournalEntry: failed to persist entry", safeErrorLog(error));
     return { ok: false, errors: ["Failed to persist journal entry"] };
   }
 
@@ -363,7 +366,7 @@ export async function createJournalEntry(
     (await db
       .select({ entryNo: journalEntries.entryNo })
       .from(journalEntries)
-      .where(eq(journalEntries.id, entryId))
+      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
       .execute())[0]?.entryNo ?? 0;
 
   return { ok: true, entryId, entryNo };
@@ -513,6 +516,7 @@ export async function insertManualCashJournal(
   const now = new Date().toISOString();
   try {
     await db.transaction(async (tx) => {
+      await assertOwnedReferences(tx, userId, entry);
       const entryNo = await nextEntryNo(userId);
       await tx
         .insert(journalEntries)
@@ -578,14 +582,14 @@ export async function insertManualCashJournal(
       }
     });
   } catch (error) {
-    console.error("insertManualCashJournal: failed to persist entry", error);
+    console.error("insertManualCashJournal: failed to persist entry", safeErrorLog(error));
     return { ok: false, errors: ["Failed to persist journal entry"] };
   }
   const entryNo =
     (await db
       .select({ entryNo: journalEntries.entryNo })
       .from(journalEntries)
-      .where(eq(journalEntries.id, entryId))
+      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
       .execute())[0]?.entryNo ?? 0;
   return { ok: true, entryId, entryNo };
 }
@@ -635,6 +639,7 @@ export async function insertBackfilledJournalEntry(
   const now = new Date().toISOString();
   try {
     await db.transaction(async (tx) => {
+      await assertOwnedReferences(tx, userId, entry);
       const entryNo = await nextEntryNo(userId);
       await tx
         .insert(journalEntries)
@@ -681,14 +686,14 @@ export async function insertBackfilledJournalEntry(
         .execute();
     });
   } catch (error) {
-    console.error("insertBackfilledJournalEntry: failed to persist entry", error);
+    console.error("insertBackfilledJournalEntry: failed to persist entry", safeErrorLog(error));
     return { ok: false, errors: ["Failed to persist journal entry"] };
   }
   const entryNo =
     (await db
       .select({ entryNo: journalEntries.entryNo })
       .from(journalEntries)
-      .where(eq(journalEntries.id, entryId))
+      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
       .execute())[0]?.entryNo ?? 0;
   return { ok: true, entryId, entryNo };
 }
@@ -751,7 +756,7 @@ export async function syncCapitalLedgerJournal(
         isFxConversion: detail.isFxConversion,
         updatedAt: new Date().toISOString(),
       })
-      .where(eq(journalEntries.id, entryId))
+      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
       .execute();
 
     // Two-line equity entries (manual cash rows) get their legs rebuilt to the
@@ -762,13 +767,13 @@ export async function syncCapitalLedgerJournal(
           c: sql`COUNT(*)`.as<number>("c"),
         })
         .from(journalEntryLines)
-        .where(eq(journalEntryLines.journalEntryId, entryId))
+        .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.userId, userId)))
         .execute()
     )[0]?.c ?? 0;
     if (lineCount === 2) {
       await db
         .delete(journalEntryLines)
-        .where(eq(journalEntryLines.journalEntryId, entryId))
+        .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.userId, userId)))
         .execute();
       const entry = validateJournalEntry({
         entryDate: current.transactionDate,
@@ -804,7 +809,7 @@ export async function syncCapitalLedgerJournal(
       }
     }
   } catch (error) {
-    console.error("syncCapitalLedgerJournal: failed to sync entry", error);
+    console.error("syncCapitalLedgerJournal: failed to sync entry", safeErrorLog(error));
   }
 }
 
@@ -832,12 +837,12 @@ export async function removeCapitalLedgerJournal(
     for (const { id } of entries) {
       await db
         .delete(journalEntryLines)
-        .where(eq(journalEntryLines.journalEntryId, id))
+        .where(and(eq(journalEntryLines.journalEntryId, id), eq(journalEntryLines.userId, userId)))
         .execute();
-      await db.delete(journalEntries).where(eq(journalEntries.id, id)).execute();
+      await db.delete(journalEntries).where(and(eq(journalEntries.id, id), eq(journalEntries.userId, userId))).execute();
     }
   } catch (error) {
-    console.error("removeCapitalLedgerJournal: failed to remove entry", error);
+    console.error("removeCapitalLedgerJournal: failed to remove entry", safeErrorLog(error));
   }
 }
 
@@ -997,12 +1002,15 @@ export async function insertStatementImport(
   };
 
   await db.transaction(async (tx) => {
+    for (const sourceDocumentId of new Set(rows.map((row) => row.sourceDocumentId))) {
+      await assertOwnedReferences(tx, userId, { sourceDocumentId });
+    }
     for (const row of rows) {
       await tx
         .insert(capitalTransactions)
         .values({
           transactionId: row.transactionId,
-          userId: row.userId,
+          userId,
           amountForeign: row.amountForeign,
           currency: row.currency,
           transactionDate: row.transactionDate,
@@ -1222,7 +1230,8 @@ async function selectRawLines(conditions: (SQL | undefined)[]) {
       },
     })
     .from(journalEntryLines)
-    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .innerJoin(journalEntries, and(eq(journalEntryLines.journalEntryId, journalEntries.id), eq(journalEntries.userId, journalEntryLines.userId)))
+    .innerJoin(accounts, and(eq(accounts.id, journalEntryLines.accountId), eq(accounts.userId, journalEntryLines.userId)))
     .where(and(...conditions))
     .orderBy(asc(journalEntries.entryDate), asc(journalEntries.entryNo), asc(journalEntryLines.id))
     .execute();
@@ -1436,7 +1445,7 @@ export async function getAccountLedger(
   opening: string;
   lines: LedgerLineView[];
   symbolSummary: LedgerSymbolSummary[];
-}> {
+} | null> {
   const [account, raw] = await Promise.all([
     db
       .select({ openingBalance: accounts.openingBalance })
@@ -1446,6 +1455,8 @@ export async function getAccountLedger(
       .execute(),
     fetchRawLinesForAccount(userId, accountId, from, to),
   ]);
+
+  if (!account.length) return null;
 
   const openingDec = new Decimal(account[0]?.openingBalance ?? "0");
   let running = openingDec;
@@ -1839,10 +1850,10 @@ export async function reverseJournalEntry(
     await db
       .update(journalEntries)
       .set({ status: "REVERSED", updatedAt: new Date().toISOString() })
-      .where(eq(journalEntries.id, entryId))
+      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
       .execute();
   } catch (error) {
-    console.error("reverseJournalEntry: failed to mark original reversed", error);
+    console.error("reverseJournalEntry: failed to mark original reversed", safeErrorLog(error));
   }
 
   return { ok: true, reversalEntryId: created.entryId, reversalEntryNo: created.entryNo };

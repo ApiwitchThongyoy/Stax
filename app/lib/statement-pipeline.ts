@@ -1,3 +1,5 @@
+import { assertOwnedReferences } from "./resource-ownership";
+import { safeErrorLog } from "./safe-error-log";
 import { randomUUID } from "node:crypto";
 import { eq, and } from "drizzle-orm";
 import { Decimal } from "decimal.js";
@@ -415,12 +417,15 @@ export async function insertStatementTransactions(
 
   const insertedIds: string[] = [];
   await db.transaction(async (tx) => {
+    for (const sourceDocumentId of new Set(rows.map((row) => row.sourceDocumentId))) {
+      await assertOwnedReferences(tx, userId, { sourceDocumentId });
+    }
     for (const row of rows) {
       await tx
         .insert(capitalTransactions)
         .values({
           transactionId: row.transactionId,
-          userId: row.userId,
+          userId,
           amountForeign: row.amountForeign,
           currency: row.currency,
           transactionDate: row.transactionDate,
@@ -1039,7 +1044,7 @@ export async function backfillComputedGainLoss(
     } else {
       // A real server error must not silently drop actions either: log and
       // continue (best-effort backfill; trade-history replay is still valid).
-      console.warn("backfillComputedGainLoss: corporate actions lookup failed", error);
+      console.warn("backfillComputedGainLoss: corporate actions lookup failed", safeErrorLog(error));
     }
   }
 

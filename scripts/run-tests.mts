@@ -3751,6 +3751,11 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
     }
   }
 
+  // ================= REG: USER ISOLATION =================
+  console.log("\n=== REG: USER ISOLATION ===");
+  const { runUserIsolationTests } = await import("./user-isolation-db.mjs");
+  await runUserIsolationTests(client, ok, makePdf, tokenAd);
+
   // ================= CLEANUP =================
   console.log("\n=== CLEANUP ===");
   const cleanIds: string[] = [];
