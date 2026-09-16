@@ -5,6 +5,8 @@ import {
   saveStatementPdf,
   findExistingDocumentByHash,
   deleteStoredFile,
+  validatePdfFile,
+  hasPdfMagicBytes,
 } from "~/lib/storage/statement-storage";
 import { db } from "~/lib/drizzle-db";
 import { documents } from "~/db/schema";
@@ -340,12 +342,33 @@ export async function action({ request }: Route.ActionArgs) {
     );
   }
 
-  // 0. User-scoped duplicate detection BEFORE storing anything, so a re-uploaded
-  // Statement never creates an orphaned file/document row. The decision is NOT
-  // hash-only: a document that still exists but has no derived rows (its ledger
-  // data was deleted) must be safely re-importable/rebuildable under the SAME
-  // document id — otherwise deleting then re-uploading the same PDF would
-  // silently restore nothing.
+  // 1. Validate BEFORE reading the full file — size + extension + MIME metadata,
+  //    then a small header slice for %PDF- magic bytes. Only after validation
+  //    passes do we load the full file into memory for hashing / extraction.
+  const validation = validatePdfFile(file);
+  if (!validation.ok) {
+    return Response.json(
+      { success: false, message: validation.message },
+      { status: 400 }
+    );
+  }
+
+  let isValidPdf: boolean;
+  try {
+    isValidPdf = await hasPdfMagicBytes(file);
+  } catch {
+    isValidPdf = false;
+  }
+  if (!isValidPdf) {
+    return Response.json(
+      { success: false, message: "File is not a valid PDF (missing %PDF- header)" },
+      { status: 400 }
+    );
+  }
+
+  // 2. Content-hash dedup BEFORE storing anything, so a re-uploaded Statement
+  //    never creates an orphaned file/document row. The full file is read only
+  //    now that validation has passed (safe for memory + fast-fail on bad input).
   const contentHash = computeContentHash(
     new Uint8Array(await file.arrayBuffer())
   );
@@ -377,16 +400,36 @@ export async function action({ request }: Route.ActionArgs) {
         data: buildDuplicatePayload(existingDocument.id),
       });
     }
-    return rebuildStatementImport({
-      userId: auth.userId,
-      file,
-      documentId: existingDocument.id,
-      fileName: existingDocument.originalName ?? "Statement",
-      contentHash,
-    });
+    // Rebuild path: re-extract + re-insert under the EXISTING document id.
+    // Wrapped in try-catch so a DB failure (loadCostBasisState / insertStatementImport)
+    // returns a clean 500 instead of crashing; no new storage object was created
+    // in this path, so there is nothing to clean up on failure.
+    try {
+      return await rebuildStatementImport({
+        userId: auth.userId,
+        file,
+        documentId: existingDocument.id,
+        fileName: existingDocument.originalName ?? "Statement",
+        contentHash,
+      });
+    } catch (rebuildError) {
+      console.error("Statement upload: rebuild failed", {
+        documentId: existingDocument.id,
+        errorName:
+          rebuildError instanceof Error
+            ? rebuildError.name
+            : "UnknownError",
+      });
+      return Response.json(
+        { success: false, message: "Internal server error" },
+        { status: 500 }
+      );
+    }
   }
 
-  // 1. Validate + store the PDF (UUID filename) and record it in the documents table.
+  // 3. Store the PDF (UUID filename) and record it in the documents table.
+  //    Validation (size/ext/MIME/magic bytes) was already done above before the
+  //    full-file read. saveStatementPdf repeats validation defensively.
   let stored;
   try {
     stored = await saveStatementPdf({ userId: auth.userId, file });
@@ -432,7 +475,7 @@ export async function action({ request }: Route.ActionArgs) {
   await notifyStatementUploaded(auth.userId, fileName, documentId);
 
   try {
-    // 2. Server-side text extraction from the stored object bytes (never a
+    // 4. Server-side text extraction from the stored object bytes (never a
     //    client-supplied path; works for Supabase Storage and local dev).
     let extraction;
     try {
@@ -452,7 +495,7 @@ export async function action({ request }: Route.ActionArgs) {
       );
     }
 
-    // 3. Parse + validate into Capital_Transactions rows. Seed the
+    // 5. Parse + validate into Capital_Transactions rows. Seed the
     //    server-authoritative running-average cost basis from previous imports
     //    and persist the updated state after a successful build (so SELL
     //    realized gain/loss stays computable across statements/months).
@@ -464,12 +507,12 @@ export async function action({ request }: Route.ActionArgs) {
       costBasis
     );
 
-    // 3a. External historical FX fallback (only for rows WITHOUT a statement
+    // 5a. External historical FX fallback (only for rows WITHOUT a statement
     //     rate; statement FX always wins). Graceful — never throws, never
     //     invents a rate, never changes row count.
     const fallbackRows = await applyFxRateFallback(built.rows, fxFallback);
 
-    // 3b. Gemini structured analysis (best-effort, for preview only).
+    // 5b. Gemini structured analysis (best-effort, for preview only).
     const aiResult = await runGeminiAnalysis(
       extraction.text,
       auth.userId,
@@ -497,7 +540,7 @@ export async function action({ request }: Route.ActionArgs) {
       });
     }
 
-    // 4. Duplicate protection: if this document was already saved for this user, skip.
+    // 6. Duplicate protection: if this document was already saved for this user, skip.
     if (await hasSavedDocumentRows(auth.userId, documentId)) {
       return Response.json({
         success: true,
@@ -513,12 +556,12 @@ export async function action({ request }: Route.ActionArgs) {
       });
     }
 
-    // 5. Atomic insert into Capital_Transactions + journal_entries (every row
+    // 7. Atomic insert into Capital_Transactions + journal_entries (every row
     //    gets its POSTED or SKIPPED journal entry in the SAME transaction) —
     //    the authoritative SSOT step.
     const result = await insertStatementImport(auth.userId, fallbackRows);
 
-    // 5a. Persist the updated running-average cost basis only AFTER the rows
+    // 7a. Persist the updated running-average cost basis only AFTER the rows
     //     have actually committed, so the derived cache can never be written
     //     from rows that failed to insert (which would poison future realized
     //     gain/loss). Best-effort: a basis-write failure must not push this
@@ -529,7 +572,7 @@ export async function action({ request }: Route.ActionArgs) {
       console.error("Statement upload: cost-basis persist failed", basisError);
     }
 
-    // 5a2. Heal any legacy frozen SELL rows whose realized gain/loss only
+    // 7a2. Heal any legacy frozen SELL rows whose realized gain/loss only
     //     became computable once this (or historical) statement's buys are in
     //     the ledger. Best-effort — never fails an already-committed import.
     try {
@@ -538,7 +581,7 @@ export async function action({ request }: Route.ActionArgs) {
       console.error("Statement upload: gain-loss backfill failed", backfillError);
     }
 
-    // 5b. The journal was written inside the same transaction as the rows above
+    // 7b. The journal was written inside the same transaction as the rows above
     //     (every row -> POSTED or SKIPPED journal entry). Nothing more to post.
     const posting = toPostingView(result.journal);
 
