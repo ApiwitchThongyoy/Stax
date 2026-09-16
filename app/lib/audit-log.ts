@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { db } from "./drizzle-db";
 import { auditLogs } from "../db/schema";
+import { safeErrorLog } from "./safe-error-log";
 
 export interface AuditLogInput {
   userId?: string | null;
@@ -94,8 +95,9 @@ export async function insertAuditLog(input: AuditLogInput): Promise<void> {
       .execute();
   } catch (error) {
     // Best-effort by design: an audit write failure must never turn a successful
-    // login/import/delete into a 500, nor trigger error/cleanup paths. Log and
-    // move on — the audit trail is observability, not a source of truth.
-    console.error("insertAuditLog: failed to persist audit entry", error);
+    // login/import/delete into a 500, nor trigger error/cleanup paths. Log the
+    // sanitized shape and move on — the audit trail is observability, not a
+    // source of truth.
+    console.error("insertAuditLog: failed to persist audit entry", safeErrorLog(error));
   }
 }

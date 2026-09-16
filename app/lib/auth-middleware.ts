@@ -2,6 +2,7 @@ import jwt from "jsonwebtoken";
 import { eq } from "drizzle-orm";
 import { db } from "./drizzle-db";
 import { users } from "../db/schema";
+import { safeErrorLog } from "./safe-error-log";
 
 export interface AuthPayload {
   userId: string;
@@ -90,7 +91,7 @@ export async function verifyAuth(
       .where(eq(users.id, decoded.userId))
       .limit(1);
   } catch (error) {
-    console.error("verifyAuth: failed to query user", error);
+    console.error("verifyAuth: failed to query user", safeErrorLog(error));
     return { status: 500, message: "Internal server error" };
   }
 
