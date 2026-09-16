@@ -1,0 +1,113 @@
+name: Backend CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Job-local placeholder only. NOT connectable (port 1) and never reached:
+  # the DB-free `npm test` suites construct a lazy postgres client at import
+  # time but run zero queries. Never a production URL, never a real secret.
+  DATABASE_URL: postgresql://stax:stax@127.0.0.1:1/stax_test
+  STORAGE_MODE: local
+  # Ephemeral test-only value required by the harness when it signs JWTs.
+  # Not a production credential.
+  JWT_SECRET: stax-ci-only-not-for-prod
+
+jobs:
+  backend-checks:
+    name: Backend checks (DB-free)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Drizzle kit check (schema/journal consistency)
+        run: npx drizzle-kit check
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests (DB-free)
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Git diff check (whitespace/conflict markers)
+        run: git diff --check
+
+  fresh-postgres-integration:
+    name: Fresh PostgreSQL migration + integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: stax
+          POSTGRES_PASSWORD: stax
+          POSTGRES_DB: stax_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stax -d stax_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Ephemeral CI-only credentials pointing at the service container above.
+      # Both URL vars are used by this job: DATABASE_URL for db:migrate via
+      # drizzle.config.ts, TEST_DATABASE_URL for the test:w2 harness.
+      DATABASE_URL: postgresql://stax:stax@127.0.0.1:5432/stax_test
+      TEST_DATABASE_URL: postgresql://stax:stax@127.0.0.1:5432/stax_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Wait for PostgreSQL health
+        run: |
+          node --input-type=module -e "
+            import postgres from 'postgres';
+            const url = process.env.DATABASE_URL;
+            const deadline = Date.now() + 60000;
+            for (;;) {
+              try {
+                const sql = postgres(url, { max: 1 });
+                await sql.unsafe('SELECT 1');
+                await sql.end();
+                process.exit(0);
+              } catch (e) {
+                if (Date.now() > deadline) { console.error(e); process.exit(1); }
+                await new Promise((r) => setTimeout(r, 2000));
+              }
+            }
+          "
+      - name: Confirm the database is fresh and empty
+        run: node scripts/ci-verify-migrations.mjs --fresh
+      - name: Apply migrations to latest
+        run: npm run db:migrate
+      - name: Verify migration journal matches applied rows
+        run: node scripts/ci-verify-migrations.mjs --verify
+      - name: Integration tests (test:w2)
+        run: npm run test:w2
+      - name: Git diff check (whitespace/conflict markers)
+        run: git diff --check
