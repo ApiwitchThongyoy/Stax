@@ -12,16 +12,25 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
-export const users = pgTable("User", {
-  id: text("id").primaryKey(),
-  email: text("email").notNull().unique(),
-  passwordHash: text("password_hash").notNull(),
-  role: text("role").notNull().default("USER"),
-  status: text("status").notNull().default("ACTIVE"),
-  lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
-  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
-  createdAt: timestamp("created_at", { withTimezone: true }),
-});
+export const users = pgTable(
+  "User",
+  {
+    id: text("id").primaryKey(),
+    email: text("email").notNull().unique(),
+    passwordHash: text("password_hash").notNull(),
+    role: text("role").notNull().default("USER"),
+    status: text("status").notNull().default("ACTIVE"),
+    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }),
+  },
+  (table) => [
+    // Data-integrity: role/status are closed sets (see migration 0025;
+    // registered with NOT VALID there so pre-repo rows never break the upgrade).
+    check("chk_users_role", sql`${table.role} IN ('USER', 'ADMIN')`),
+    check("chk_users_status", sql`${table.status} IN ('ACTIVE', 'SUSPENDED')`),
+  ]
+);
 
 export const capitalTransactions = pgTable(
   "Capital_Transactions",
@@ -113,6 +122,29 @@ export const capitalTransactions = pgTable(
       table.sourceDocumentId
     ),
     index("Capital_Transactions_symbol_idx").on(table.symbol),
+    // Data-integrity closed sets + magnitude guards (migration 0025). NOT VALID
+    // in the DB: this table has pre-repo/removed-CSV-import rows that are not
+    // provably within these sets; new writes are fully enforced.
+    check(
+      "chk_capital_transactions_type",
+      sql`${table.type} IN ('CASH_IN', 'CASH_OUT')`
+    ),
+    check(
+      "chk_capital_transactions_source_type",
+      sql`${table.sourceType} IN ('AI_PARSED', 'MANUAL')`
+    ),
+    check(
+      "chk_capital_transactions_side",
+      sql`${table.side} IS NULL OR ${table.side} IN ('BUY', 'SELL')`
+    ),
+    check(
+      "chk_capital_transactions_category",
+      sql`${table.category} IS NULL OR ${table.category} IN ('income', 'expense', 'equity', 'asset')`
+    ),
+    check(
+      "chk_capital_transactions_quantity_positive",
+      sql`${table.quantity} IS NULL OR ${table.quantity} > 0`
+    ),
   ]
 );
 
@@ -188,6 +220,12 @@ export const corporateActions = pgTable(
       table.userId,
       table.symbol,
       table.transactionDate
+    ),
+    // Data-integrity closed set (migration 0025), matches
+    // corporate-action-service.ts VALID_ACTION_TYPES.
+    check(
+      "chk_corporate_actions_action_type",
+      sql`${table.actionType} IN ('SPLIT', 'REVERSE_SPLIT', 'SPIN_OFF', 'RENAME')`
     ),
   ]
 );
@@ -293,6 +331,23 @@ export const auditLogs = pgTable(
     index("audit_logs_user_id_idx").on(table.userId),
     index("audit_logs_created_at_idx").on(table.createdAt),
     index("audit_logs_action_idx").on(table.action),
+    // Data-integrity closed set (migration 0025), matches audit-log.ts
+    // AuditAction (all 25 actions). NOT VALID in the DB: audit history spans
+    // pre-repo deployments whose exact historical actions are unprovable.
+    check(
+      "chk_audit_logs_action",
+      sql`${table.action} IN (
+        'REGISTER_SUCCESS', 'REGISTER_FAILED', 'LOGIN_SUCCESS', 'LOGIN_FAILED',
+        'STATEMENT_UPLOAD', 'STATEMENT_IMPORT', 'STATEMENT_DELETE',
+        'GEMINI_PARSE', 'GEMINI_PARSE_FAILED',
+        'CAPITAL_TRANSACTION_CREATE', 'CAPITAL_TRANSACTION_UPDATE', 'CAPITAL_TRANSACTION_DELETE',
+        'ADMIN_LOGIN_SUCCESS', 'ADMIN_USER_LIST_VIEW', 'ADMIN_USER_STATUS_UPDATE', 'ADMIN_UNAUTHORIZED_ACCESS',
+        'SETTINGS_UPDATE',
+        'NOTIFICATION_LIST_VIEW', 'NOTIFICATION_MARK_READ', 'NOTIFICATION_READ_ALL',
+        'ACCOUNT_CREATE', 'JOURNAL_ENTRY_CREATE', 'JOURNAL_ENTRY_REVERSE',
+        'CORPORATE_ACTION_CREATE', 'CORPORATE_ACTION_DELETE'
+      )`
+    ),
   ]
 );
 
@@ -333,6 +388,12 @@ export const authRateLimits = pgTable(
   },
   (table) => [
     index("auth_rate_limits_updated_at_idx").on(table.updatedAt),
+    // Data-integrity magnitude guard (migration 0025): the atomic increment can
+    // never go negative (rollback only decrements when attempts >= 2).
+    check(
+      "chk_auth_rate_limits_attempts_non_negative",
+      sql`${table.attempts} >= 0`
+    ),
   ]
 );
 
@@ -354,6 +415,13 @@ export const notifications = pgTable(
     index("notifications_user_id_idx").on(table.userId),
     index("notifications_user_read_idx").on(table.userId, table.isRead),
     index("notifications_dedup_idx").on(table.userId, table.type, table.entityId),
+    // Data-integrity closed set (migration 0025), matches
+    // notification-service.ts NotificationType. NOT VALID in the DB: early
+    // shared-repo rows may carry type strings no longer in the set.
+    check(
+      "chk_notifications_type",
+      sql`${table.type} IN ('SYSTEM', 'STATEMENT_UPLOAD', 'STATEMENT_IMPORT', 'STATEMENT_DUPLICATE', 'ANALYSIS_COMPLETE', 'ACCOUNT_STATUS')`
+    ),
   ]
 );
 
@@ -396,6 +464,17 @@ export const accounts = pgTable(
     uniqueIndex("accounts_user_id_code_idx").on(table.userId, table.code),
     index("accounts_user_id_idx").on(table.userId),
     index("accounts_parent_id_idx").on(table.parentId),
+    // Data-integrity closed set + magnitude (migration 0025): account type must
+    // be one of the five GAAP categories the engine understands; opening balance
+    // is a positive magnitude (no write path exists today).
+    check(
+      "chk_accounts_type",
+      sql`${table.type} IN ('ASSET', 'LIABILITY', 'EQUITY', 'INCOME', 'EXPENSE')`
+    ),
+    check(
+      "chk_accounts_opening_balance_non_negative",
+      sql`${table.openingBalance} IS NULL OR ${table.openingBalance} >= 0`
+    ),
   ]
 );
 
@@ -466,6 +545,28 @@ export const journalEntries = pgTable(
     index("journal_entries_source_document_id_idx").on(table.sourceDocumentId),
     index("journal_entries_symbol_idx").on(table.symbol),
     index("journal_entries_source_transaction_id_idx").on(table.sourceTransactionId),
+    // Data-integrity closed sets (migration 0025), matching the audited
+    // ledger-service insert paths.
+    check(
+      "chk_journal_entries_source_type",
+      sql`${table.sourceType} IN ('MANUAL', 'STATEMENT')`
+    ),
+    check(
+      "chk_journal_entries_status",
+      sql`${table.status} IN ('POSTED', 'REVERSED')`
+    ),
+    check(
+      "chk_journal_entries_side",
+      sql`${table.side} IS NULL OR ${table.side} IN ('BUY', 'SELL')`
+    ),
+    check(
+      "chk_journal_entries_posting_state",
+      sql`${table.postingState} IN ('POSTED', 'SKIPPED')`
+    ),
+    check(
+      "chk_journal_entries_type",
+      sql`${table.type} IS NULL OR ${table.type} IN ('CASH_IN', 'CASH_OUT')`
+    ),
   ]
 );
 
@@ -501,6 +602,25 @@ export const journalEntryLines = pgTable(
     check(
       "journal_entry_lines_single_leg",
       sql`(debit_amount IS NULL) <> (credit_amount IS NULL)`
+    ),
+    // Data-integrity magnitude guards (migration 0025): a leg is always a
+    // positive magnitude, fx is always > 0 (THB pinned at 1), and the derived
+    // THB base is always > 0.
+    check(
+      "chk_journal_entry_lines_debit_positive",
+      sql`${table.debitAmount} IS NULL OR ${table.debitAmount} > 0`
+    ),
+    check(
+      "chk_journal_entry_lines_credit_positive",
+      sql`${table.creditAmount} IS NULL OR ${table.creditAmount} > 0`
+    ),
+    check(
+      "chk_journal_entry_lines_fx_rate_effective_positive",
+      sql`${table.fxRateEffective} > 0`
+    ),
+    check(
+      "chk_journal_entry_lines_amount_thb_positive",
+      sql`${table.amountThb} > 0`
     ),
   ]
 );

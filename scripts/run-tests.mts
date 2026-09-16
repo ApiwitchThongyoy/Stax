@@ -3470,6 +3470,277 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
     }
   }
 
+  // ================= REG: DATA INTEGRITY CHECKS (migration 0025) =================
+  // Proves the CHECK constraints added by 0025 are present and enforce the
+  // closed sets + magnitude guards at the DB level: 8 invalid finite-state
+  // values, 7 invalid journal finite-state values, 4 invalid journal-line
+  // magnitudes, the both/neither single-leg defect, negative attempts, and a
+  // valid-value sweep that exercises EVERY allowed state. Invalid inserts must
+  // fail with SQLSTATE 23514. Requires the 0025 migration.
+  {
+    const checkExists = await client`
+      SELECT 1 AS one FROM pg_constraint
+      WHERE conname = 'chk_users_role'
+      LIMIT 1`;
+    if (checkExists.length === 0) {
+      console.log(
+        "\n  SKIP  REG-data-integrity: migration 0025 constraints absent (run the 0025 migration)"
+      );
+    } else {
+      console.log("\n=== REG: DATA INTEGRITY CHECKS ===");
+      const { randomUUID } = await import("node:crypto");
+      const diEmail = `di-${randomUUID()}@test.local`;
+      const diPass = "DiCheck!234";
+      const diReg = await registerAs(diEmail, diPass);
+      const diJson = (await diReg.json()) as { data?: { user?: { id?: string } } };
+      const diUserId = diJson.data?.user?.id;
+      if (!diUserId) {
+        ok(false, "REG-di: register failed to create the data-integrity test user");
+      } else {
+        smokeUserIds.push(diUserId);
+        ok(diReg.status === 201, "REG-di: test user registers (role USER / status ACTIVE pass)");
+
+        const nowIso = new Date().toISOString();
+        // Grab a seeded account to satisfy FKs when testing journal lines.
+        const acct = await client`
+          SELECT id FROM accounts WHERE user_id = ${diUserId} AND code = '1010' LIMIT 1`;
+        const acctId: string = acct[0]?.id;
+        const jNo = 5000 + Math.floor(Math.random() * 4000);
+        const jEntryId = randomUUID();
+
+        const expectCheckViolation = async (
+          label: string,
+          run: () => Promise<unknown>
+        ) => {
+          try {
+            await run();
+            ok(false, `REG-di: ${label} — expected SQLSTATE 23514 but the write succeeded`);
+          } catch (e) {
+            const code = (e as { code?: string })?.code ?? "none";
+            ok(code === "23514", `REG-di: ${label} — rejected with SQLSTATE 23514 (got ${code})`);
+          }
+        };
+
+        // ---- Schema shape: all 22 constraints registered with the right tier ----
+        const chkRows = await client`
+          SELECT c.conname, c.convalidated
+          FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+          WHERE c.contype = 'c' AND c.conname IN (
+            'chk_users_role','chk_users_status',
+            'chk_capital_transactions_type','chk_capital_transactions_source_type',
+            'chk_capital_transactions_side','chk_capital_transactions_category',
+            'chk_capital_transactions_quantity_positive',
+            'chk_corporate_actions_action_type',
+            'chk_accounts_type','chk_accounts_opening_balance_non_negative',
+            'chk_journal_entries_source_type','chk_journal_entries_status',
+            'chk_journal_entries_side','chk_journal_entries_posting_state',
+            'chk_journal_entries_type',
+            'chk_journal_entry_lines_debit_positive','chk_journal_entry_lines_credit_positive',
+            'chk_journal_entry_lines_fx_rate_effective_positive','chk_journal_entry_lines_amount_thb_positive',
+            'chk_notifications_type','chk_audit_logs_action',
+            'chk_auth_rate_limits_attempts_non_negative'
+          )`;
+        ok(
+          chkRows.length === 22,
+          `REG-di: all 22 data-integrity constraints are registered (found ${chkRows.length})`
+        );
+        const nameOf = (n: string) => chkRows.find((r) => r.conname === n);
+        const assertTier = (n: string, notValidExpected: boolean) =>
+          ok(
+            (nameOf(n)?.convalidated === !notValidExpected) === true,
+            `REG-di: ${n} is ${notValidExpected ? "NOT VALID (notvalid=true)" : "VALIDATED"}`
+          );
+        // NOT VALID tier: pre-repo / removed-CSV / evolving-enum tables.
+        assertTier("chk_users_role", true);
+        assertTier("chk_capital_transactions_type", true);
+        assertTier("chk_notifications_type", true);
+        assertTier("chk_audit_logs_action", true);
+        // VALIDATED tier: audited repo-only writers.
+        assertTier("chk_journal_entries_status", false);
+        assertTier("chk_accounts_type", false);
+        assertTier("chk_journal_entry_lines_debit_positive", false);
+        assertTier("chk_auth_rate_limits_attempts_non_negative", false);
+
+        // ---- Invalid finite-state values (8 fields) ----
+        await expectCheckViolation("bad User.role", () =>
+          client`INSERT INTO "User" (id, email, password_hash, role, status) VALUES (${randomUUID()}, ${`role-${randomUUID()}@test.local`}, 'x', 'SUPER_ADMIN', 'ACTIVE')`
+        );
+        await expectCheckViolation("bad User.status", () =>
+          client`INSERT INTO "User" (id, email, password_hash, role, status) VALUES (${randomUUID()}, ${`status-${randomUUID()}@test.local`}, 'x', 'USER', 'DELETED')`
+        );
+        await expectCheckViolation("bad Capital_Transactions.type", () =>
+          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'TRADE', 'AI_PARSED')`
+        );
+        await expectCheckViolation("bad Capital_Transactions.source_type", () =>
+          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'CASH_IN', 'CSV')`
+        );
+        await expectCheckViolation("bad Capital_Transactions.side", () =>
+          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, side) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'CASH_IN', 'AI_PARSED', 'BUY_SIDE')`
+        );
+        await expectCheckViolation("bad Capital_Transactions.category", () =>
+          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, category) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'CASH_IN', 'AI_PARSED', 'liability')`
+        );
+        await expectCheckViolation("zero Capital_Transactions.quantity", () =>
+          client`INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, quantity) VALUES (${randomUUID()}, ${diUserId}, '10.00', 'USD', '2026-01-01', '350.00', 'CASH_IN', 'AI_PARSED', '0')`
+        );
+        await expectCheckViolation("bad corporate_actions.action_type", () =>
+          client`INSERT INTO corporate_actions (id, user_id, symbol, action_type, transaction_date, created_at, updated_at) VALUES (${randomUUID()}, ${diUserId}, 'NVDA', 'DIVIDEND', '2026-01-01', ${nowIso}, ${nowIso})`
+        );
+        await expectCheckViolation("bad accounts.type", () =>
+          client`INSERT INTO accounts (id, user_id, code, name, type, created_at, updated_at) VALUES (${randomUUID()}, ${diUserId}, '9999', 'X', 'LEDGER', ${nowIso}, ${nowIso})`
+        );
+        await expectCheckViolation("negative accounts.opening_balance", () =>
+          client`INSERT INTO accounts (id, user_id, code, name, type, opening_balance, created_at, updated_at) VALUES (${randomUUID()}, ${diUserId}, '9998', 'X', 'ASSET', '-1.00', ${nowIso}, ${nowIso})`
+        );
+
+        // ---- Invalid journal finite-state values (5 fields) ----
+        await expectCheckViolation("bad journal_entries.source_type", () =>
+          client`INSERT INTO journal_entries (id, user_id, entry_no, entry_date, description, source_type, status, created_at, updated_at)
+            VALUES (${randomUUID()}, ${diUserId}, ${jNo}, '2026-01-01', 'REG-di', 'CSV', 'POSTED', ${nowIso}, ${nowIso})`
+        );
+        await expectCheckViolation("bad journal_entries.status", () =>
+          client`INSERT INTO journal_entries (id, user_id, entry_no, entry_date, description, source_type, status, created_at, updated_at)
+            VALUES (${randomUUID()}, ${diUserId}, ${jNo + 1}, '2026-01-01', 'REG-di', 'MANUAL', 'DRAFT', ${nowIso}, ${nowIso})`
+        );
+        await expectCheckViolation("bad journal_entries.posting_state", () =>
+          client`INSERT INTO journal_entries (id, user_id, entry_no, entry_date, description, source_type, status, posting_state, created_at, updated_at)
+            VALUES (${randomUUID()}, ${diUserId}, ${jNo + 2}, '2026-01-01', 'REG-di', 'MANUAL', 'POSTED', 'FAILED', ${nowIso}, ${nowIso})`
+        );
+        await expectCheckViolation("bad journal_entries.side", () =>
+          client`INSERT INTO journal_entries (id, user_id, entry_no, entry_date, description, source_type, status, side, created_at, updated_at)
+            VALUES (${randomUUID()}, ${diUserId}, ${jNo + 3}, '2026-01-01', 'REG-di', 'MANUAL', 'POSTED', 'HOLD', ${nowIso}, ${nowIso})`
+        );
+        await expectCheckViolation("bad journal_entries.type", () =>
+          client`INSERT INTO journal_entries (id, user_id, entry_no, entry_date, description, source_type, status, type, created_at, updated_at)
+            VALUES (${randomUUID()}, ${diUserId}, ${jNo + 4}, '2026-01-01', 'REG-di', 'MANUAL', 'POSTED', 'BUY', ${nowIso}, ${nowIso})`
+        );
+
+        // ---- Invalid journal-line magnitudes + single-leg defect (5 cases) ----
+        const seedLineEntry = await client`
+          INSERT INTO journal_entries (id, user_id, entry_no, entry_date, description, source_type, status, created_at, updated_at)
+          VALUES (${jEntryId}, ${diUserId}, ${jNo + 5}, '2026-01-01', 'REG-di lines', 'MANUAL', 'POSTED', ${nowIso}, ${nowIso})
+          RETURNING id`;
+        await expectCheckViolation("zero debit_amount", () =>
+          client`INSERT INTO journal_entry_lines (id, journal_entry_id, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective)
+            VALUES (${randomUUID()}, ${jEntryId}, ${diUserId}, ${acctId}, 'USD', '0', NULL, '10.00', '1.00')`
+        );
+        await expectCheckViolation("negative credit_amount", () =>
+          client`INSERT INTO journal_entry_lines (id, journal_entry_id, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective)
+            VALUES (${randomUUID()}, ${jEntryId}, ${diUserId}, ${acctId}, 'USD', NULL, '-5.00', '5.00', '1.00')`
+        );
+        await expectCheckViolation("zero fx_rate_effective", () =>
+          client`INSERT INTO journal_entry_lines (id, journal_entry_id, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective)
+            VALUES (${randomUUID()}, ${jEntryId}, ${diUserId}, ${acctId}, 'USD', '10.00', NULL, '10.00', '0')`
+        );
+        await expectCheckViolation("zero amount_thb", () =>
+          client`INSERT INTO journal_entry_lines (id, journal_entry_id, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective)
+            VALUES (${randomUUID()}, ${jEntryId}, ${diUserId}, ${acctId}, 'USD', '10.00', NULL, '0', '1.00')`
+        );
+        await expectCheckViolation("both debit AND credit set", () =>
+          client`INSERT INTO journal_entry_lines (id, journal_entry_id, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective)
+            VALUES (${randomUUID()}, ${jEntryId}, ${diUserId}, ${acctId}, 'USD', '10.00', '10.00', '10.00', '1.00')`
+        );
+        await expectCheckViolation("neither debit nor credit set", () =>
+          client`INSERT INTO journal_entry_lines (id, journal_entry_id, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective)
+            VALUES (${randomUUID()}, ${jEntryId}, ${diUserId}, ${acctId}, 'USD', NULL, NULL, '10.00', '1.00')`
+        );
+
+        // ---- Negative auth_rate_limits.attempts ----
+        await expectCheckViolation("negative auth_rate_limits.attempts", () =>
+          client`INSERT INTO auth_rate_limits (key, attempts) VALUES (${`di-${randomUUID()}`}, -1)`
+        );
+
+        // ---- Valid-value sweep: every allowed state writes successfully ----
+        const validUser = await client`
+          INSERT INTO "User" (id, email, password_hash, role, status)
+          VALUES (${randomUUID()}, ${`diadmin-${randomUUID()}@test.local`}, 'x', 'ADMIN', 'SUSPENDED')
+          RETURNING id`;
+        ok(validUser.length === 1, "REG-di: valid User (role ADMIN / status SUSPENDED) passes");
+        await client`DELETE FROM "User" WHERE id = ${validUser[0].id}`;
+
+        const validTx = await client`
+          INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, category, side, quantity)
+          VALUES (${randomUUID()}, ${diUserId}, '1000.00', 'USD', '2026-01-01', '35000.00', 'CASH_IN', 'MANUAL', 'equity', NULL, NULL)
+          RETURNING transaction_id`;
+        ok(validTx.length === 1, "REG-di: valid Capital_Transactions (CASH_IN/MANUAL/equity/NULL side) passes");
+        await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ${validTx[0].transaction_id}`;
+
+        const validTx2 = await client`
+          INSERT INTO "Capital_Transactions" (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, category, side, quantity)
+          VALUES (${randomUUID()}, ${diUserId}, '500.00', 'USD', '2026-02-01', '17500.00', 'CASH_IN', 'AI_PARSED', 'asset', 'SELL', '5')
+          RETURNING transaction_id`;
+        ok(validTx2.length === 1, "REG-di: valid trade row (AI_PARSED/asset/SELL/qty 5) passes");
+        await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ${validTx2[0].transaction_id}`;
+
+        const validAction = await client`
+          INSERT INTO corporate_actions (id, user_id, symbol, action_type, transaction_date, created_at, updated_at)
+          VALUES (${randomUUID()}, ${diUserId}, 'NVDA', 'SPLIT', '2026-01-01', ${nowIso}, ${nowIso})
+          RETURNING id`;
+        ok(validAction.length === 1, "REG-di: valid corporate_actions (SPLIT) passes");
+        await client`DELETE FROM corporate_actions WHERE id = ${validAction[0].id}`;
+
+        const validAccount = await client`
+          INSERT INTO accounts (id, user_id, code, name, type, opening_balance, created_at, updated_at)
+          VALUES (${randomUUID()}, ${diUserId}, '9997', 'X', 'INCOME', NULL, ${nowIso}, ${nowIso})
+          RETURNING id`;
+        ok(validAccount.length === 1, "REG-di: valid accounts (INCOME / NULL opening_balance) passes");
+        await client`DELETE FROM accounts WHERE id = ${validAccount[0].id}`;
+
+        const validEntry = await client`
+          INSERT INTO journal_entries (id, user_id, entry_no, entry_date, description, source_type, status, posting_state, side, type, created_at, updated_at)
+          VALUES (${randomUUID()}, ${diUserId}, ${jNo + 9}, '2026-01-01', 'REG-di valid', 'STATEMENT', 'POSTED', 'SKIPPED', 'SELL', 'CASH_IN', ${nowIso}, ${nowIso})
+          RETURNING id`;
+        ok(validEntry.length === 1, "REG-di: valid journal_entries (STATEMENT/POSTED/SKIPPED/SELL/CASH_IN) passes");
+        // Nullable tallows: a plain GL-manual entry with all trade-detail fields NULL.
+        const validEntryNulls = await client`
+          INSERT INTO journal_entries (id, user_id, entry_no, entry_date, description, source_type, status, created_at, updated_at)
+          VALUES (${randomUUID()}, ${diUserId}, ${jNo + 10}, '2026-01-01', 'REG-di nulls', 'MANUAL', 'POSTED', ${nowIso}, ${nowIso})
+          RETURNING id`;
+        ok(validEntryNulls.length === 1, "REG-di: valid journal_entries with NULL side/type/posting-nulls passes");
+        await client`DELETE FROM journal_entries WHERE id = ${validEntry[0].id}`;
+        await client`DELETE FROM journal_entries WHERE id = ${validEntryNulls[0].id}`;
+
+        const lineDebit = await client`
+          INSERT INTO journal_entry_lines (id, journal_entry_id, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective)
+          VALUES (${randomUUID()}, ${jEntryId}, ${diUserId}, ${acctId}, 'USD', '1234.56', NULL, '1234.56', '35.50')
+          RETURNING id`;
+        const lineCredit = await client`
+          INSERT INTO journal_entry_lines (id, journal_entry_id, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective)
+          VALUES (${randomUUID()}, ${jEntryId}, ${diUserId}, ${acctId}, 'USD', NULL, '1234.56', '1234.56', '1.00')
+          RETURNING id`;
+        ok(
+          lineDebit.length === 1 && lineCredit.length === 1,
+          "REG-di: valid journal lines (debit-only + credit-only, positive, THB base > 0) pass"
+        );
+        await client`DELETE FROM journal_entry_lines WHERE id = ${lineDebit[0].id}`;
+        await client`DELETE FROM journal_entry_lines WHERE id = ${lineCredit[0].id}`;
+
+        const validNotif = await client`
+          INSERT INTO notifications (id, user_id, title, message, type, created_at)
+          VALUES (${randomUUID()}, ${diUserId}, 't', 'm', 'SYSTEM', ${nowIso})
+          RETURNING id`;
+        ok(validNotif.length === 1, "REG-di: valid notifications (SYSTEM) passes");
+
+        const validAudit = await client`
+          INSERT INTO audit_logs (id, user_id, action, created_at)
+          VALUES (${randomUUID()}, ${diUserId}, 'LOGIN_SUCCESS', ${nowIso})
+          RETURNING id`;
+        ok(validAudit.length === 1, "REG-di: valid audit_logs (LOGIN_SUCCESS) passes");
+
+        const validRate = await client`
+          INSERT INTO auth_rate_limits (key, attempts) VALUES (${`di-${randomUUID()}`}, 3)
+          RETURNING key`;
+        ok(validRate.length === 1, "REG-di: valid auth_rate_limits (attempts 3) passes");
+
+        // Self-cleaning: journal lines -> the seeded line entry + INTENTIONAL
+        // loop rows are FK-bound to accounts; the shared CLEANUP already deletes
+        // lines/entries/accounts/user for this smoke user.
+        await client`DELETE FROM journal_entry_lines WHERE journal_entry_id = ${jEntryId}`;
+        await client`DELETE FROM journal_entries WHERE id = ${jEntryId}`;
+      }
+    }
+  }
+
   // ================= CLEANUP =================
   console.log("\n=== CLEANUP ===");
   const cleanIds: string[] = [];
