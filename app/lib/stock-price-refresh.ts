@@ -10,7 +10,10 @@ import {
   yahooFinanceStockSource,
   isDefaultStale,
   refreshStockPricesCore,
+  normalizeStockSymbol,
+  isValidStockQuote,
 } from "./stock-price-provider";
+import { safeErrorLog } from "./safe-error-log";
 
 /**
  * DB-aware service wiring the daily stock-price refresh + read path.
@@ -67,7 +70,7 @@ export async function refreshStockPrices(
 ): Promise<StockPriceRefreshStats> {
   const targets =
     symbols && symbols.length > 0 ? symbols : await getTrackedSymbols();
-  const deduped = [...new Set(targets.map((s) => s.toUpperCase()))];
+  const deduped = [...new Set(targets.map((s) => s.trim().toUpperCase()))];
 
   const core = await refreshStockPricesCore(deduped, source, upsertStockPrice, {
     delayMs: 250,
@@ -91,28 +94,33 @@ export async function resolveStockPrice(
   symbol: string,
   source: StockPriceSource = yahooFinanceStockSource
 ): Promise<StockPriceQuoteResult | null> {
-  const upper = symbol.toUpperCase();
+  const upper = normalizeStockSymbol(symbol);
+  if (!upper) return null;
   const cached = await getLatestStockPrice(upper);
   if (cached && !isDefaultStale(cached.updatedAt)) {
     return quoteResultFromCached(upper, cached);
   }
 
-  const fresh = await source.getClose(upper);
-  if (fresh && Number.isFinite(fresh.close) && fresh.close > 0) {
-    const wrote = await upsertStockPrice({
-      symbol: upper,
-      priceDate: fresh.priceDate,
-      close: fresh.close,
-      currency: fresh.currency,
-    });
-    return {
-      symbol: upper,
-      priceDate: wrote.priceDate,
-      close: parseFloat(wrote.closePrice),
-      currency: wrote.currency,
-      priceUpdatedAt: wrote.updatedAt,
-      source: YAHOO_FINANCE_SOURCE_NAME_LABEL,
-    };
+  try {
+    const fresh = await source.getClose(upper);
+    if (fresh && isValidStockQuote(fresh)) {
+      const wrote = await upsertStockPrice({
+        symbol: upper,
+        priceDate: fresh.priceDate,
+        close: fresh.close,
+        currency: fresh.currency,
+      });
+      return {
+        symbol: upper,
+        priceDate: wrote.priceDate,
+        close: parseFloat(wrote.closePrice),
+        currency: wrote.currency,
+        priceUpdatedAt: wrote.updatedAt,
+        source: YAHOO_FINANCE_SOURCE_NAME_LABEL,
+      };
+    }
+  } catch (error) {
+    console.warn("Stock price lookup failed", safeErrorLog(error));
   }
 
   if (cached) {

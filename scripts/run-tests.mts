@@ -3752,6 +3752,9 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
   }
 
   // ================= REG: USER ISOLATION =================
+  const { runReleaseReadinessTests } = await import("./release-readiness-db.mjs");
+  await runReleaseReadinessTests(client, ok, tokenA, tokenAd, userARow.id);
+
   console.log("\n=== REG: USER ISOLATION ===");
   const { runUserIsolationTests } = await import("./user-isolation-db.mjs");
   await runUserIsolationTests(client, ok, makePdf, tokenAd);

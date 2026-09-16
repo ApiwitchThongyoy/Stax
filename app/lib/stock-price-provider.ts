@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { safeErrorLog } from "./safe-error-log";
 
 /**
  * Daily-close stock price provider (keyless), used to enrich the Dashboard
@@ -49,6 +50,18 @@ const YAHOO_CHART_API_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
 /** Milliseconds that make a stored price "stale" (fetch again after ~1 day). */
 export const DEFAULT_STALE_MS = 86_400_000;
 
+export function normalizeStockSymbol(symbol: string): string | null {
+  const normalized = symbol.trim().toUpperCase();
+  return /^[A-Z0-9][A-Z0-9.\-]{0,11}$/.test(normalized) ? normalized : null;
+}
+
+export function isValidStockQuote(quote: Omit<StockQuoteInput, "symbol">): boolean {
+  if (!Number.isFinite(quote.close) || quote.close <= 0 || !/^[A-Z]{3}$/.test(quote.currency)) return false;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(quote.priceDate)) return false;
+  const date = new Date(`${quote.priceDate}T00:00:00Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === quote.priceDate;
+}
+
 function formatUtcDate(unixSeconds: number): string {
   const d = new Date(unixSeconds * 1000);
   const y = d.getUTCFullYear();
@@ -64,7 +77,8 @@ function formatUtcDate(unixSeconds: number): string {
  * return null — never an invented price.
  */
 export function parseYahooChartResponse(
-  body: unknown
+  body: unknown,
+  now: Date = new Date()
 ): Omit<StockQuoteInput, "symbol"> | null {
   if (typeof body !== "object" || body === null) return null;
   const chart = (body as { chart?: unknown }).chart;
@@ -75,7 +89,8 @@ export function parseYahooChartResponse(
   const result = chartObj.result?.[0];
   if (typeof result !== "object" || result === null) return null;
   const res = result as {
-    meta?: { currency?: unknown };
+    meta?: { currency?: unknown; exchangeTimezoneName?: unknown;
+      currentTradingPeriod?: { regular?: { start?: unknown; end?: unknown } } };
     timestamp?: unknown[];
     indicators?: {
       quote?: Array<{ close?: unknown[] }>;
@@ -83,7 +98,7 @@ export function parseYahooChartResponse(
   };
 
   const currency = res.meta?.currency;
-  if (typeof currency !== "string" || currency.length !== 3) return null;
+  if (typeof currency !== "string" || !/^[A-Z]{3}$/.test(currency)) return null;
 
   const timestamps = res.timestamp;
   const closes = res.indicators?.quote?.[0]?.close;
@@ -93,15 +108,31 @@ export function parseYahooChartResponse(
   for (let i = closes.length - 1; i >= 0; i--) {
     const rawClose = closes[i];
     if (rawClose === null || rawClose === undefined) continue;
-    const close = parseFloat(String(rawClose));
-    if (!Number.isFinite(close) || close <= 0) continue;
+    if (typeof rawClose !== "number" || !Number.isFinite(rawClose) || rawClose <= 0) continue;
+    const close = rawClose;
 
     const rawTs = timestamps[i];
-    const ts = typeof rawTs === "number" ? rawTs : parseInt(String(rawTs), 10);
-    if (!Number.isFinite(ts) || ts <= 0) continue;
+    if (typeof rawTs !== "number" || !Number.isFinite(rawTs) || rawTs <= 0) continue;
+    const ts = rawTs;
+    if (!Number.isFinite(new Date(ts * 1000).getTime()) || ts * 1000 > now.getTime()) continue;
+    // Yahoo's final daily bar can still be today's live, unfinished session.
+    const regular = res.meta?.currentTradingPeriod?.regular;
+    if (typeof regular?.start === "number" && typeof regular.end === "number"
+      && ts >= regular.start && now.getTime() < regular.end * 1000) continue;
+
+    let priceDate = formatUtcDate(ts);
+    if (typeof res.meta?.exchangeTimezoneName === "string") {
+      try {
+        const parts = new Intl.DateTimeFormat("en-US", {
+          timeZone: res.meta.exchangeTimezoneName, year: "numeric", month: "2-digit", day: "2-digit",
+        }).formatToParts(new Date(ts * 1000));
+        const value = (type: string) => parts.find((p) => p.type === type)?.value;
+        priceDate = `${value("year")}-${value("month")}-${value("day")}`;
+      } catch { return null; }
+    }
 
     return {
-      priceDate: formatUtcDate(ts),
+      priceDate,
       close,
       currency,
     };
@@ -119,21 +150,22 @@ export function parseYahooChartResponse(
 export const yahooFinanceStockSource: StockPriceSource = {
   name: YAHOO_FINANCE_SOURCE_NAME,
   async getClose(symbol: string): Promise<Omit<StockQuoteInput, "symbol"> | null> {
+    const normalized = normalizeStockSymbol(symbol);
+    if (!normalized) return null;
+    symbol = normalized;
     const url = new URL(`${YAHOO_CHART_API_BASE}/${encodeURIComponent(symbol)}`);
     url.searchParams.set("range", "5d");
     url.searchParams.set("interval", "1d");
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
       const response = await fetch(url.toString(), {
         method: "GET",
         headers: { Accept: "application/json" },
         signal: controller.signal,
       });
-
-      clearTimeout(timeout);
 
       if (!response.ok) {
         console.warn(
@@ -157,10 +189,13 @@ export const yahooFinanceStockSource: StockPriceSource = {
       } else {
         console.warn(
           `Stock price provider network error for ${symbol}:`,
-          error
+          safeErrorLog(error)
         );
       }
       return null;
+    } finally {
+      // Covers response body consumption too, and every early/error return.
+      clearTimeout(timeout);
     }
   },
 };
@@ -201,22 +236,26 @@ export async function refreshStockPricesCore(
   const failed: string[] = [];
   let updated = 0;
 
-  for (const symbol of symbols) {
+  for (const [index, symbol] of symbols.entries()) {
+    if (index > 0 && delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
     let updatedThisSymbol = false;
-    const quote = await source.getClose(symbol);
-    if (quote && Number.isFinite(quote.close) && quote.close > 0) {
-      // The refresh writes today's (dedup-safe) row even when the provider hands
-      // back the previous trading day's close — the (symbol, price_date) unique
-      // index makes re-writes idempotent.
-      const priceDate = opts?.hintPriceDate?.(symbol) ?? quote.priceDate;
-      await upsert({
-        symbol,
-        priceDate,
-        close: quote.close,
-        currency: quote.currency,
-      });
-      updated++;
-      updatedThisSymbol = true;
+    try {
+      const normalized = normalizeStockSymbol(symbol);
+      const quote = normalized ? await source.getClose(normalized) : null;
+      if (quote && isValidStockQuote(quote)) {
+        // Keep the provider's trading date, including weekends/holidays.
+        const priceDate = quote.priceDate;
+        await upsert({
+          symbol: normalized!,
+          priceDate,
+          close: quote.close,
+          currency: quote.currency,
+        });
+        updated++;
+        updatedThisSymbol = true;
+      }
+    } catch (error) {
+      console.warn("Stock price refresh: symbol failed", safeErrorLog(error));
     }
     if (!updatedThisSymbol) {
       failed.push(symbol);
