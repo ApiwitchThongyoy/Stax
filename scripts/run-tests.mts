@@ -646,6 +646,16 @@ async function main() {
         "REG: mismatched MIME type is rejected (400)"
       );
 
+      // Wrong extension (.txt with valid PDF content) -> 400
+      const wrongExt = new File([magicPdf as BlobPart], "statement.txt", {
+        type: "application/pdf",
+      });
+      const extRes = await uploadAs(tokenA, wrongExt);
+      ok(
+        extRes.status === 400,
+        "REG: non-.pdf extension is rejected (400)"
+      );
+
       // Oversized file (over 20 MB) -> 400
       const oversized = new File(
         [
@@ -662,6 +672,27 @@ async function main() {
         bigRes.status === 400,
         "REG: upload exceeding the 20 MB size limit is rejected (400)"
       );
+
+      // Rejects happen BEFORE any storage/document write (validation-first):
+      // none of the rejected uploads may leave a documents row behind. Since
+      // saveStatementPdf persists the storage object only alongside its
+      // documents row (and cleans the object up when the row insert fails), a
+      // missing row is a sound no-leak invariant — no row, no orphaned object.
+      const leakedDocs = await client`SELECT id, original_name FROM documents WHERE user_id = ${userARow.id} AND original_name IN ('evil.pdf', 'x.pdf', 'statement.txt', 'big.pdf')`;
+      ok(
+        leakedDocs.length === 0,
+        "REG: rejected uploads leave NO documents row behind (validation-first, no leak)"
+      );
+
+      // Isolation: the same invalid file is rejected identically for a second
+      // user, and one user's rejection never affects another user's documents.
+      if (tokenB) {
+        const bRes = await uploadAs(tokenB, fakePdf);
+        ok(
+          bRes.status === 400,
+          "REG: invalid upload rejected identically for a second user (no cross-user effect)"
+        );
+      }
     }
   }
 

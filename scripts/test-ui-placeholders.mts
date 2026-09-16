@@ -306,6 +306,33 @@ ok(
     uploadRoute.includes("buildDuplicatePayload"),
   "upload route computes hash, checks user-scoped duplicates, returns duplicate payload"
 );
+// Upload safety: heavy full-file work (arrayBuffer/hash/extract) must only
+// happen AFTER cheap validation (metadata size/ext/MIME first, then a 5-byte
+// %PDF- header slice). Verify the ordering in the `action` flow. (The helper
+// rebuildStatementImport also reads file.arrayBuffer(), but it is only ever
+// called later — after the same validation already passed in `action`.)
+const actionStart = uploadRoute.indexOf("export async function action");
+const actionCode = actionStart !== -1 ? uploadRoute.slice(actionStart) : uploadRoute;
+const firstValidateIdx = actionCode.indexOf("validatePdfFile(file)");
+const firstMagicIdx = actionCode.indexOf("hasPdfMagicBytes(file)");
+const firstArrayBufferIdx = actionCode.indexOf("file.arrayBuffer()");
+ok(
+  firstValidateIdx !== -1 && firstMagicIdx !== -1 && firstArrayBufferIdx !== -1,
+  "upload route action calls validatePdfFile + hasPdfMagicBytes + arrayBuffer"
+);
+ok(
+  firstValidateIdx !== -1 &&
+    firstMagicIdx !== -1 &&
+    firstValidateIdx < firstMagicIdx &&
+    firstMagicIdx < firstArrayBufferIdx,
+  "upload action validates metadata BEFORE magic bytes BEFORE the full-file read"
+);
+ok(
+  actionCode.includes("validatePdfFile") &&
+    actionCode.includes('status: 400') &&
+    actionCode.includes("validation.message"),
+  "upload action rejects unvalidated files with a 400 + validation message"
+);
 ok(
   uploadRoute.includes("buildDuplicatePayload") &&
     statementHash.includes("STATEMENT_ALREADY_IMPORTED") &&
