@@ -6,6 +6,7 @@ import { db } from "~/lib/drizzle-db";
 import { users } from "~/db/schema";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 import { seedDefaultChartOfAccounts } from "~/lib/ledger-service";
+import { normalizeEmail } from "~/lib/normalize-email";
 
 // Same email format used by login.ts.
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -48,7 +49,7 @@ export async function action({ request }: Route.ActionArgs) {
     );
   }
 
-  const normalizedEmail = email.trim().toLowerCase();
+  const normalizedEmail = normalizeEmail(email);
 
   if (!normalizedEmail) {
     return Response.json(

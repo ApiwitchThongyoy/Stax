@@ -917,8 +917,8 @@ ok(
 ok(
   /"crons":\s*\[/.test(vercelFile) &&
     vercelFile.includes('"path": "/api/v1/stock-prices/refresh"') &&
-    vercelFile.includes('"schedule": "30 17 * * *"'),
-  "vercel.json schedules the daily stock-price refresh cron (00:30 ICT)"
+    vercelFile.includes('"schedule": "30 22 * * *"'),
+  "vercel.json schedules the daily stock-price refresh cron (22:30 UTC / 05:30 ICT)"
 );
 
 // ---------------------------------------------------------------------------
