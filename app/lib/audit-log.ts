@@ -3,9 +3,16 @@ import { db } from "./drizzle-db";
 import { auditLogs } from "../db/schema";
 import { safeErrorLog } from "./safe-error-log";
 
+export type AuditActionValue = (typeof AuditAction)[keyof typeof AuditAction];
+
 export interface AuditLogInput {
   userId?: string | null;
-  action: string;
+  // Typed as the closed AuditAction set (single producer of action strings; every
+  // call site passes AuditAction.*). Compile-time guard so a raw-string/typo can
+  // never reach the DB — the CHECK constraint in migration 0025 is the matching
+  // DB-level guard. Adding a value REQUIRES updating the migration CHECK too;
+  // scripts/test-audit-actions-sync.mts fails loudly if the two drift.
+  action: AuditActionValue;
   entityType?: string | null;
   entityId?: string | null;
   details?: Record<string, unknown> | null;
