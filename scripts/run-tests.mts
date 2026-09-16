@@ -1185,6 +1185,200 @@ async function main() {
     }
   }
 
+  // ================= REG: AUTH HARDENING =================
+  // Rate limiting (PostgreSQL-backed, atomic counters), concurrent-register
+  // resolution and privacy (unknown email == wrong password). Every request
+  // here pins a DEDICATED client IP via x-forwarded-for so these attempts land
+  // on their own rate-limit buckets and never touch the shared "unknown" bucket
+  // used by every other loginAs() call in the harness.
+  {
+    const { randomUUID } = await import("node:crypto");
+    const registerRoute = await import("../app/routes/api/auth/register");
+    const rlLogin = (email: string, password: string, ip: string) =>
+      loginRoute.action({
+        request: new Request("http://test.local/api/v1/auth/login", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-forwarded-for": ip,
+          },
+          body: JSON.stringify({ email, password }),
+        }),
+      } as never);
+    const rlRegister = (email: string, password: string, ip: string) =>
+      registerRoute.action({
+        request: new Request("http://test.local/api/v1/auth/register", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-forwarded-for": ip,
+          },
+          body: JSON.stringify({ email, password }),
+        }),
+      } as never);
+    const rlIp = () => `203.0.113.${Math.floor(Math.random() * 200) + 10}`;
+
+    // 1. Concurrent registration of the SAME email resolves atomically:
+    //    exactly one 201 and the rest 409 EMAIL_ALREADY_EXISTS (whether via the
+    //    pre-check or the DB 23505 unique-constraint race), never a 500.
+    {
+      const email = `rl-concurrent-${randomUUID()}@test.local`;
+      const ip = rlIp();
+      const results = await Promise.all(
+        Array.from({ length: 4 }, () => rlRegister(email, "Concurrent!234", ip))
+      );
+      const statuses = results.map((r) => r.status);
+      const bodies = (await Promise.all(results.map((r) => r.json()))) as Array<{
+        code?: string;
+        data?: { user?: { id?: string } };
+      }>;
+      ok(
+        statuses.filter((s) => s === 201).length === 1,
+        "AUTH: concurrent same-email registrations produce exactly one 201"
+      );
+      ok(
+        statuses.filter((s) => s === 409).length === 3,
+        "AUTH: concurrent registrations beyond the winner are 409"
+      );
+      ok(
+        statuses.every((s) => s === 201 || s === 409),
+        "AUTH: concurrent registration never 500s"
+      );
+      const dupBodies = bodies.filter((_, i) => statuses[i] === 409);
+      ok(
+        dupBodies.every((b) => b.code === "EMAIL_ALREADY_EXISTS"),
+        "AUTH: duplicate 409s carry EMAIL_ALREADY_EXISTS"
+      );
+      const created = bodies.find((_, i) => statuses[i] === 201);
+      if (created?.data?.user?.id) smokeUserIds.push(created.data.user.id);
+    }
+
+    // 2. Login failure loop: attempts 1-5 fail with the SAME 401 as before,
+    //    the 6th is rate-limited (429 TOO_MANY_ATTEMPTS + Retry-After).
+    {
+      const email = `rl-loop-${randomUUID()}@test.local`;
+      const ip = rlIp();
+      for (let i = 1; i <= 5; i++) {
+        const res = await rlLogin(email, "WrongPass!234", ip);
+        ok(res.status === 401, `AUTH: login failure #${i} still 401 (budget ${i}/5)`);
+      }
+      const limited = await rlLogin(email, "WrongPass!234", ip);
+      ok(limited.status === 429, "AUTH: 6th login failure is 429 (TOO_MANY_ATTEMPTS)");
+      const limitedBody = (await limited.json()) as { code?: string };
+      ok(
+        limitedBody.code === "TOO_MANY_ATTEMPTS",
+        "AUTH: login 429 carries code TOO_MANY_ATTEMPTS"
+      );
+      const retryAfter = Number(limited.headers.get("Retry-After"));
+      ok(
+        Number.isFinite(retryAfter) && retryAfter >= 1,
+        "AUTH: login 429 carries a positive Retry-After header"
+      );
+    }
+
+    // 3. IP cap: 20 random-email failures on one IP exhaust the shared IP
+    //    bucket; the 21st attempt from that IP is a generic 429 even though
+    //    each individual email only saw one failure.
+    {
+      const ip = rlIp();
+      for (let i = 1; i <= 20; i++) {
+        const res = await rlLogin(`ip-sweep-${i}-${randomUUID()}@test.local`, "WrongPass!234", ip);
+        ok(res.status === 401, `AUTH: random-email sweep #${i} still 401`);
+      }
+      const after = await rlLogin(`ip-sweep-21-${randomUUID()}@test.local`, "WrongPass!234", ip);
+      ok(after.status === 429, "AUTH: 21st attempt on the same IP is 429 (IP cap)");
+      const afterBody = (await after.json()) as {
+        message?: string;
+        code?: string;
+      };
+      ok(
+        afterBody.message === "Too many attempts. Please try again later." &&
+          afterBody.code === "TOO_MANY_ATTEMPTS",
+        "AUTH: IP-cap 429 body is generic (no email-existence leak)"
+      );
+    }
+
+    // 4. A successful login RESETS the budget: one failure, then a correct
+    //    login clears both buckets; a fresh failure loop then needs a full 6
+    //    attempts to reach 429 (proves the counters were really cleared).
+    {
+      const email = `rl-reset-${randomUUID()}@test.local`;
+      const ip = rlIp();
+      const password = "RlReset!234";
+      const reg = await rlRegister(email, password, ip);
+      const regBody = (await reg.json()) as { data?: { user?: { id?: string } } };
+      ok(reg.status === 201, "AUTH: reset scenario - register succeeds");
+      if (regBody.data?.user?.id) smokeUserIds.push(regBody.data.user.id);
+
+      const f1 = await rlLogin(email, "WrongPass!234", ip);
+      ok(f1.status === 401, "AUTH: reset scenario - one failure counted");
+      const good = await rlLogin(email, password, ip);
+      ok(good.status === 200, "AUTH: correct credential resets the budget");
+      for (let i = 1; i <= 5; i++) {
+        const res = await rlLogin(email, "WrongPass!234", ip);
+        ok(res.status === 401, `AUTH: after-reset failure #${i} still 401`);
+      }
+      const blocked = await rlLogin(email, "WrongPass!234", ip);
+      ok(
+        blocked.status === 429,
+        "AUTH: after-reset, the 6th failure is 429 (clear really reset the budget)"
+      );
+    }
+
+    // 5. Register spam on ONE email+IP: first 201, duplicates 409, the 11th
+    //    attempt is a 429 (duplicate spam is throttled BEFORE the race path).
+    {
+      const email = `rl-regspam-${randomUUID()}@test.local`;
+      const ip = rlIp();
+      const password = "RlRegspam!234";
+      const first = await rlRegister(email, password, ip);
+      const firstBody = (await first.json()) as { data?: { user?: { id?: string } } };
+      ok(first.status === 201, "AUTH: register spam - first register 201");
+      if (firstBody.data?.user?.id) smokeUserIds.push(firstBody.data.user.id);
+      for (let i = 2; i <= 10; i++) {
+        const res = await rlRegister(email, password, ip);
+        ok(res.status === 409, `AUTH: register spam duplicate #${i - 1} still 409`);
+      }
+      const blocked = await rlRegister(email, password, ip);
+      ok(blocked.status === 429, "AUTH: 11th register attempt is 429");
+      const blockedBody = (await blocked.json()) as { code?: string };
+      ok(
+        blockedBody.code === "TOO_MANY_ATTEMPTS",
+        "AUTH: register 429 carries code TOO_MANY_ATTEMPTS"
+      );
+    }
+
+    // 6. Privacy: an unknown email and a wrong password produce byte-identical
+    //    401 bodies (no email-existence enumration via login).
+    {
+      const unknownEmail = `rl-unknown-${randomUUID()}@test.local`;
+      const realEmail = `rl-real-${randomUUID()}@test.local`;
+      const ip = rlIp();
+      const reg = await rlRegister(realEmail, "RlReal!234", ip);
+      const regBody = (await reg.json()) as { data?: { user?: { id?: string } } };
+      ok(reg.status === 201, "AUTH: create real user for message-comparison");
+      if (regBody.data?.user?.id) smokeUserIds.push(regBody.data.user.id);
+
+      const unknownRes = await rlLogin(unknownEmail, "WrongPass!234", ip);
+      const wrongPassRes = await rlLogin(realEmail, "WrongPass!234", ip);
+      ok(
+        unknownRes.status === 401 && wrongPassRes.status === 401,
+        "AUTH: unknown email and wrong password both 401"
+      );
+      const uBody = (await unknownRes.json()) as { message?: string; code?: string };
+      const wBody = (await wrongPassRes.json()) as { message?: string; code?: string };
+      ok(
+        uBody.message === "Invalid email or password" &&
+          wBody.message === "Invalid email or password",
+        "AUTH: unknown-email and wrong-password 401 messages are identical"
+      );
+      ok(
+        !uBody.code && !wBody.code,
+        "AUTH: 401 bodies carry no distinguishing code"
+      );
+    }
+  }
+
   // ================= W2-10 TESTS =================
   console.log("\n=== W2-10: TELEMETRY + SECURITY ===");
 
@@ -3250,6 +3444,9 @@ async function main() {
   }
   await client`DELETE FROM audit_logs WHERE created_at >= ${startTime}`;
   await client`DELETE FROM notifications WHERE created_at >= ${startTime}`;
+  // Rate-limit counters written during this window (dedicated test IPs/emails)
+  // so a re-run inside the 15-minute window starts from a clean slate.
+  await client`DELETE FROM auth_rate_limits WHERE updated_at >= ${startTime}`;
   // Ledger rows are FK-bound to accounts/entries: remove lines -> entries ->
   // accounts for every smoke user (register now seeds a chart of accounts) and
   // for USER A (whose statement uploads lazily-seeded accounts + postings).

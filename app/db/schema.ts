@@ -312,6 +312,30 @@ export const userSettings = pgTable("user_settings", {
   updatedAt: text("updated_at").notNull(),
 });
 
+// PostgreSQL-backed rate limiting for the auth routes (login + register).
+// One row per rate-limit key (e.g. "login-ip:127.0.0.1" or
+// "register-ip:127.0.0.1:user@example.com"). The counter and the window are
+// bumped atomically (INSERT ... ON CONFLICT DO UPDATE) so concurrent requests
+// cannot bypass a limit. Fail-open by design: if a query errors (table missing
+// pre-migration, DB hiccup) the request is allowed through — rate limiting is
+// mitigation, never a user-facing 500. See app/lib/rate-limit.ts.
+export const authRateLimits = pgTable(
+  "auth_rate_limits",
+  {
+    key: text("key").primaryKey(),
+    attempts: integer("attempts").notNull().default(0),
+    windowStartedAt: timestamp("window_started_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("auth_rate_limits_updated_at_idx").on(table.updatedAt),
+  ]
+);
+
 export const notifications = pgTable(
   "notifications",
   {

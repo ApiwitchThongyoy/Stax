@@ -7,6 +7,19 @@ import { users } from "~/db/schema";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 import { ACCOUNT_SUSPENDED_MESSAGE } from "~/lib/auth-middleware";
 import { normalizeEmail } from "~/lib/normalize-email";
+import {
+  LOGIN_EMAIL_RATE_LIMIT,
+  LOGIN_IP_RATE_LIMIT,
+  clearRateLimit,
+  clientIpFromRequest,
+  evaluateRateLimit,
+  incrementRateLimit,
+  loginEmailKey,
+  loginIpKey,
+  purgeStaleRateLimits,
+  rateLimitResponse,
+} from "~/lib/rate-limit";
+import { safeErrorLog } from "~/lib/safe-error-log";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ACCESS_TOKEN_EXPIRY = "1h";
@@ -68,6 +81,47 @@ export async function action({ request }: Route.ActionArgs) {
     );
   }
 
+  // Rate-limit policy (PostgreSQL-backed, fail-open). Every attempt — success
+  // or failure — is counted BEFORE the expensive bcrypt compare, so an
+  // exhausted budget is answered with 429 without wasting a bcrypt round
+  // (resource-DoS mitigation). Keys are per-IP (shared across emails) and
+  // per-email (shared across IPs), so neither a random-email sweep nor a
+  // single-account hammering can bypass the window. A success clears both
+  // keys, resetting the budget. The 429 body is identical for both buckets and
+  // never reveals whether a specific email exists.
+  const loginIp = clientIpFromRequest(request);
+  const ipKey = loginIpKey(loginIp);
+  const emailKey = loginEmailKey(normalizedEmail);
+  const [ipRow, emailRow] = await Promise.all([
+    incrementRateLimit(ipKey),
+    incrementRateLimit(emailKey),
+  ]);
+  const ipDecision = evaluateRateLimit(
+    LOGIN_IP_RATE_LIMIT,
+    ipRow.windowStartedAt.getTime(),
+    ipRow.attempts
+  );
+  const emailDecision = evaluateRateLimit(
+    LOGIN_EMAIL_RATE_LIMIT,
+    emailRow.windowStartedAt.getTime(),
+    emailRow.attempts
+  );
+  if (ipDecision.limited || emailDecision.limited) {
+    const config = ipDecision.limited
+      ? LOGIN_IP_RATE_LIMIT
+      : LOGIN_EMAIL_RATE_LIMIT;
+    const decision = ipDecision.limited ? ipDecision : emailDecision;
+    const currentAttempts = ipDecision.limited
+      ? ipRow.attempts
+      : emailRow.attempts;
+    return rateLimitResponse(
+      decision.retryAfterMs,
+      config.maxAttempts,
+      Math.max(0, config.maxAttempts - currentAttempts + 1)
+    );
+  }
+  void purgeStaleRateLimits();
+
   let user;
   try {
     // Auth-critical select: pin to columns that are guaranteed to exist on every
@@ -87,7 +141,7 @@ export async function action({ request }: Route.ActionArgs) {
       .limit(1);
     user = rows[0];
   } catch (error) {
-    console.error("Login: failed to query user", error);
+    console.error("Login: failed to query user", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }
@@ -117,7 +171,7 @@ export async function action({ request }: Route.ActionArgs) {
   try {
     passwordMatches = await bcrypt.compare(password, user.passwordHash);
   } catch (error) {
-    console.error("Login: failed to compare password", error);
+    console.error("Login: failed to compare password", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }
@@ -174,7 +228,7 @@ export async function action({ request }: Route.ActionArgs) {
       { expiresIn: ACCESS_TOKEN_EXPIRY }
     );
   } catch (error) {
-    console.error("Login: failed to sign access token", error);
+    console.error("Login: failed to sign access token", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }
@@ -197,6 +251,10 @@ export async function action({ request }: Route.ActionArgs) {
     },
   });
 
+  // Login succeeded: reset both rate-limit buckets so a correct credential
+  // clears any accumulated failures (fail-open, never blocks the response).
+  await Promise.all([clearRateLimit(ipKey), clearRateLimit(emailKey)]);
+
   // Record login/presence timestamps (fire-and-forget; failure must not block login).
   try {
     const now = new Date();
@@ -206,7 +264,7 @@ export async function action({ request }: Route.ActionArgs) {
       .where(eq(users.id, user.id))
       .execute();
   } catch (error) {
-    console.error("Login: failed to record last_login_at", error);
+    console.error("Login: failed to record last_login_at", safeErrorLog(error));
   }
 
   return Response.json(

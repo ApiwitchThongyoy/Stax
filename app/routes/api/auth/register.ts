@@ -7,6 +7,16 @@ import { users } from "~/db/schema";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 import { seedDefaultChartOfAccounts } from "~/lib/ledger-service";
 import { normalizeEmail } from "~/lib/normalize-email";
+import {
+  REGISTER_IP_RATE_LIMIT,
+  clientIpFromRequest,
+  evaluateRateLimit,
+  incrementRateLimit,
+  registerIpKey,
+  purgeStaleRateLimits,
+  rateLimitResponse,
+} from "~/lib/rate-limit";
+import { safeErrorLog } from "~/lib/safe-error-log";
 
 // Same email format used by login.ts.
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -86,6 +96,31 @@ export async function action({ request }: Route.ActionArgs) {
   const role = "USER";
   const status = "ACTIVE";
 
+  // Rate-limit policy (PostgreSQL-backed, fail-open). A registration attempt
+  // is counted once the payload is well-formed — i.e. NOT for malformed/invalid
+  // payloads (cheap 400s), but YES for every valid-looking attempt including
+  // duplicates. The pre-check/INSERT duplicate path and the concurrent-race
+  // 23505 path all land on the same per-IP-per-email budget, so a scripted
+  // mass-register run trips the 429 FIRST (before hitting the unique race
+  // repeatedly). The email is embedded in the key so a legit shared-IP user
+  // creating a handful of accounts is unaffected by another user's spam.
+  const registerIp = clientIpFromRequest(request);
+  const registerKey = registerIpKey(registerIp, normalizedEmail);
+  const registerRow = await incrementRateLimit(registerKey);
+  const registerDecision = evaluateRateLimit(
+    REGISTER_IP_RATE_LIMIT,
+    registerRow.windowStartedAt.getTime(),
+    registerRow.attempts
+  );
+  if (registerDecision.limited) {
+    return rateLimitResponse(
+      registerDecision.retryAfterMs,
+      REGISTER_IP_RATE_LIMIT.maxAttempts,
+      Math.max(0, REGISTER_IP_RATE_LIMIT.maxAttempts - registerRow.attempts)
+    );
+  }
+  void purgeStaleRateLimits();
+
   let existing;
   try {
     const rows = await db
@@ -95,7 +130,7 @@ export async function action({ request }: Route.ActionArgs) {
       .limit(1);
     existing = rows[0];
   } catch (error) {
-    console.error("Register: failed to query user", error);
+    console.error("Register: failed to query user", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }
@@ -129,7 +164,7 @@ export async function action({ request }: Route.ActionArgs) {
   try {
     passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
   } catch (error) {
-    console.error("Register: failed to hash password", error);
+    console.error("Register: failed to hash password", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }
@@ -152,7 +187,43 @@ export async function action({ request }: Route.ActionArgs) {
       })
       .execute();
   } catch (error) {
-    console.error("Register: failed to insert user", error);
+    // Concurrent registration race: the pre-check above can pass for two
+    // requests at once, and the DB's unique constraint (User_email_unique) is
+    // the single source of truth. Turn that race into the SAME 409 the
+    // pre-check returns (it already had its register attempt counted against
+    // the rate budget, so it is throttled just like a normal duplicate).
+    // concurrent-race 23505 usually surfaces UNWRAPPED (a postgres library
+    // PostgresError with `.code`) but the drizzle postgres-js driver wraps the
+    // driver error in a DrizzleQueryError that carries the original on `.cause`.
+    // Check both so the race always resolves to 409, never 500.
+    const uniqueViolation =
+      typeof error === "object" &&
+      error !== null &&
+      ((error as { code?: unknown }).code === "23505" ||
+        (error as { cause?: { code?: unknown } }).cause?.code === "23505");
+    if (uniqueViolation) {
+      await insertAuditLog({
+        userId: null,
+        action: AuditAction.REGISTER_FAILED,
+        entityType: "User",
+        details: {
+          route: "/api/v1/auth/register",
+          method: "POST",
+          result: "failed",
+          reason: "email_already_exists",
+          email: normalizedEmail,
+        },
+      });
+      return Response.json(
+        {
+          success: false,
+          message: "Email already exists",
+          code: "EMAIL_ALREADY_EXISTS",
+        },
+        { status: 409 }
+      );
+    }
+    console.error("Register: failed to insert user", safeErrorLog(error));
     return Response.json(
       { success: false, message: "Internal server error" },
       { status: 500 }
@@ -165,7 +236,7 @@ export async function action({ request }: Route.ActionArgs) {
   try {
     await seedDefaultChartOfAccounts(id);
   } catch (error) {
-    console.error("Register: failed to seed chart of accounts", error);
+    console.error("Register: failed to seed chart of accounts", safeErrorLog(error));
   }
 
   await insertAuditLog({

@@ -162,6 +162,13 @@
       "when": 1789516800008,
       "tag": "0023_add_spin_off_fmv",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1789516800009,
+      "tag": "0024_add_auth_rate_limits",
+      "breakpoints": true
     }
   ]
 }
