@@ -333,6 +333,25 @@ ok(
     actionCode.includes("validation.message"),
   "upload action rejects unvalidated files with a 400 + validation message"
 );
+// Rebuild failure must log SANITIZED server-side info only — never the raw
+// error object, its message, stack, SQL, path or secrets.
+const rebuildCatchIdx = uploadRoute.indexOf('"Statement upload: rebuild failed"');
+const rebuildCatchCode =
+  rebuildCatchIdx !== -1 ? uploadRoute.slice(rebuildCatchIdx) : "";
+ok(
+  rebuildCatchIdx !== -1 &&
+    uploadRoute.includes("rebuildError instanceof Error") &&
+    rebuildCatchCode.includes(".name") &&
+    rebuildCatchCode.includes('"UnknownError"'),
+  "upload rebuild catch logs sanitized errorName only (name or UnknownError)"
+);
+ok(
+  rebuildCatchIdx !== -1 && !rebuildCatchCode.includes(", rebuildError)") &&
+    !rebuildCatchCode.includes("rebuildError.message") &&
+    !rebuildCatchCode.includes("rebuildError.stack") &&
+    !/\bSQL\b/.test(rebuildCatchCode),
+  "upload rebuild catch never logs the raw error object, message, stack or SQL"
+);
 ok(
   uploadRoute.includes("buildDuplicatePayload") &&
     statementHash.includes("STATEMENT_ALREADY_IMPORTED") &&

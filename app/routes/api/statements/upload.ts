@@ -413,7 +413,13 @@ export async function action({ request }: Route.ActionArgs) {
         contentHash,
       });
     } catch (rebuildError) {
-      console.error("Statement upload: rebuild failed", rebuildError);
+      console.error("Statement upload: rebuild failed", {
+        documentId: existingDocument.id,
+        errorName:
+          rebuildError instanceof Error
+            ? rebuildError.name
+            : "UnknownError",
+      });
       return Response.json(
         { success: false, message: "Internal server error" },
         { status: 500 }
