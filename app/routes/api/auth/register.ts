@@ -99,13 +99,13 @@ export async function action({ request }: Route.ActionArgs) {
   // Rate-limit policy (PostgreSQL-backed, fail-open). A registration attempt
   // is counted once the payload is well-formed — i.e. NOT for malformed/invalid
   // payloads (cheap 400s), but YES for every valid-looking attempt including
-  // duplicates. The pre-check/INSERT duplicate path and the concurrent-race
-  // 23505 path all land on the same per-IP-per-email budget, so a scripted
-  // mass-register run trips the 429 FIRST (before hitting the unique race
-  // repeatedly). The email is embedded in the key so a legit shared-IP user
-  // creating a handful of accounts is unaffected by another user's spam.
+  // duplicates. The budget key is per-IP ONLY (the email is deliberately NOT
+  // part of it: an ip+email key lets one attacker rotate emails from a single
+  // IP and get a fresh bucket per email, bypassing the cap). The pre-check /
+  // INSERT duplicate path and the concurrent-race 23505 path all land on the
+  // same per-IP budget, so a scripted mass-register run trips the 429 FIRST.
   const registerIp = clientIpFromRequest(request);
-  const registerKey = registerIpKey(registerIp, normalizedEmail);
+  const registerKey = registerIpKey(registerIp);
   const registerRow = await incrementRateLimit(registerKey);
   const registerDecision = evaluateRateLimit(
     REGISTER_IP_RATE_LIMIT,

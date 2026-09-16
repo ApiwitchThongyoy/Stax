@@ -136,6 +136,27 @@ async function loginAs(email: string, password: string) {
   return body;
 }
 
+// Register a user through the REAL route, each call from its OWN random client
+// IP. The register rate-limit budget is per-IP (register-ip:<ip>), so harness
+// account-creation must spread across distinct IPs — if every setup call used
+// the same "unknown" bucket, the 10-per-window cap would 429 the suite's own
+// registrations mid-run instead of only throttling the intentional-spam tests
+// (which pin a shared IP on purpose).
+async function registerAs(email: string, password: string) {
+  const registerRoute = await import("../app/routes/api/auth/register");
+  const ip = `198.51.100.${Math.floor(Math.random() * 240) + 10}`;
+  return await registerRoute.action({
+    request: new Request("http://test.local/api/v1/auth/register", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-forwarded-for": ip,
+      },
+      body: JSON.stringify({ email, password }),
+    }),
+  } as never);
+}
+
 async function fetchUserByEmail(email: string) {
   const rows = await client`SELECT * FROM "User" WHERE email = ${email} LIMIT 1`;
   return rows[0];
@@ -1141,17 +1162,11 @@ async function main() {
   // ================= REG: REGISTER -> LOGIN -> SESSION SMOKE =================
   {
     const { randomUUID } = await import("node:crypto");
-    const registerRoute = await import("../app/routes/api/auth/register");
     const smokeEmail = `smoke-${randomUUID()}@test.local`;
     const smokePassword = "SmokePass!234";
+    // Per-call random client IP (like registerAs) — the register budget is per-IP.
     const post = (email: string, password: string) =>
-      registerRoute.action({
-        request: new Request("http://test.local/api/v1/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email, password }),
-        }),
-      } as never);
+      registerAs(email, password);
 
     const regRes = await post(smokeEmail, smokePassword);
     const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
@@ -1298,9 +1313,11 @@ async function main() {
       );
     }
 
-    // 4. A successful login RESETS the budget: one failure, then a correct
-    //    login clears both buckets; a fresh failure loop then needs a full 6
-    //    attempts to reach 429 (proves the counters were really cleared).
+    // 4. A successful login RESETS the EMAIL budget only (the shared per-IP
+    //    bucket keeps prior spray failures — see scenario 8): one failure, then
+    //    a correct login clears the email key and rolls back its own IP slot; a
+    //    fresh failure loop then needs a full 6 attempts on the EMAIL bucket to
+    //    reach 429 (proves the email counter was really cleared).
     {
       const email = `rl-reset-${randomUUID()}@test.local`;
       const ip = rlIp();
@@ -1375,6 +1392,115 @@ async function main() {
       ok(
         !uBody.code && !wBody.code,
         "AUTH: 401 bodies carry no distinguishing code"
+      );
+    }
+
+    // 7. The REGISTER budget is per-IP, NOT per-IP-per-email — rotating the
+    //    email from one IP must NOT buy a fresh bucket. 10 DIFFERENT emails
+    //    from one IP are all allowed (201), the 11th (even a brand-new email)
+    //    is a generic 429, and a DIFFERENT IP still registers fine.
+    {
+      const ip = rlIp();
+      const email = () => `rl-rotate-${randomUUID()}@test.local`;
+      for (let i = 1; i <= 10; i++) {
+        const res = await rlRegister(email(), "RlRotate!234", ip);
+        const body = (await res.json()) as { data?: { user?: { id?: string } } };
+        ok(res.status === 201, `AUTH: rotating-email register #${i} (same IP) is 201`);
+        if (body.data?.user?.id) smokeUserIds.push(body.data.user.id);
+      }
+      const eleventh = await rlRegister(email(), "RlRotate!234", ip);
+      ok(
+        eleventh.status === 429,
+        "AUTH: 11th rotating email on the SAME IP is 429 (IP-only register budget)"
+      );
+      const elsewhere = await rlRegister(email(), "RlRotate!234", rlIp());
+      const elsewhereBody = (await elsewhere.json()) as {
+        data?: { user?: { id?: string } };
+      };
+      ok(
+        elsewhere.status === 201,
+        "AUTH: a fresh IP can still register (budget is per-IP, not global)"
+      );
+      if (elsewhereBody.data?.user?.id)
+        smokeUserIds.push(elsewhereBody.data.user.id);
+    }
+
+    // 8. Login IP-reset bypass: a successful login must NOT wipe the shared
+    //    per-IP bucket (credential-spray protection). 19 random-email failures
+    //    on one IP, then ONE success — the success's own IP reservation is
+    //    rolled back (bucket back to 19), so failure #20 is still 401 and
+    //    failure #21 hits the 20-cap 429. Prior spray is never forgiven.
+    {
+      const ip = rlIp();
+      const email = `rl-spray-${randomUUID()}@test.local`;
+      const reg = await rlRegister(email, "RlSpray!234", ip);
+      const regBody = (await reg.json()) as { data?: { user?: { id?: string } } };
+      ok(reg.status === 201, "AUTH: spray-reset - attacker account created");
+      if (regBody.data?.user?.id) smokeUserIds.push(regBody.data.user.id);
+      for (let i = 1; i <= 19; i++) {
+        const res = await rlLogin(
+          `spray-${i}-${randomUUID()}@test.local`,
+          "WrongPass!234",
+          ip
+        );
+        ok(res.status === 401, `AUTH: spray failure #${i} still 401`);
+      }
+      const good = await rlLogin(email, "RlSpray!234", ip);
+      ok(good.status === 200, "AUTH: success mid-spray is allowed");
+      const f20 = await rlLogin(
+        `spray-20-${randomUUID()}@test.local`,
+        "WrongPass!234",
+        ip
+      );
+      ok(
+        f20.status === 401,
+        "AUTH: IP bucket NOT reset by success - spray failure #20 is still 401"
+      );
+      const f21 = await rlLogin(
+        `spray-21-${randomUUID()}@test.local`,
+        "WrongPass!234",
+        ip
+      );
+      ok(
+        f21.status === 429,
+        "AUTH: spray failure #21 is 429 (prior spray preserved across a success)"
+      );
+    }
+
+    // 9. Legit usage is never wedged by its own successes: every successful
+    //    login rolls back ITS OWN per-IP reservation, so repeated successes on
+    //    one IP leave the shared IP bucket EMPTY (a success nets zero), and a
+    //    success still resets the EMAIL bucket for the account concerned —
+    //    verified directly against the auth_rate_limits counters.
+    {
+      const ip = rlIp();
+      const email = `rl-legit-${randomUUID()}@test.local`;
+      const reg = await rlRegister(email, "RlLegit!234", ip);
+      const regBody = (await reg.json()) as { data?: { user?: { id?: string } } };
+      ok(reg.status === 201, "AUTH: legit-success - account created");
+      if (regBody.data?.user?.id) smokeUserIds.push(regBody.data.user.id);
+      for (let i = 1; i <= 6; i++) {
+        const res = await rlLogin(email, "RlLegit!234", ip);
+        ok(res.status === 200, `AUTH: repeated successful login #${i} is 200`);
+      }
+      const ipBucket = await client`
+        SELECT attempts FROM auth_rate_limits
+        WHERE key = ${"login-ip:" + ip}
+      `;
+      ok(
+        ipBucket.length === 0,
+        "AUTH: 6 successes leave NO per-IP counter (each rolls back its own slot)"
+      );
+      const f1 = await rlLogin(email, "WrongPass!234", ip);
+      ok(f1.status === 401, "AUTH: legit - post-success failure #1 still 401");
+      for (let i = 2; i <= 5; i++) {
+        const res = await rlLogin(email, "WrongPass!234", ip);
+        ok(res.status === 401, `AUTH: legit - post-success failure #${i} still 401`);
+      }
+      const blocked = await rlLogin(email, "WrongPass!234", ip);
+      ok(
+        blocked.status === 429,
+        "AUTH: legit - success reset the EMAIL bucket - 6th failure is 429"
       );
     }
   }
@@ -1817,15 +1943,8 @@ async function main() {
 
     // ---- 3. users.created_at set on registration ----
     {
-      const registerRoute = await import("../app/routes/api/auth/register");
       const email = `join-${randomUUID()}@test.local`;
-      const res = await registerRoute.action({
-        request: new Request("http://test.local/api/v1/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email, password: "JoinPass!234" }),
-        }),
-      } as never);
+      const res = await registerAs(email, "JoinPass!234");
       const body = (await res.json()) as { data?: { user?: { id?: string } } };
       const newId = body.data?.user?.id;
       if (newId) {
@@ -1852,16 +1971,9 @@ async function main() {
   {
     console.log("\n=== REG: GENERAL LEDGER WIRING ===");
     const { randomUUID } = await import("node:crypto");
-    const registerRoute = await import("../app/routes/api/auth/register");
     const glEmail = `gl-${randomUUID()}@test.local`;
     const glPassword = "GLPost!234";
-    const regRes = await registerRoute.action({
-      request: new Request("http://test.local/api/v1/auth/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: glEmail, password: glPassword }),
-      }),
-    } as never);
+    const regRes = await registerAs(glEmail, glPassword);
     const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
     const glUserId = regJson.data?.user?.id;
     if (!glUserId) {
@@ -1973,7 +2085,6 @@ async function main() {
   {
     console.log("\n=== REG: TRANSACTION RECORD VIEW ===");
     const { randomUUID } = await import("node:crypto");
-    const registerRoute = await import("../app/routes/api/auth/register");
     const accountLedgerRoute = await import("../app/routes/api/ledger.$accountId");
     const { deleteStoredFile } = await import(
       "../app/lib/storage/statement-storage"
@@ -1981,13 +2092,7 @@ async function main() {
 
     const txrEmail = `txr-${randomUUID()}@test.local`;
     const txrPassword = "TxRecord!234";
-    const regRes = await registerRoute.action({
-      request: new Request("http://test.local/api/v1/auth/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: txrEmail, password: txrPassword }),
-      }),
-    } as never);
+    const regRes = await registerAs(txrEmail, txrPassword);
     const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
     const txrUserId = regJson.data?.user?.id;
     if (!txrUserId) {
@@ -2001,13 +2106,7 @@ async function main() {
       } else {
         const otherEmail = `txr-other-${randomUUID()}@test.local`;
         const otherPass = "TxRecord-#other1";
-        const otherReg = await registerRoute.action({
-          request: new Request("http://test.local/api/v1/auth/register", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ email: otherEmail, password: otherPass }),
-          }),
-        } as never);
+        const otherReg = await registerAs(otherEmail, otherPass);
         const otherJson = (await otherReg.json()) as {
           data?: { user?: { id?: string } };
         };
@@ -2148,7 +2247,6 @@ async function main() {
   {
     console.log("\n=== REG: PER-STOCK DETAIL (CASE-BY-CASE STOCKS) ===");
     const { randomUUID } = await import("node:crypto");
-    const registerRoute = await import("../app/routes/api/auth/register");
     const portfolioRoute = await import("../app/routes/api/portfolio.$symbol");
     const { deleteStoredFile } = await import(
       "../app/lib/storage/statement-storage"
@@ -2156,13 +2254,7 @@ async function main() {
 
     const pfEmail = `pf-${randomUUID()}@test.local`;
     const pfPassword = "PfStock!234";
-    const regRes = await registerRoute.action({
-      request: new Request("http://test.local/api/v1/auth/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: pfEmail, password: pfPassword }),
-      }),
-    } as never);
+    const regRes = await registerAs(pfEmail, pfPassword);
     const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
     const pfUserId = regJson.data?.user?.id;
     if (!pfUserId) {
@@ -2176,13 +2268,7 @@ async function main() {
       } else {
         const otherEmail = `pf-other-${randomUUID()}@test.local`;
         const otherPass = "PfOther!#234";
-        const otherReg = await registerRoute.action({
-          request: new Request("http://test.local/api/v1/auth/register", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ email: otherEmail, password: otherPass }),
-          }),
-        } as never);
+        const otherReg = await registerAs(otherEmail, otherPass);
         const otherJson = (await otherReg.json()) as {
           data?: { user?: { id?: string } };
         };
@@ -2406,16 +2492,9 @@ async function main() {
     } else {
       console.log("\n=== REG: GAIN/LOSS BACKFILL (FROZEN SELL) ===");
       const { randomUUID } = await import("node:crypto");
-      const registerRoute = await import("../app/routes/api/auth/register");
       const backfillPath = await import("../app/lib/statement-pipeline");
       const bfEmail = `bf-${randomUUID()}@test.local`;
-      const bfRes = await registerRoute.action({
-        request: new Request("http://test.local/api/v1/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: bfEmail, password: "BfPass!234" }),
-        }),
-      } as never);
+      const bfRes = await registerAs(bfEmail, "BfPass!234");
       const bfJson = (await bfRes.json()) as { data?: { user?: { id?: string } } };
       const bfUserId = bfJson.data?.user?.id;
       if (!bfUserId) {
@@ -2493,16 +2572,9 @@ async function main() {
     } else {
       console.log("\n=== REG: WEBULL AVERAGE COST RECOMPUTE ===");
       const { randomUUID } = await import("node:crypto");
-      const registerRoute = await import("../app/routes/api/auth/register");
       const pipeline = await import("../app/lib/statement-pipeline");
       const wlEmail = `wl-${randomUUID()}@test.local`;
-      const wlRes = await registerRoute.action({
-        request: new Request("http://test.local/api/v1/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: wlEmail, password: "WlPass!234" }),
-        }),
-      } as never);
+      const wlRes = await registerAs(wlEmail, "WlPass!234");
       const wlJson = (await wlRes.json()) as { data?: { user?: { id?: string } } };
       const wlUserId = wlJson.data?.user?.id;
       if (!wlUserId) {
@@ -3022,20 +3094,13 @@ async function main() {
     } else {
       console.log("\n=== REG: TRADING JOURNAL NOTES ===");
       const { randomUUID } = await import("node:crypto");
-      const registerRoute = await import("../app/routes/api/auth/register");
       const noteRoute = await import(
         "../app/routes/api/trading-journal.$transactionId.note"
       );
       const journalRoute = await import("../app/routes/api/trading-journal");
       const noteEmail = `note-${randomUUID()}@test.local`;
       const notePass = "NotePass!234";
-      const noteReg = await registerRoute.action({
-        request: new Request("http://test.local/api/v1/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: noteEmail, password: notePass }),
-        }),
-      } as never);
+      const noteReg = await registerAs(noteEmail, notePass);
       const noteJson = (await noteReg.json()) as {
         data?: { user?: { id?: string } };
       };
@@ -3050,13 +3115,7 @@ async function main() {
           ok(false, "REG-notes: notes user could not log in");
         } else {
           const otherEmail = `note-other-${randomUUID()}@test.local`;
-          const otherReg = await registerRoute.action({
-            request: new Request("http://test.local/api/v1/auth/register", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ email: otherEmail, password: "NoteOther!234" }),
-            }),
-          } as never);
+          const otherReg = await registerAs(otherEmail, "NoteOther!234");
           const otherJson = (await otherReg.json()) as {
             data?: { user?: { id?: string } };
           };
@@ -3177,17 +3236,10 @@ async function main() {
     } else {
       console.log("\n=== REG: SPIN_OFF FMV ===");
       const { randomUUID } = await import("node:crypto");
-      const registerRoute = await import("../app/routes/api/auth/register");
       const caRoute = await import("../app/routes/api/corporate-actions");
       const spinEmail = `spin-${randomUUID()}@test.local`;
       const spinPass = "SpinPass!234";
-      const spinReg = await registerRoute.action({
-        request: new Request("http://test.local/api/v1/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: spinEmail, password: spinPass }),
-        }),
-      } as never);
+      const spinReg = await registerAs(spinEmail, spinPass);
       const spinJson = (await spinReg.json()) as {
         data?: { user?: { id?: string } };
       };
@@ -3292,19 +3344,12 @@ async function main() {
         "\n  SKIP  REG-journal-scope: trade-detail columns absent (run the 0020 migration)"
       );
     } else {
-      console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
+console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
       const { randomUUID } = await import("node:crypto");
-      const registerRoute = await import("../app/routes/api/auth/register");
       const scopedJournalRoute = await import("../app/routes/api/trading-journal");
       const scopeEmail = `scope-${randomUUID()}@test.local`;
       const scopePass = "ScopePass!234";
-      const scopeReg = await registerRoute.action({
-        request: new Request("http://test.local/api/v1/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: scopeEmail, password: scopePass }),
-        }),
-      } as never);
+      const scopeReg = await registerAs(scopeEmail, scopePass);
       const scopeJson = (await scopeReg.json()) as {
         data?: { user?: { id?: string } };
       };

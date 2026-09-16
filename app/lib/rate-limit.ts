@@ -74,7 +74,8 @@ export async function incrementRateLimit(
 }
 
 /**
- * Clear a rate-limit key entirely (login success). Fail-open (no-op on error).
+ * Clear a rate-limit key entirely (login success resets an ACCOUNT's own email
+ * budget). Fail-open (no-op on error).
  */
 export async function clearRateLimit(key: string): Promise<void> {
   try {
@@ -83,6 +84,45 @@ export async function clearRateLimit(key: string): Promise<void> {
       .where(sql`${authRateLimits.key} = ${key}`);
   } catch {
     // fail-open: nothing to clear is fine.
+  }
+}
+
+/**
+ * Roll back the CURRENT request's own per-IP attempt after a successful login.
+ *
+ * The IP bucket is credential-spray protection shared across ALL emails, so a
+ * success must NOT wipe prior failures made from the same IP — it only undoes
+ * the reservation THIS request made (each successful login incremented the IP
+ * bucket before bcrypt). Concurrent-safe and never negative:
+ *   - attempts >= 2 -> attempts - 1 (prior failures stay in place);
+ *   - attempts <= 1 -> row deleted (a lone reservation disappears entirely).
+ * Implemented as two atomic statements; the UPDATE is attempted first and the
+ * DELETE only fires when the UPDATE matched nothing (guarded by RETURNING, so a
+ * bucket holding prior failures + leftover reservations is never over-deleted).
+ * Fail-open: on any DB error the counter is simply left as-is.
+ */
+export async function rollbackRateLimit(key: string): Promise<void> {
+  try {
+    const updated = await db
+      .update(authRateLimits)
+      .set({
+        attempts: sql`${authRateLimits.attempts} - 1`,
+        updatedAt: sql`now()`,
+      })
+      .where(
+        sql`${authRateLimits.key} = ${key} AND ${authRateLimits.attempts} >= 2`
+      )
+      .returning({ key: authRateLimits.key })
+      .execute();
+    if (updated.length === 0) {
+      await db
+        .delete(authRateLimits)
+        .where(
+          sql`${authRateLimits.key} = ${key} AND ${authRateLimits.attempts} <= 1`
+        );
+    }
+  } catch {
+    // fail-open.
   }
 }
 

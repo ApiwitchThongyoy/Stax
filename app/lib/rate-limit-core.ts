@@ -45,8 +45,15 @@ export function loginEmailKey(email: string): string {
   return `login-email:${email}`;
 }
 
-export function registerIpKey(ip: string, email: string): string {
-  return `register-ip:${ip}:${email}`;
+/**
+ * Register-budget key: per-IP ONLY. Deliberately does NOT embed the email —
+ * a per-IP (per-IP-per-email) bucket keyed on ip+email would let an attacker
+ * rotate emails from one IP and get a fresh bucket every time, bypassing the
+ * REGISTER_IP_RATE_LIMIT cap. The namespace prefix (register- vs login-) keeps
+ * register and login budgets orthogonal even though both are per-IP.
+ */
+export function registerIpKey(ip: string): string {
+  return `register-ip:${ip}`;
 }
 
 /**
@@ -92,21 +99,25 @@ function nowMs(): number {
 
 /**
  * Pure decision: given the current window's start and attempt count, decide
- * whether the next attempt is limited, and how long to wait. DB-free so tests
- * can pin the boundary math exactly.
+ * whether the request is limited, and how long to wait. DB-free so tests can
+ * pin the boundary math exactly.
  *
- * Semantics (post-increment): `attempts` is the number of prior recorded
- * failures. The current request is failure #attempts+1. If that exceeds
- * maxAttempts, this request is limited (429); otherwise it proceeds (401/etc).
- * The login route increments BOTH keys before evaluating (so a 429 is returned
- * without wasting a bcrypt round); a successful login clears both keys.
+ * Semantics (post-increment): `attempts` is the current request's OWN
+ * post-increment count — the caller increments the DB bucket BEFORE evaluating
+ * (incrementRateLimit returns attempts AFTER counting this request), so
+ * `attempts` INCLUDES this request. Limited (429) iff attempts > maxAttempts.
+ * A window that has expired resets to attempts=0 (allowed).
  *
- *   - window expired  -> reset (allowed, window = now).
- *   - attempts < max  -> allowed.
- *   - attempts === max -> allowed for THIS attempt (it's failure #(max+1) but
- *     was counted as max by the DB post-increment). The NEXT request sees
- *     attempts = max+1 and gets 429.
- *   - attempts > max  -> limited (429).
+ * Boundary with maxAttempts = 5:
+ *   - attempts 1..5 -> allowed. attempt #5 (attempts === max) is the LAST
+ *     allowed request.
+ *   - attempts >= 6 -> limited (429). attempt #6 is the first 429.
+ *
+ * The login route increments BOTH keys (IP + email) before evaluating, so a
+ * 429 is returned without wasting a bcrypt round; a successful login clears
+ * only the EMAIL bucket and rolls back its OWN IP-bucket attempt — prior IP
+ * failures (credential-spray protection) are preserved. The register route
+ * increments the per-IP register key (no email in the key) before evaluating.
  */
 export function evaluateRateLimit(
   config: AuthRateLimitConfig,

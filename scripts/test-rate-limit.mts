@@ -39,7 +39,18 @@ async function main() {
   // ---- Key builders ----
   check(loginIpKey("1.2.3.4") === "login-ip:1.2.3.4", "loginIpKey prefixes correctly");
   check(loginEmailKey("a@b.c") === "login-email:a@b.c", "loginEmailKey prefixes correctly");
-  check(registerIpKey("10.0.0.1", "u@x.com") === "register-ip:10.0.0.1:u@x.com", "registerIpKey composes ip + email");
+  check(
+    registerIpKey("10.0.0.1") === "register-ip:10.0.0.1",
+    "registerIpKey prefixes the IP only (no email in the register IP key)"
+  );
+  check(
+    registerIpKey("203.0.113.9") !== registerIpKey("203.0.113.10"),
+    "different IPs produce different register buckets"
+  );
+  check(
+    !registerIpKey("203.0.113.9").includes("@"),
+    "register IP key never embeds an email (rotating emails share one bucket)"
+  );
 
   // ---- clientIpFromRequest ----
   check(
@@ -88,9 +99,16 @@ async function main() {
     "under-budget attempts → not limited"
   );
 
-  // ---- exact boundary: attempts === max → not limited (this attempt is the last allowed) ----
+  // ---- exact boundary: attempts === max → allowed (this request IS the max-th) ----
   const atMax = evaluateRateLimit(LOGIN_EMAIL_RATE_LIMIT, activeWindow, LOGIN_EMAIL_RATE_LIMIT.maxAttempts);
-  check(atMax.limited === false, "attempts === maxAttempts → not limited (this attempt allowed)");
+  check(atMax.limited === false, "attempts === maxAttempts → not limited (the max-th attempt is the last allowed)");
+
+  // ---- post-increment semantics: attempts INCLUDES this request ----
+  check(
+    evaluateRateLimit(LOGIN_EMAIL_RATE_LIMIT, activeWindow, 5).limited === false &&
+      evaluateRateLimit(LOGIN_EMAIL_RATE_LIMIT, activeWindow, 6).limited === true,
+    "post-increment boundary: 5 failures allowed, the 6th attempt (attempts=6) is limited"
+  );
 
   // ---- over budget: attempts > max → limited ----
   const over = evaluateRateLimit(LOGIN_EMAIL_RATE_LIMIT, activeWindow, LOGIN_EMAIL_RATE_LIMIT.maxAttempts + 1);

@@ -18,6 +18,7 @@ import {
   loginIpKey,
   purgeStaleRateLimits,
   rateLimitResponse,
+  rollbackRateLimit,
 } from "~/lib/rate-limit";
 import { safeErrorLog } from "~/lib/safe-error-log";
 
@@ -84,11 +85,14 @@ export async function action({ request }: Route.ActionArgs) {
   // Rate-limit policy (PostgreSQL-backed, fail-open). Every attempt — success
   // or failure — is counted BEFORE the expensive bcrypt compare, so an
   // exhausted budget is answered with 429 without wasting a bcrypt round
-  // (resource-DoS mitigation). Keys are per-IP (shared across emails) and
-  // per-email (shared across IPs), so neither a random-email sweep nor a
-  // single-account hammering can bypass the window. A success clears both
-  // keys, resetting the budget. The 429 body is identical for both buckets and
-  // never reveals whether a specific email exists.
+  // (resource-DoS mitigation). Keys are per-IP (shared across emails —
+  // credential-spray protection) and per-email (shared across IPs), so neither
+  // a random-email sweep nor a single-account hammering can bypass the window.
+  // On success only the EMAIL bucket is cleared (account-level budget reset);
+  // the IP bucket rolls back THIS request's own attempt only — prior spray
+  // failures from the same IP are preserved, and repeated successes cannot
+  // exhaust the shared IP budget. The 429 body is identical for both buckets
+  // and never reveals whether a specific email exists.
   const loginIp = clientIpFromRequest(request);
   const ipKey = loginIpKey(loginIp);
   const emailKey = loginEmailKey(normalizedEmail);
@@ -251,9 +255,11 @@ export async function action({ request }: Route.ActionArgs) {
     },
   });
 
-  // Login succeeded: reset both rate-limit buckets so a correct credential
-  // clears any accumulated failures (fail-open, never blocks the response).
-  await Promise.all([clearRateLimit(ipKey), clearRateLimit(emailKey)]);
+  // Login succeeded: clear the ACCOUNT's email failure budget (so a correct
+  // credential resets its own counter) and roll back only this request's IP
+  // reservation — prior per-IP failures stay put (spray protection). Both are
+  // fail-open and never block the response.
+  await Promise.all([rollbackRateLimit(ipKey), clearRateLimit(emailKey)]);
 
   // Record login/presence timestamps (fire-and-forget; failure must not block login).
   try {
