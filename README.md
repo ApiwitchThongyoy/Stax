@@ -1,5 +1,7 @@
 # STAX
 
+September 18 Node backend handoff: [setup, release checks, and tester checklist](docs/backend-handoff.md).
+
 ระบบจัดการพอร์ตหุ้นจาก Statement — นำเข้าไฟล์ Statement (PDF) แล้วสกัดธุรกรรมอัตโนมัติ
 ลงบัญชีแยกประเภทแบบคู่ (double-entry) พร้อมหน้าสรุป เงินเข้า-ออก สมุดบันทึกการซื้อขาย
 รายละเอียดหุ้นรายตัว และคลังเอกสาร

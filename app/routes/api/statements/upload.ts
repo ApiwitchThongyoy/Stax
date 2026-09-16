@@ -427,6 +427,27 @@ export async function action({ request }: Route.ActionArgs) {
     }
   }
 
+  // Extract before creating metadata/storage: corrupt or textless PDFs must
+  // not leave a document behind when extraction returns an error response.
+  let extraction;
+  try {
+    extraction = await extractTextFromPdfBytes(new Uint8Array(await file.arrayBuffer()));
+  } catch (extractError) {
+    console.error("Statement upload: text extraction failed", {
+      errorName: extractError instanceof Error ? extractError.name : "UnknownError",
+    });
+    return Response.json(
+      { success: false, message: "Failed to extract text from the PDF" },
+      { status: 500 }
+    );
+  }
+  if (!extraction.ok) {
+    return Response.json(
+      { success: false, message: extraction.message },
+      { status: extraction.status }
+    );
+  }
+
   // 3. Store the PDF (UUID filename) and record it in the documents table.
   //    Validation (size/ext/MIME/magic bytes) was already done above before the
   //    full-file read. saveStatementPdf repeats validation defensively.
@@ -475,26 +496,6 @@ export async function action({ request }: Route.ActionArgs) {
   await notifyStatementUploaded(auth.userId, fileName, documentId);
 
   try {
-    // 4. Server-side text extraction from the stored object bytes (never a
-    //    client-supplied path; works for Supabase Storage and local dev).
-    let extraction;
-    try {
-      extraction = await extractTextFromPdfBytes(stored.document.bytes);
-    } catch (extractError) {
-      console.error("Statement upload: extractTextFromPdfBytes threw", extractError);
-      return Response.json(
-        { success: false, message: "Failed to extract text from the PDF" },
-        { status: 500 }
-      );
-    }
-
-    if (!extraction.ok) {
-      return Response.json(
-        { success: false, message: extraction.message },
-        { status: extraction.status }
-      );
-    }
-
     // 5. Parse + validate into Capital_Transactions rows. Seed the
     //    server-authoritative running-average cost basis from previous imports
     //    and persist the updated state after a successful build (so SELL

@@ -694,6 +694,13 @@ async function main() {
         "REG: upload exceeding the 20 MB size limit is rejected (400)"
       );
 
+      for (const [name, bytes] of [["corrupt.pdf", magicPdf], ["textless.pdf", makePdf([])]] as const) {
+        const response = await uploadAs(tokenA, new File([bytes as BlobPart], name, { type: "application/pdf" }));
+        ok(response.status >= 400, `REG: ${name} extraction rejected`);
+        const leftover = await client`SELECT id FROM documents WHERE user_id=${userARow.id} AND original_name=${name}`;
+        ok(leftover.length === 0, `REG: ${name} extraction failure leaves no document`);
+      }
+
       // Rejects happen BEFORE any storage/document write (validation-first):
       // none of the rejected uploads may leave a documents row behind. Since
       // saveStatementPdf persists the storage object only alongside its
@@ -1532,11 +1539,10 @@ async function main() {
 
   // 3. USER upload statement -> audit row (STATEMENT_UPLOAD logged after save)
   const { saveStatementPdf } = await import("../app/lib/storage/statement-storage");
-  const pdfBytes = new Uint8Array([
-    ...[..."%PDF-1.4\n"].map((c) => c.charCodeAt(0)),
-    ...new Array(120).fill(0x20),
-  ]);
-  const pdfFile = new File([pdfBytes], "w2-telemetry-test.pdf", {
+  // Valid extractable PDF with unsupported content: archiveable, no trades.
+  // A corrupt magic-header-only fixture used to rely on failed-upload leftovers.
+  const pdfBytes = makePdf(["Telemetry archive fixture without supported trades"]);
+  const pdfFile = new File([pdfBytes as BlobPart], "w2-telemetry-test.pdf", {
     type: "application/pdf",
   });
 
@@ -1561,6 +1567,7 @@ async function main() {
   })();
   const uploadBody = (await uploadRes.json()) as { data?: { documentId?: string } };
   uploadedDocId = uploadBody.data?.documentId ?? null;
+  ok(uploadRes.status === 200 && !!uploadedDocId, "W2-10: valid telemetry PDF upload succeeds");
 
   // Duplicate rejection: re-uploading identical PDF bytes must return the
   // stable duplicate payload instead of storing anything again.
@@ -1604,6 +1611,7 @@ async function main() {
                    ORDER BY created_at DESC LIMIT 1`
     : [];
   const uploadedRow = uploadedRows[0] ?? null;
+  ok(!!uploadedRow, "W2-10: successful upload has document metadata");
   if (uploadedRow && userARow) {
     uploadedDocId = uploadedRow.id;
     uploadedKey = uploadedRow.file_path;
