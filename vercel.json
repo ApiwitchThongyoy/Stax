@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/v1/stock-prices/refresh",
-      "schedule": "30 17 * * *"
+      "schedule": "30 22 * * *"
     }
   ]
 }

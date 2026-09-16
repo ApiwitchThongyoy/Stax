@@ -23,6 +23,8 @@ import {
   stockPriceRowFromQuote,
   type StockPriceSource,
 } from "../app/lib/stock-price-provider";
+import { readFileSync } from "node:fs";
+import { handleStockPriceRefresh } from "../app/lib/stock-price-refresh-handler.server";
 
 let passed = 0;
 let failed = 0;
@@ -240,6 +242,101 @@ async function main() {
       typeof row.id === "string" && row.id.length > 0,
     "row helper builds a DB-ready payload (id + timestamps)"
   );
+
+  // 10. Execute the same handler used by the GET loader and POST action.
+  // Both collaborators are fake: no database, JWT service or live provider.
+  const cronSecret = "test-only-stock-cron-secret";
+  const cronStats = { requested: 2, updated: 1, failed: ["DEAD"] };
+  let refreshCalls = 0;
+  let adminCalls = 0;
+  let adminStatus = 401;
+  const dependencies = {
+    cronSecret: cronSecret as string | undefined,
+    refresh: async () => { refreshCalls++; return cronStats; },
+    authorizeAdmin: async () => {
+      adminCalls++;
+      return adminStatus === 200 ? null : Response.json(
+        { success: false, message: "Denied" }, { status: adminStatus }
+      );
+    },
+  };
+  const cronRequest = (method = "GET", headers: Record<string, string> = {}) =>
+    new Request("https://test.local/api/v1/stock-prices/refresh", { method, headers });
+  const bearerHeaders = { Authorization: `Bearer ${cronSecret}` };
+  const cronResponse = await handleStockPriceRefresh(cronRequest("GET", bearerHeaders), dependencies);
+  const cronPayload = await cronResponse.json();
+  ok(cronResponse.status === 200 && cronPayload.success === true &&
+    JSON.stringify(cronPayload.data) === JSON.stringify(cronStats),
+    "Vercel GET + correct Bearer secret returns refresh stats (including failed symbols)");
+  ok(refreshCalls === 1 && adminCalls === 0, "valid cron runs once without JWT authentication");
+  ok(cronResponse.headers.get("Cache-Control") === "no-store", "cron response cannot be cached");
+
+  for (const [label, headers] of [
+    ["missing secret", {}],
+    ["wrong same-length secret", { Authorization: `Bearer ${"x".repeat(cronSecret.length)}` }],
+    ["wrong shorter secret", { Authorization: "Bearer wrong" }],
+    ["missing Bearer scheme", { Authorization: cronSecret }],
+    ["wrong scheme", { Authorization: `Basic ${cronSecret}` }],
+    ["empty Bearer", { Authorization: "Bearer " }],
+    ["forged Vercel user-agent", { "User-Agent": "vercel-cron/1.0" }],
+    ["wrong custom secret", { "x-cron-secret": "wrong" }],
+  ] as Array<[string, Record<string, string>]>) {
+    const response = await handleStockPriceRefresh(cronRequest("GET", headers), dependencies);
+    const payload = await response.json();
+    ok(response.status === 401 && payload.message === "Unauthorized" &&
+      !JSON.stringify(payload).includes(cronSecret) && refreshCalls === 1 && adminCalls === 0,
+      `GET rejects ${label} without running refresh or checking JWT`);
+  }
+  for (const unsetSecret of [undefined, "", "   "]) {
+    const response = await handleStockPriceRefresh(
+      cronRequest("GET", { Authorization: `Bearer ${String(unsetSecret)}` }),
+      { ...dependencies, cronSecret: unsetSecret }
+    );
+    ok(response.status === 401 && refreshCalls === 1, "missing/blank server CRON_SECRET fails closed");
+  }
+  for (const method of ["HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+    const response = await handleStockPriceRefresh(cronRequest(method, bearerHeaders), dependencies);
+    ok(response.status === 405 && response.headers.get("Allow") === "GET, POST" &&
+      refreshCalls === 1 && adminCalls === 0, `${method} never runs the sweep, even with valid secret`);
+  }
+  const manualCron = await handleStockPriceRefresh(cronRequest("POST", bearerHeaders), dependencies);
+  ok(manualCron.status === 200 && refreshCalls === 2 && adminCalls === 0, "manual Bearer POST remains supported");
+  const customCron = await handleStockPriceRefresh(cronRequest("POST", { "x-cron-secret": cronSecret }), dependencies);
+  ok(customCron.status === 200 && refreshCalls === 3, "legacy x-cron-secret POST remains supported");
+  const anonPost = await handleStockPriceRefresh(cronRequest("POST"), dependencies);
+  ok(anonPost.status === 401 && refreshCalls === 3, "unauthenticated POST cannot refresh");
+  adminStatus = 403;
+  const userPost = await handleStockPriceRefresh(cronRequest("POST", { Authorization: "Bearer user-jwt" }), dependencies);
+  ok(userPost.status === 403 && refreshCalls === 3, "non-admin POST cannot refresh");
+  adminStatus = 200;
+  const adminPost = await handleStockPriceRefresh(cronRequest("POST", { Authorization: "Bearer admin-jwt" }), dependencies);
+  ok(adminPost.status === 200 && refreshCalls === 4, "authorized ADMIN POST still refreshes");
+  const savedError = console.error;
+  const errorLogs: unknown[][] = [];
+  try {
+    console.error = (...args: unknown[]) => { errorLogs.push(args); };
+    const response = await handleStockPriceRefresh(cronRequest("GET", bearerHeaders), {
+      ...dependencies, refresh: async () => { throw new Error(`private upstream error ${cronSecret}`); },
+    });
+    const body = await response.text();
+    ok(response.status === 500 && body.includes("Internal server error") &&
+      !body.includes(cronSecret) && !JSON.stringify(errorLogs).includes(cronSecret),
+      "refresh failure returns sanitized 500 without leaking credentials into response/log");
+  } finally { console.error = savedError; }
+
+  const config = JSON.parse(readFileSync(new URL("../vercel.json", import.meta.url), "utf8"));
+  const schedule = config.crons.find((c: { path: string }) => c.path === "/api/v1/stock-prices/refresh")?.schedule;
+  ok(schedule === "30 22 * * *", "daily cron is scheduled for 22:30 UTC");
+  const [minute, hour] = schedule.split(" ").map(Number);
+  for (const day of ["2026-01-15", "2026-07-15"]) {
+    const at = new Date(`${day}T${String(hour).padStart(2, "0")}:${minute}:00Z`);
+    const nyHour = Number(new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York", hour: "2-digit", hourCycle: "h23",
+    }).format(at));
+    ok(nyHour > 16, `scheduled time is after the regular 16:00 New York close (${day}, EST/EDT)`);
+  }
+  const example = readFileSync(new URL("../.env.example", import.meta.url), "utf8");
+  ok(/^CRON_SECRET=\s*$/m.test(example), "environment example contains only a blank CRON_SECRET placeholder");
 
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);

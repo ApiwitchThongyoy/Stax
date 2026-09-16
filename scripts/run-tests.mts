@@ -2450,8 +2450,8 @@ async function main() {
         ),
       } as never);
       ok(
-        bareLoader.status === 405,
-        "REG-stock: bare GET refresh without cron secret -> 405 (browser-safe, never auto-runs)"
+        bareLoader.status === 401,
+        "REG-stock: bare GET refresh without cron secret -> 401 (never auto-runs)"
       );
 
       if (tokenA) {
@@ -2574,6 +2574,12 @@ async function main() {
         // x-cron-secret matching CRON_SECRET is authorized even without a JWT.
         const prevSecret = process.env.CRON_SECRET;
         process.env.CRON_SECRET = "test-cron-secret-xyz";
+        for (const headers of [new Headers(), new Headers({ Authorization: "Bearer wrong-cron-secret" })]) {
+          const denied = await stockPricesRefreshRoute.loader({
+            request: new Request("http://test.local/api/v1/stock-prices/refresh", { headers }),
+          } as never);
+          ok(denied.status === 401, "REG-stock: cron GET rejects missing/wrong Bearer secret");
+        }
         globalThis.fetch = (async (_input: string | URL | Request) =>
           new Response(
             JSON.stringify({
@@ -2604,6 +2610,15 @@ async function main() {
           cronRes.status === 200 && !!cronBody.data,
           "REG-stock: x-cron-secret matching CRON_SECRET -> refresh allowed"
         );
+        const vercelCronRes = await stockPricesRefreshRoute.loader({
+          request: new Request("http://test.local/api/v1/stock-prices/refresh", {
+            method: "GET",
+            headers: { Authorization: "Bearer test-cron-secret-xyz" },
+          }),
+        } as never);
+        const vercelCronBody = await vercelCronRes.json() as { success?: boolean };
+        ok(vercelCronRes.status === 200 && vercelCronBody.success === true,
+          "REG-stock: Vercel GET with matching Bearer CRON_SECRET refreshes successfully");
         if (prevSecret === undefined) delete process.env.CRON_SECRET;
         else process.env.CRON_SECRET = prevSecret;
       }
