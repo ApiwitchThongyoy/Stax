@@ -1016,8 +1016,8 @@ async function main() {
       const up = await uploadDocTx(tokenA);
       const upBody = (await up.json()) as { data?: { documentId?: string; saved?: number } };
       ok(
-        up.status === 200 && (upBody.data?.saved ?? 0) === 3,
-        "REG-doc-tx-view: upload commits 3 rows (2 BUY + 1 SELL)"
+        up.status === 200 && (upBody.data?.saved ?? 0) === 6,
+        "REG-doc-tx-view: upload commits 6 rows (2 BUY + 1 SELL trades plus 3 cash movements)"
       );
       const docId = upBody.data?.documentId;
       ok(!!docId, "REG-doc-tx-view: upload returns a document id");
@@ -1050,15 +1050,16 @@ async function main() {
           "REG-doc-tx-view: owner reads the document's transactions (200, name echoed)"
         );
         ok(
-          ownBody.data?.transactions?.length === 3,
-          "REG-doc-tx-view: all 3 committed rows are returned"
+          ownBody.data?.transactions?.length === 6,
+          "REG-doc-tx-view: all 6 committed rows are returned (trades + cash movements)"
         );
         ok(
           ownBody.data?.stats?.buyCount === 2 &&
             ownBody.data?.stats?.sellCount === 1 &&
+            ownBody.data?.stats?.cashCount === 3 &&
             ownBody.data?.stats?.computableSellCount === 1 &&
-            ownBody.data?.stats?.total === 3,
-          "REG-doc-tx-view: stats are server-derived (2 BUY / 1 computable SELL / total 3)"
+            ownBody.data?.stats?.total === 6,
+          "REG-doc-tx-view: stats are server-derived (2 BUY / 1 computable SELL / 3 cash / total 6)"
         );
         ok(
           (ownBody.data?.stats?.fxRates ?? []).includes("35.42"),
@@ -1094,8 +1095,8 @@ async function main() {
         };
         const mine = (listBody.data ?? []).find((d) => d.id === docId);
         ok(
-          !!mine && mine.transactionCount === 3,
-          "REG-doc-tx-view: documents list transactionCount aggregates the statement's rows"
+          !!mine && mine.transactionCount === 6,
+          "REG-doc-tx-view: documents list transactionCount aggregates the statement's rows (6)"
         );
 
         // cleanup
@@ -1823,8 +1824,8 @@ async function main() {
         };
         const txrDocId = upBody.data?.documentId;
         ok(
-          up.status === 200 && !!txrDocId && (upBody.data?.saved ?? 0) === 3,
-          "REG-TXREC: statement upload stores 3 rows that trigger postings"
+          up.status === 200 && !!txrDocId && (upBody.data?.saved ?? 0) === 6,
+          "REG-TXREC: statement upload stores 6 rows (3 trades + 3 cash movements) that trigger postings"
         );
 
         if (txrDocId) {
@@ -1965,7 +1966,7 @@ async function main() {
         const otherLogin = await loginAs(otherEmail, otherPass);
         const otherToken = otherLogin.data?.accessToken as string | undefined;
 
-        // 1. Upload a 3-row VRMAX statement (2 BUY + 1 computable SELL).
+        // 1. Upload a VRMAX statement (2 BUY + 1 computable SELL + their cash rows).
         const pfLines = [
           "TRADE RECORDS",
           "Currency: USD",
@@ -1997,8 +1998,8 @@ async function main() {
         };
         const pfDocId = upBody.data?.documentId;
         ok(
-          up.status === 200 && !!pfDocId && (upBody.data?.saved ?? 0) === 3,
-          "REG-pf: per-stock fixture upload commits 3 VRMAX rows (2 BUY + 1 SELL)"
+          up.status === 200 && !!pfDocId && (upBody.data?.saved ?? 0) === 6,
+          "REG-pf: per-stock fixture upload commits the VRMAX statement (3 trade rows + 3 cash movements = 6 saved)"
         );
 
         // Optional stock_prices seed (0017) — quote path only when the table exists.
@@ -2302,7 +2303,7 @@ async function main() {
           INSERT INTO "Capital_Transactions"
             (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, symbol, side, quantity, unit_price, gross_amount, fees, net_amount, fx_rate_effective)
           VALUES
-            (${randomUUID()}, ${wlUserId}, '500.00', 'USD', '2026-01-05', '17710.00', 'CASH_IN', 'MANUAL', 'WBML', 'SELL', '10', '50', '500', '0', '500', '35.42')`;
+            (${manSellId}, ${wlUserId}, '500.00', 'USD', '2026-01-05', '17710.00', 'CASH_IN', 'MANUAL', 'WBML', 'SELL', '10', '50', '500', '0', '500', '35.42')`;
 
         const rows = await client`
           SELECT transaction_id, source_type, transaction_date, symbol, side, quantity, unit_price,
@@ -2742,7 +2743,7 @@ async function main() {
             je[0].type === "CASH_IN" &&
             Number(je[0].amount) === 1200 &&
             Number(je[0].amount_thb) === 39600 &&
-            String(je[0].fx_rate_effective) === "33",
+            Number(je[0].fx_rate_effective) === 33,
           "REG-cash: manual CASH_IN mirrored in journal (type + amount + THB + fx)"
         );
         const lineCountIn = await client`SELECT COUNT(*)::int AS c FROM journal_entry_lines WHERE journal_entry_id = ${je[0].id}`;
@@ -3174,8 +3175,8 @@ async function main() {
           const winBuy = avgOf(windowed?.entries, "BUY", "SCOPX", "2026-02-01");
           const winSell = avgOf(windowed?.entries, "SELL", "SCOPX", "2026-03-01");
           ok(
-            fullBuy === 20 && fullSell === 20,
-            "REG-scope: unfiltered SCOPX replay reports the lifetime average 20 for the in-window BUY and SELL"
+            fullBuy === 10 && fullSell === 20,
+            "REG-scope: unfiltered SCOPX replay reports lifetime averages (BUY 10 pre-trade / SELL 20) for the in-window rows"
           );
           ok(
             winBuy === fullBuy && winSell === fullSell,
