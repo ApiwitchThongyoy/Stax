@@ -5,8 +5,10 @@
 //      AuditLogInput.action, so the compiler only accepts these values)
 //   2. app/db/schema.ts            -> check("chk_audit_logs_action", sql`... IN (...)`),
 //      the Drizzle source that "generate/CI never drift"
-//   3. drizzle/0025_...sql        -> the actual DB CHECK (NOT VALID, historical
-//      audit spans pre-repo deployments whose exact actions are unprovable)
+//   3. drizzle/00xx_...sql        -> the actual DB CHECK (NOT VALID, historical
+//      audit spans pre-repo deployments whose exact actions are unprovable).
+//      Located by marker (not by "latest migration number" - later, unrelated
+//      migrations must not break this check).
 //
 // Adding an AuditAction value is a deliberate, rare, feature-driven change and
 // REQUIRES updating the migration CHECK too (and normally also the schema mirror).
@@ -22,14 +24,6 @@ import { dirname, join, sep } from "node:path";
 
 const root = fileURLToPath(new URL("..", import.meta.url)).replace(/[\\/]$/, "");
 
-const lastMigrationVersion = (): number => {
-  const entries = readdirSync(join(root, "drizzle"))
-    .filter((f) => /^\d{4}_.*\.sql$/.test(f))
-    .sort();
-  assert.ok(entries.length > 0, "expected at least one drizzle migration");
-  return Number(entries[entries.length - 1].slice(0, 4));
-};
-
 const extractQuoted = (text: string): string[] => {
   const values = [...text.matchAll(/'([A-Z][A-Z_0-9]*)'/g)].map((m) => m[1]);
   return [...new Set(values)].sort();
@@ -44,20 +38,21 @@ const auditActionValues = (): string[] => {
 };
 
 const migrationCheckValues = (): string[] => {
-  const latest = lastMigrationVersion();
-  const file = readdirSync(join(root, "drizzle"))
+  // Find the migration that actually DEFINES chk_audit_logs_action, rather than
+  // assuming it is the numerically-latest migration (unrelated later migrations
+  // are normal). Prefer the highest-numbered file that defines it.
+  const candidates = readdirSync(join(root, "drizzle"))
     .filter((f) => /^\d{4}_.*\.sql$/.test(f))
     .sort()
-    .filter((f) => Number(f.slice(0, 4)) === latest)[0];
-  const sql = readFileSync(join(root, "drizzle", file), "utf8");
-  const block = /chk_audit_logs_action[\s\S]*?CHECK\s*\(\s*"action"\s*IN\s*\(([\s\S]*?)\)\s*(?:NOT VALID)?\s*;/i.exec(
-    sql
-  );
-  assert.ok(
-    block,
-    `chk_audit_logs_action must be defined in the latest migration ${file}`
-  );
-  return extractQuoted(block[1]);
+    .reverse();
+  for (const file of candidates) {
+    const sql = readFileSync(join(root, "drizzle", file), "utf8");
+    const block = /chk_audit_logs_action[\s\S]*?CHECK\s*\(\s*"action"\s*IN\s*\(([\s\S]*?)\)\s*(?:NOT VALID)?\s*;/i.exec(
+      sql
+    );
+    if (block) return extractQuoted(block[1]);
+  }
+  assert.fail("chk_audit_logs_action CHECK not found in any drizzle migration");
 };
 
 const schemaCheckValues = (): string[] => {
@@ -123,12 +118,12 @@ check("action field is typed as AuditActionValue (raw strings impossible)", () =
     }
   }
 });
-check("AuditAction values == schema.ts check == latest migration CHECK", () => {
+check("AuditAction values == schema.ts check == migration CHECK", () => {
   const actions = auditActionValues();
   const schema = schemaCheckValues();
   const migration = migrationCheckValues();
   assert.deepEqual(schema, actions, "app/db/schema.ts check must mirror AuditAction");
-  assert.deepEqual(migration, schema, "latest migration CHECK must mirror schema.ts");
+  assert.deepEqual(migration, schema, "migration CHECK must mirror schema.ts");
   console.log(
     `  (${actions.length} actions: ${actions.join(", ")})`
   );

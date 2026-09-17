@@ -8,8 +8,8 @@
 //   - applyFxRateFallback: external HISTORICAL FX fallback fires ONLY when a
 //     non-THB row has no statement rate (statement FX always wins); applied
 //     rate lands in fx_rate_effective and recomputes amountThb + realized
-//     gain/loss THB; provider-unavailable stays graceful (base fallback kept,
-//     no fabricated rate).
+//     gain/loss THB; provider-unavailable leaves fxRateEffective/amountThb NULL
+//     (never a fabricated 1:1 rate, never 0).
 //   - capitalRowToTransaction: effective-first FX rate fallback.
 //   - 2-stage gain rounding is INTENTIONAL: realizedGainLoss = round2(net -
 //     basis), then realizedGainLossThb = round2(roundedGain x fx), so the pair
@@ -33,6 +33,10 @@ import {
   capitalRowToTransaction,
   type CapitalLedgerRow,
 } from "../app/lib/server-api";
+import {
+  postCapitalRow,
+  buildStatementJournalEntries,
+} from "../app/lib/posting-engine";
 import { applyCorporateAction } from "../app/lib/corporate-action";
 import type { CostBasisMap } from "../app/lib/cost-basis-engine";
 import type { ExtractedTransaction } from "../app/lib/pdfStatementParser";
@@ -330,8 +334,84 @@ async function main() {
     { resolve: async () => null }
   );
   ok(
-    usdNoProvider[0].fxRateEffective === "1" && usdNoProvider[0].amountThb === "250.00",
-    "provider unavailable -> graceful: base fallback kept, no fabricated rate, import still succeeds"
+    usdNoProvider[0].fxRateEffective === null && usdNoProvider[0].amountThb === null,
+    "provider unavailable -> fxRateEffective/amountThb stay NULL (no 1:1 rate, no fabricated 250 THB)"
+  );
+
+  // ---- R3: unknown-FX rows are honest (statement -> provider -> NULL) ----
+  // (A) statement rate wins: USD 100 @ 35.42 -> 3542 THB.
+  const r3a = map(txn({ currency: "USD", amount: 100, rate: "35.42" }));
+  ok(
+    r3a.fxRateStatement === "35.42" &&
+      r3a.fxRateEffective === "35.42" &&
+      r3a.amountThb === "3542.00",
+    "R3 (A) statement FX 35.42 -> amountThb 3542.00"
+  );
+
+  // (B) no statement rate, provider resolves 34.50 -> 3450 THB.
+  const r3bBase = map(txn({ currency: "USD", amount: 100, rate: undefined }));
+  ok(
+    r3bBase.fxRateStatement === null &&
+      r3bBase.fxRateEffective === null &&
+      r3bBase.amountThb === null,
+    "R3 (B) no statement rate -> base row has NULL FX/THB (no silent 1:1)"
+  );
+  const r3b = (
+    await applyFxRateFallback([r3bBase], {
+      resolve: async () => ({ rate: 34.5, source: "historical-fx-provider" }),
+    })
+  )[0];
+  ok(
+    r3b.fxRateEffective === "34.5" && r3b.amountThb === "3450.00",
+    "R3 (B) provider FX 34.50 -> amountThb 3450.00"
+  );
+
+  // (C) no statement rate, provider unavailable -> NULL, never 1:1 / 100 THB.
+  const r3c = (
+    await applyFxRateFallback(
+      [map(txn({ currency: "USD", amount: 100, rate: undefined }))],
+      { resolve: async () => null }
+    )
+  )[0];
+  ok(
+    r3c.fxRateEffective === null &&
+      r3c.amountThb === null &&
+      r3c.amountThb !== "100.00" &&
+      r3c.fxRateEffective !== "1",
+    "R3 (C) provider unavailable -> NULL FX/THB (never 1:1, never 100 THB)"
+  );
+
+  // (D) THB rows stay pinned to 1 with amountThb = amountForeign.
+  const r3d = map(txn({ currency: "THB", amount: 100, rate: undefined }));
+  ok(
+    r3d.fxRateEffective === "1" &&
+      r3d.fxRateStatement === "1" &&
+      r3d.amountThb === "100.00",
+    "R3 (D) THB 100 -> FX 1, amountThb 100.00"
+  );
+
+  // (E) Journal posting: a non-THB row with unknown FX must NOT post.
+  const r3eUnknown = map(txn({ category: "income", currency: "USD", amount: 100, rate: undefined }));
+  ok(
+    postCapitalRow(r3eUnknown).ok === false,
+    "R3 (E) postCapitalRow refuses a non-THB row with unknown FX"
+  );
+  const r3eEntry = buildStatementJournalEntries([r3eUnknown])[0];
+  ok(
+    r3eEntry.postingState === "SKIPPED" &&
+      r3eEntry.entry.lines.length === 0,
+    "R3 (E) unknown-FX row becomes a SKIPPED journal entry with ZERO lines (never a fabricated 1:1 posting)"
+  );
+  ok(
+    !r3eEntry.entry.lines.some((l) => l.fxRateEffective === "1" || l.fxRateEffective === 1),
+    "R3 (E) no posted line ever carries an invented rate of 1 for the unknown-FX row"
+  );
+  // Control: a THB row with the same shape still posts normally.
+  const r3eThb = map(txn({ category: "income", currency: "THB", amount: 100 }));
+  ok(
+    postCapitalRow(r3eThb).ok === true &&
+      buildStatementJournalEntries([r3eThb])[0].postingState === "POSTED",
+    "R3 (E) control: a THB row still posts normally"
   );
 
   // ---- Gain/loss backfill: heal FROZEN SELL rows (out-of-order imports) ----

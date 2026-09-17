@@ -1,0 +1,14 @@
+-- R3 (unknown-FX honesty): allow Capital_Transactions.amount_thb to be NULL.
+--
+-- A non-THB row whose effective FX rate is unknown (no statement rate AND no
+-- historical-provider rate) has no valid THB value. Before this migration the
+-- column was NOT NULL, so the importer was forced to fall back to a fabricated
+-- 1:1 rate (fx_rate_effective = 1, amount_thb = amount_foreign) -> silently
+-- reporting a foreign amount as if it were THB.
+--
+-- The foreign amount/currency are preserved; the row now stores amount_thb NULL
+-- (fx_rate_effective NULL) meaning "not computable in THB". It is recorded in
+-- the journal as a SKIPPED entry and is NOT double-entry posted. THB rows and
+-- rows with a real rate are unaffected. journal_entry_lines.amount_thb stays
+-- NOT NULL because a line is only ever written for a row with a valid rate.
+ALTER TABLE "Capital_Transactions" ALTER COLUMN "amount_thb" DROP NOT NULL;

@@ -50,7 +50,7 @@ interface LedgerRow extends GainLossBackfillRow {
   transactionDate: string;
   fxRateBot: string | null;
   fxRateStatement: string | null;
-  amountThb: string;
+  amountThb: string | null;
   type: string;
   sourceDocumentId: string | null;
   category: string | null;

@@ -30,7 +30,7 @@ export interface ValidatedCapitalRow {
   currency: string;
   transactionDate: string;
   fxRateBot: string | null;
-  amountThb: string;
+  amountThb: string | null;
   type: ParsedCapitalType;
   sourceType: "AI_PARSED";
   sourceDocumentId: string;
@@ -126,15 +126,22 @@ export function mapToCapitalRow(
 
   // FX semantics (see schema notes):
   //  - fx_rate_statement = the rate PROVIDED BY THE SOURCE STATEMENT header.
-  //  - fx_rate_effective  = the rate actually used for THB conversion.
+  //  - fx_rate_effective  = the rate actually used for THB conversion. For a
+  //    non-THB row whose rate is unknown (no statement rate and, later, no
+  //    historical provider rate) this stays NULL. It is NEVER silently set to 1
+  //    for a non-THB currency: a 1:1 rate would fabricate a THB value.
   //  - fx_rate_bot        = legacy column (kept for data compatibility; manual
   //    ledger entries may store user-entered rates). The importer NEVER writes
   //    statement FX or provider rates into it.
+  //  - amount_thb = amountForeign * fxRateEffective, or NULL when the effective
+  //    rate is unknown. null means "not computable in THB" - never 0, never the
+  //    foreign amount treated as if it were THB.
   const parsedRate = parseRate(t.rate);
   const fxRateStatement = currency === "THB" ? 1 : parsedRate;
-  const fxRateEffective = currency === "THB" ? 1 : (parsedRate ?? 1);
+  const fxRateEffective = currency === "THB" ? 1 : parsedRate;
   const amountForeign = Math.abs(t.amount);
-  const amountThb = amountForeign * fxRateEffective;
+  const amountThb =
+    fxRateEffective !== null ? amountForeign * fxRateEffective : null;
 
   // Determine cash direction deterministically. The parser reports "expense"
   // rows (WHT, broker fees, VAT) with a positive amount even though it is money
@@ -152,6 +159,7 @@ export function mapToCapitalRow(
   let realizedGainLossThb: string | null = null;
   if (
     t.side === "SELL" &&
+    fxRateEffective !== null &&
     t.realizedGainLoss !== undefined &&
     Number.isFinite(t.realizedGainLoss)
   ) {
@@ -183,7 +191,7 @@ export function mapToCapitalRow(
       currency,
       transactionDate,
       fxRateBot: null,
-      amountThb: amountThb.toFixed(2),
+      amountThb: amountThb !== null ? amountThb.toFixed(2) : null,
       type,
       sourceType: "AI_PARSED",
       sourceDocumentId,
@@ -210,7 +218,7 @@ export function mapToCapitalRow(
       realizedGainLossThb,
       fxRateStatement:
         fxRateStatement !== null ? String(fxRateStatement) : null,
-      fxRateEffective: String(fxRateEffective),
+      fxRateEffective: fxRateEffective !== null ? String(fxRateEffective) : null,
       netAmount:
         t.netAmount !== undefined && Number.isFinite(t.netAmount)
           ? decimalString(t.netAmount)
@@ -284,7 +292,12 @@ export interface FxFallback {
  * Apply the external historical FX fallback to built rows, with this priority:
  *   A. Statement-provided FX (fx_rate_statement) — always wins, never overridden.
  *   B. Historical FX provider fallback — only for non-THB rows WITHOUT a rate.
- *   C. THB = 1 / existing base fallback — untouched when no external rate exists.
+ *   C. Unknown - when neither a statement rate nor an external rate exists the
+ *      row keeps fxRateEffective = null and amountThb = null (and
+ *      realizedGainLossThb = null). It is NEVER defaulted to a 1:1 rate: a
+ *      non-THB amount must not be represented as if it were THB. Such a row is
+ *      still recorded (foreign amount/currency preserved) but carries no THB
+ *      value and is not double-entry posted.
  *
  * When an external rate is applied it becomes fx_rate_effective, and the derived
  * THB amounts (amountThb + realizedGainLossThb on computable SELL rows) are

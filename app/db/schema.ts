@@ -42,7 +42,11 @@ export const capitalTransactions = pgTable(
     // historical/imported rows migrate cleanly. Deprecated: not used as an FX
     // source by either the importer or the tax core.
     fxRateBot: numeric("fx_rate_bot"),
-    amountThb: numeric("amount_thb").notNull(),
+    // THB reporting base = amount_foreign * fx_rate_effective. NULL when the
+    // effective rate is unknown (non-THB row with neither a statement rate nor a
+    // provider rate) - never 0 and never the foreign amount treated as THB.
+    // Nullable so such a row is still recorded with its foreign amount/currency.
+    amountThb: numeric("amount_thb"),
     type: text("type").notNull(),
     sourceType: text("source_type").notNull(),
     sourceDocumentId: text("source_document_id"),

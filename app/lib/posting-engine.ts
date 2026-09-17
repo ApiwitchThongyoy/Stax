@@ -66,7 +66,12 @@ function leg(
   const base: JournalLineInput = {
     accountId,
     currency: row.currency,
-    fxRateEffective: row.fxRateEffective ?? "1",
+    // Verbatim: NEVER default a missing rate to 1. For THB the validator pins
+    // the rate to 1 internally; for a non-THB row without a resolved rate this
+    // stays null and the entry is refused before any line is built
+    // (see postCapitalRow). Defaulting to 1 here would fabricate a 1:1 rate and
+    // silently post a foreign amount as if it were THB.
+    fxRateEffective: row.fxRateEffective ?? null,
     fxRateStatement: row.fxRateStatement ?? null,
     memo: memo ?? null,
   };
@@ -212,6 +217,21 @@ function expenseAccountFor(row: ValidatedCapitalRow): string {
 export function postCapitalRow(row: ValidatedCapitalRow): CapitalPostingResult {
   const category = (row.category ?? "").trim().toLowerCase();
   const amount = row.amountForeign;
+
+  // R3 guard: a non-THB row whose effective FX rate is unknown has no valid THB
+  // value. It must NOT be double-entry posted - posting it would either invent a
+  // 1:1 rate or an unbalanced entry. The row is still recorded in the journal as
+  // a SKIPPED entry (foreign amount/currency preserved, no lines).
+  if (row.currency !== "THB") {
+    const eff = row.fxRateEffective;
+    if (eff == null || !(Number(eff) > 0)) {
+      return {
+        ok: false,
+        reason:
+          "no effective FX rate for non-THB row (THB value unknown) - not posted",
+      };
+    }
+  }
 
   if (category === "equity") {
     const cash = cashAccountFor(row.currency);
