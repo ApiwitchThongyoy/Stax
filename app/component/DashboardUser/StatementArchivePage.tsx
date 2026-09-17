@@ -62,6 +62,10 @@ export default function StatementArchivePage({
   const [loading, setLoading] = useState(true);
   const [deletingIds, setDeletingIds] = useState<ReadonlySet<string>>(new Set());
   const [deleteError, setDeleteError] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<StoredDocumentMeta | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const deleteDialog = useRef<HTMLDialogElement>(null);
+  const confirmationInFlight = useRef(false);
   const [downloadError, setDownloadError] = useState("");
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set()
@@ -220,6 +224,28 @@ export default function StatementArchivePage({
     }
   };
 
+  useEffect(() => {
+    if (pendingDelete) deleteDialog.current?.showModal();
+    else deleteDialog.current?.close();
+  }, [pendingDelete]);
+
+  const cancelDelete = () => {
+    if (!confirmationInFlight.current) setPendingDelete(null);
+  };
+
+  const confirmDelete = async () => {
+    if (!pendingDelete || confirmationInFlight.current) return;
+    confirmationInFlight.current = true;
+    setConfirmingDelete(true);
+    try {
+      await handleDelete(pendingDelete.id, pendingDelete.fileName);
+    } finally {
+      setPendingDelete(null);
+      setConfirmingDelete(false);
+      confirmationInFlight.current = false;
+    }
+  };
+
   const toggleFolder = (key: string) => {
     setExpandedFolders((prev) => {
       const next = new Set(prev);
@@ -270,6 +296,33 @@ export default function StatementArchivePage({
 
   return (
     <div className="space-y-6">
+      <dialog
+        ref={deleteDialog}
+        aria-labelledby="statement-delete-title"
+        aria-describedby="statement-delete-message statement-delete-warning"
+        onCancel={(event) => { event.preventDefault(); cancelDelete(); }}
+        className="fixed inset-0 m-auto w-[calc(100%-2rem)] max-w-md rounded-2xl bg-white p-6 shadow-xl backdrop:bg-black/40"
+      >
+        <h2 id="statement-delete-title" className="text-lg font-semibold text-gray-900">
+          ยืนยันการลบ Statement
+        </h2>
+        <p id="statement-delete-message" className="mt-3 text-sm text-gray-700 break-words">
+          คุณต้องการลบ "{pendingDelete?.fileName}" จริงหรือไม่?
+        </p>
+        <p id="statement-delete-warning" className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-600">
+          การลบจะนำข้อมูลธุรกรรมและข้อมูลทางการเงินที่สร้างจาก Statement นี้ออกด้วย
+        </p>
+        <div className="mt-5 flex justify-end gap-3">
+          <button type="button" autoFocus onClick={cancelDelete} disabled={confirmingDelete}
+            className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50">
+            ยกเลิก
+          </button>
+          <button type="button" onClick={confirmDelete} disabled={confirmingDelete}
+            className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-wait">
+            {confirmingDelete ? "กำลังลบ..." : "ลบเอกสาร"}
+          </button>
+        </div>
+      </dialog>
       <div className="bg-linear-to-br from-blue-900 to-blue-950 rounded-2xl px-6 py-5 text-white">
         <p className="text-xs text-blue-300 mb-1">Statement Archive</p>
         <h1 className="text-xl font-semibold mb-1.5">คลัง Statement ทั้งหมด</h1>
@@ -409,7 +462,7 @@ export default function StatementArchivePage({
                               </button>
                               <button
                                 type="button"
-                                onClick={() => handleDelete(doc.id, doc.fileName)}
+                                onClick={() => setPendingDelete(doc)}
                                 disabled={deletingIds.has(doc.id)}
                                 className="text-gray-400 hover:text-red-600 transition shrink-0 disabled:opacity-50 disabled:cursor-wait disabled:hover:text-gray-400"
                                 aria-label={deletingIds.has(doc.id) ? "กำลังลบไฟล์" : "ลบไฟล์"}
