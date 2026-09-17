@@ -3478,6 +3478,260 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
     }
   }
 
+  // ================= REG: MONTHLY FEE AGGREGATE PERSISTENCE (migration 0027) =================
+  // The R4 monthly-fee/VAT provenance flag (is_monthly_fee_aggregate) must land
+  // in BOTH Capital_Transactions and journal_entries when a statement import
+  // persists rows, and a REBUILD from the persisted shape (deletion
+  // reconciliation / recompute scripts re-read the DB then re-post) must keep
+  // the monthly rows (TRUE) SKIPPED-by-flag and the legacy/unknown rows (NULL)
+  // SKIPPED-by-unknown-provenance rather than inventing a 5010 expense line,
+  // while a genuine standalone fee (flag false) still POSTs once. Requires the
+  // 0027 migration.
+  {
+    const feeAggCol =
+      await client`SELECT column_name FROM information_schema.columns WHERE lower(table_name) = 'capital_transactions' AND column_name = 'is_monthly_fee_aggregate'`;
+    if (feeAggCol.length === 0) {
+      console.log(
+        "\n  SKIP  REG-monthly-fee-agg: is_monthly_fee_aggregate absent (run the 0027 migration)"
+      );
+    } else {
+      console.log("\n=== REG: MONTHLY FEE AGGREGATE PERSISTENCE ===");
+      const { randomUUID } = await import("node:crypto");
+      const mfaEmail = `mfa-${randomUUID()}@test.local`;
+      const mfaPass = "MfaCheck!234";
+      const mfaReg = await registerAs(mfaEmail, mfaPass);
+      const mfaJson = (await mfaReg.json()) as { data?: { user?: { id?: string } } };
+      const mfaUserId = mfaJson.data?.user?.id;
+      if (!mfaUserId) {
+        ok(false, "REG-mfa: register failed to create the fee-aggregate test user");
+      } else {
+        smokeUserIds.push(mfaUserId);
+        const mfaLogin = await loginAs(mfaEmail, mfaPass);
+        const mfaToken = mfaLogin.data?.accessToken as string | undefined;
+        if (!mfaToken) {
+          ok(false, "REG-mfa: fee-aggregate user could not log in");
+        } else {
+          const mfaLedger = await import("../app/lib/ledger-service");
+          const mfaEngine = await import("../app/lib/posting-engine");
+          const docId = randomUUID();
+          const now = new Date().toISOString();
+          await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                       VALUES (${docId}, ${mfaUserId}, 'mfa.PDF', '/tmp/mfa.pdf', 'application/pdf', 100, ${now}, ${now})`;
+          const baseRow = (over: Record<string, unknown>) =>
+            ({
+              transactionId: randomUUID(),
+              userId: mfaUserId,
+              amountForeign: "11.00",
+              currency: "USD",
+              transactionDate: "2026-01-15",
+              fxRateBot: null,
+              amountThb: "389.50",
+              type: "CASH_IN",
+              sourceType: "AI_PARSED",
+              sourceDocumentId: docId,
+              category: "expense",
+              section: "ค่าธรรมเนียม",
+              symbol: null,
+              side: null,
+              quantity: null,
+              unitPrice: null,
+              grossAmount: null,
+              fees: null,
+              proceeds: null,
+              costBasis: null,
+              realizedGainLoss: null,
+              realizedGainLossThb: null,
+              fxRateStatement: "35.4",
+              fxRateEffective: "35.4",
+              netAmount: null,
+              exchange: null,
+              exchangeFromCurrency: null,
+              exchangeFromAmount: null,
+              exchangeRate: null,
+              isMonthlyFeeAggregate: false,
+              ...over,
+            }) as unknown as Parameters<typeof mfaLedger.insertStatementImport>[1][number];
+          const txMonthly = randomUUID();
+          const txStandalone = randomUUID();
+          const txLegacy = randomUUID();
+          const persistedRows = [
+            baseRow({
+              transactionId: txMonthly,
+              isMonthlyFeeAggregate: true,
+            }),
+            baseRow({
+              transactionId: txStandalone,
+              isMonthlyFeeAggregate: false,
+              amountForeign: "9.00",
+              amountThb: "318.60",
+            }),
+            // Legacy pre-0027 row: the old parser emitted an IDENTICAL persisted
+            // shape for aggregates AND standalone fees, so its provenance is
+            // UNKNOWN. The tri-state contract stores NULL (never a fabricated
+            // false) and the rebuild SKIPS it (no lines) until a delete +
+            // re-import re-runs the parser for a deterministic TRUE/FALSE.
+            baseRow({
+              transactionId: txLegacy,
+              isMonthlyFeeAggregate: null,
+              amountForeign: "2.50",
+              amountThb: "88.50",
+            }),
+          ];
+          const imported = await mfaLedger.insertStatementImport(mfaUserId, persistedRows);
+          ok(
+            imported.insertedCount === 3 &&
+              imported.transactionIds.includes(txMonthly) &&
+              imported.transactionIds.includes(txLegacy),
+            "REG-mfa: statement import persists the monthly + standalone + legacy fee rows"
+          );
+          const capFlag = await client`
+            SELECT is_monthly_fee_aggregate FROM "Capital_Transactions"
+            WHERE transaction_id = ${txMonthly}`;
+          ok(
+            capFlag.length === 1 && capFlag[0].is_monthly_fee_aggregate === true,
+            "REG-mfa: Capital_Transactions row stores is_monthly_fee_aggregate = true"
+          );
+          const capStandalone = await client`
+            SELECT is_monthly_fee_aggregate FROM "Capital_Transactions"
+            WHERE transaction_id = ${txStandalone}`;
+          ok(
+            capStandalone.length === 1 && capStandalone[0].is_monthly_fee_aggregate === false,
+            "REG-mfa: standalone fee row stores is_monthly_fee_aggregate = false"
+          );
+          const capLegacy = await client`
+            SELECT is_monthly_fee_aggregate FROM "Capital_Transactions"
+            WHERE transaction_id = ${txLegacy}`;
+          ok(
+            capLegacy.length === 1 && capLegacy[0].is_monthly_fee_aggregate === null,
+            "REG-mfa: legacy (pre-0027) row stores is_monthly_fee_aggregate = NULL (never coerced to false)"
+          );
+          const jrnFlag = await client`
+            SELECT is_monthly_fee_aggregate, posting_state FROM journal_entries
+            WHERE source_transaction_id = ${txMonthly}`;
+          ok(
+            jrnFlag.length === 1 &&
+              jrnFlag[0].is_monthly_fee_aggregate === true &&
+              jrnFlag[0].posting_state === "SKIPPED",
+            "REG-mfa: journal_entries row stores the flag true AND is SKIPPED (monthly) — independent fields"
+          );
+          const jrnStandalone = await client`
+            SELECT is_monthly_fee_aggregate, posting_state FROM journal_entries
+            WHERE source_transaction_id = ${txStandalone}`;
+          ok(
+            jrnStandalone.length === 1 &&
+              jrnStandalone[0].is_monthly_fee_aggregate === false &&
+              jrnStandalone[0].posting_state === "POSTED",
+            "REG-mfa: standalone fee journal row stores flag false AND is POSTED — independent fields"
+          );
+          const jrnLegacy = await client`
+            SELECT is_monthly_fee_aggregate, posting_state, skip_reason FROM journal_entries
+            WHERE source_transaction_id = ${txLegacy}`;
+          ok(
+            jrnLegacy.length === 1 &&
+              jrnLegacy[0].is_monthly_fee_aggregate === null &&
+              jrnLegacy[0].posting_state === "SKIPPED" &&
+              typeof jrnLegacy[0].skip_reason === "string" &&
+              jrnLegacy[0].skip_reason.includes(
+                "re-import required for deterministic classification"
+              ),
+            "REG-mfa: legacy journal row keeps flag NULL AND is SKIPPED with explicit unknown-provenance reason — independent fields"
+          );
+          // Rebuild from the persisted DB shape (what reconcileStatementDeletion /
+          // recompute scripts do): read the rows back and re-run the pure engine.
+          const capRowsAll = await client`
+            SELECT * FROM "Capital_Transactions"
+            WHERE user_id = ${mfaUserId} AND source_document_id = ${docId}
+            ORDER BY transaction_id`;
+          const toCapitalShape = (r: Record<string, unknown>) => ({
+            transactionId: r.transaction_id as string,
+            userId: r.user_id as string,
+            amountForeign: r.amount_foreign as string,
+            currency: r.currency as string,
+            transactionDate: r.transaction_date as string,
+            fxRateBot: r.fx_rate_bot as string | null,
+            amountThb: r.amount_thb as string | null,
+            type: r.type as string,
+            sourceType: r.source_type as string,
+            sourceDocumentId: r.source_document_id as string | null,
+            category: r.category as string,
+            section: r.section as string | null,
+            symbol: r.symbol as string | null,
+            side: r.side as string | null,
+            quantity: r.quantity as string | null,
+            unitPrice: r.unit_price as string | null,
+            grossAmount: r.gross_amount as string | null,
+            fees: r.fees as string | null,
+            proceeds: r.proceeds as string | null,
+            costBasis: r.cost_basis as string | null,
+            realizedGainLoss: r.realized_gain_loss as string | null,
+            realizedGainLossThb: r.realized_gain_loss_thb as string | null,
+            fxRateStatement: r.fx_rate_statement as string | null,
+            fxRateEffective: r.fx_rate_effective as string | null,
+            netAmount: r.net_amount as string | null,
+            exchange: r.exchange as string | null,
+            exchangeFromCurrency: r.exchange_from_currency as string | null,
+            exchangeFromAmount: r.exchange_from_amount as string | null,
+            exchangeRate: r.exchange_rate as string | null,
+            isMonthlyFeeAggregate:
+              r.is_monthly_fee_aggregate == null
+                ? null
+                : (r.is_monthly_fee_aggregate as boolean) === true,
+          });
+          const rebuiltMonthly = toCapitalShape(
+            capRowsAll.find((r) => r.transaction_id === txMonthly) as Record<string, unknown> | undefined ?? {}
+          );
+          const rebuiltStandalone = toCapitalShape(
+            capRowsAll.find((r) => r.transaction_id === txStandalone) as Record<string, unknown> | undefined ?? {}
+          );
+          const rebuiltLegacy = toCapitalShape(
+            capRowsAll.find((r) => r.transaction_id === txLegacy) as Record<string, unknown> | undefined ?? {}
+          );
+          const rebuiltEntries = mfaEngine.buildStatementJournalEntries([
+            rebuiltMonthly as never,
+            rebuiltStandalone as never,
+            rebuiltLegacy as never,
+          ]);
+          const rebuiltMonthlyEntry = rebuiltEntries.find((e) => e.entry.detail?.section === "ค่าธรรมเนียม" && e.entry.detail?.isMonthlyFeeAggregate === true);
+          const rebuiltStandaloneEntry = rebuiltEntries.find((e) => e.entry.detail?.section === "ค่าธรรมเนียม" && e.entry.detail?.isMonthlyFeeAggregate === false);
+          const rebuiltLegacyEntry = rebuiltEntries.find((e) => e.entry.detail?.section === "ค่าธรรมเนียม" && e.entry.detail?.isMonthlyFeeAggregate == null);
+          ok(
+            rebuiltMonthlyEntry?.postingState === "SKIPPED" &&
+              rebuiltMonthlyEntry?.entry.lines.length === 0,
+            "REG-mfa: rebuild from persisted rows keeps the monthly fee SKIPPED with zero lines"
+          );
+          ok(
+            rebuiltStandaloneEntry?.postingState === "POSTED" &&
+              rebuiltStandaloneEntry?.entry.lines.some(
+                (l) => l.accountId === "5010" && l.debit === "9.00"
+              ),
+            "REG-mfa: rebuild from persisted rows POSTs the standalone fee (Dr 5010 once)"
+          );
+          ok(
+            rebuiltLegacyEntry?.postingState === "SKIPPED" &&
+              rebuiltLegacyEntry?.entry.lines.length === 0 &&
+              rebuiltLegacyEntry?.entry.detail?.isMonthlyFeeAggregate === null &&
+              typeof rebuiltLegacyEntry?.entry.skipReason === "string" &&
+              (rebuiltLegacyEntry.entry.skipReason ?? "").includes(
+                "re-import required for deterministic classification"
+              ),
+            "REG-mfa: rebuild from a legacy NULL row is SKIPPED with zero lines + explicit reason (detail stays null)"
+          );
+          // Self-cleaning (shared CLEANUP also removes this user's linked rows).
+          await client`
+            DELETE FROM journal_entry_lines
+            WHERE journal_entry_id IN (
+              SELECT id FROM journal_entries WHERE source_transaction_id IN (${txMonthly}, ${txStandalone}, ${txLegacy})
+            )`;
+          await client`
+            DELETE FROM journal_entries WHERE source_transaction_id IN (${txMonthly}, ${txStandalone}, ${txLegacy})`;
+          await client`
+            DELETE FROM "Capital_Transactions" WHERE transaction_id IN (${txMonthly}, ${txStandalone}, ${txLegacy})`;
+          await client`DELETE FROM documents WHERE id = ${docId} AND user_id = ${mfaUserId}`;
+        }
+      }
+    }
+  }
+
   // ================= REG: DATA INTEGRITY CHECKS (migration 0025) =================
   // Proves the 14 CHECK constraints that remained after the upgrade-safety
   // review are present and enforce the closed sets + magnitude guards at the

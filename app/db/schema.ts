@@ -113,6 +113,27 @@ export const capitalTransactions = pgTable(
     exchangeFromCurrency: text("exchange_from_currency"),
     exchangeFromAmount: numeric("exchange_from_amount"),
     exchangeRate: numeric("exchange_rate"),
+    // R4: the parser flags a fee row that is actually the MONTHLY aggregate of
+    // all statement-currency fees (per currency) as informational-only. Such a
+    // row has NO single underlying trade, so the posting engine must NEVER post
+    // an expense line for it — reads, reconcilers and rebuild scripts key on
+    // this explicit persisted flag (migration 0027). Tri-state:
+    //   TRUE  = confirmed parser-generated monthly aggregate (post-0027 import):
+    //           every rebuild path keeps it SKIPPED.
+    //   FALSE = confirmed standalone / non-aggregate fee (post-0027 import):
+    //           posted once.
+    //   NULL  = legacy / unknown provenance (pre-0027 row: the parser emitted an
+    //           identical persisted shape for aggregates AND genuine standalone
+    //           fees, so it cannot be classified). NULL deliberately is NOT the
+    //           same as FALSE — no DEFAULT, no NOT NULL, no backfill, so legacy
+    //           rows are never fabricated into a confirmed standalone verdict.
+    //           FINAL policy: a NULL row is SKIPPED (zero lines, explicit skip
+    //           reason "legacy fee provenance unknown ...") because posting it
+    //           could double-count the month's fees; it is NEVER treated as a
+    //           confirmed standalone. The stored flag stays NULL (unknown). The
+    //           only way to fix provenance for an old statement is delete +
+    //           re-import.
+    isMonthlyFeeAggregate: boolean("is_monthly_fee_aggregate"),
   },
   (table) => [
     index("Capital_Transactions_user_id_idx").on(table.userId),
@@ -493,6 +514,12 @@ export const journalEntries = pgTable(
     exchangeFromAmount: numeric("exchange_from_amount"),
     exchangeRate: numeric("exchange_rate"),
     isFxConversion: boolean("is_fx_conversion").notNull().default(false),
+    // R4: mirrors Capital_Transactions.is_monthly_fee_aggregate (tri-state,
+    // migration 0027) so the journal-as-SSOT read layer reproduces the flag.
+    // TRUE keeps aggregate statements as line-less SKIPPED records; FALSE is a
+    // confirmed standalone fee that posts; NULL is legacy/unknown provenance and
+    // is SKIPPED (never fabricated into a confirmed standalone verdict).
+    isMonthlyFeeAggregate: boolean("is_monthly_fee_aggregate"),
     // POSTED (lines exist + balanced) | SKIPPED (recorded but not double-entry).
     postingState: text("posting_state").notNull().default("POSTED"),
     skipReason: text("skip_reason"),

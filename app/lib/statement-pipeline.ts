@@ -53,6 +53,13 @@ export interface ValidatedCapitalRow {
   exchangeFromCurrency: string | null;
   exchangeFromAmount: string | null;
   exchangeRate: string | null;
+  // Deterministic provenance: true ONLY for the parser's monthly brokerage-fee /
+// VAT aggregate rows; false for confirmed standalone fees; null/absent for
+// legacy pre-0027 rows whose provenance is unknown (never fabricated). The
+// posting engine uses this flag (not a section-name match) to decide a fee row
+// must not be posted — a genuine standalone broker fee (same section label, no
+// flag) still posts.
+  isMonthlyFeeAggregate?: boolean | null;
 }
 
 export interface BuiltStatementTransactions {
@@ -139,14 +146,24 @@ export function mapToCapitalRow(
   const parsedRate = parseRate(t.rate);
   const fxRateStatement = currency === "THB" ? 1 : parsedRate;
   const fxRateEffective = currency === "THB" ? 1 : parsedRate;
-  const amountForeign = Math.abs(t.amount);
+  // R4 negative-fee/rebate handling. The parser reports "expense" rows (WHT,
+  // broker fees, VAT) with a POSITIVE amount when the fee is a payment out of
+  // the account, but a NEGATIVE amount when the broker credits a rebate back
+  // (money returned to the account). Expense rows therefore PRESERVE the sign
+  // so the posting engine can post a rebate as its contra-expense
+  // (Dr cash / Cr fee) instead of a phoney extra fee. Non-expense rows keep the
+  // historical positive-magnitude convention (equity deposit/withdrawal sign
+  // is captured by `type`, only the magnitude is persisted).
+  const amountForeign =
+    t.category === "expense" ? t.amount : Math.abs(t.amount);
   const amountThb =
     fxRateEffective !== null ? amountForeign * fxRateEffective : null;
 
-  // Determine cash direction deterministically. The parser reports "expense"
-  // rows (WHT, broker fees, VAT) with a positive amount even though it is money
-  // leaving the account, so direction is category-aware, not sign-only.
-  const isMoneyOut = t.category === "expense" || t.amount < 0;
+  // Determine cash direction deterministically. For an "expense" row the sign of
+  // the amount IS the direction (positive = fee paid out; negative = rebate
+  // received), so it is category-aware, not sign-only. Every other category
+  // keeps sign-only direction (negative amount = money out).
+  const isMoneyOut = t.category === "expense" ? t.amount > 0 : t.amount < 0;
   const type = isMoneyOut ? "CASH_OUT" : "CASH_IN";
 
   // Deterministic realized gain/loss (Decimal arithmetic). Only a SELL row with
@@ -235,6 +252,10 @@ export function mapToCapitalRow(
         typeof t.exchangeRate === "number" && Number.isFinite(t.exchangeRate)
           ? decimalString(t.exchangeRate)
           : null,
+      // In-memory provenance only (not persisted): the posting engine needs to
+      // know whether an expense row is the parser's monthly fee/VAT aggregate
+      // (skip) vs a real standalone fee (post once).
+      isMonthlyFeeAggregate: t.isMonthlyFeeAggregate === true,
     },
   };
 }
@@ -467,6 +488,8 @@ export async function insertStatementTransactions(
           exchangeFromCurrency: row.exchangeFromCurrency,
           exchangeFromAmount: row.exchangeFromAmount,
           exchangeRate: row.exchangeRate,
+          isMonthlyFeeAggregate:
+        row.isMonthlyFeeAggregate == null ? null : row.isMonthlyFeeAggregate === true,
         })
         .execute();
       insertedIds.push(row.transactionId);

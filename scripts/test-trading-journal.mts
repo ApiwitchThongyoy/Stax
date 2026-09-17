@@ -75,6 +75,7 @@ function journalRow(partial: Partial<CapitalJournalRecord>): CapitalJournalRecor
     exchangeFromCurrency: null,
     exchangeFromAmount: null,
     exchangeRate: null,
+    isMonthlyFeeAggregate: false,
     postingState: "POSTED",
     skipReason: null,
     type: null,

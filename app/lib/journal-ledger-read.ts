@@ -49,6 +49,11 @@ export interface CapitalJournalRecord {
   exchangeFromCurrency: string | null;
   exchangeFromAmount: string | null;
   exchangeRate: string | null;
+  // R4: monthly-fee-aggregate provenance, tri-state (true = parser monthly
+  // aggregate -> SKIPPED, false = confirmed standalone, null = legacy/unknown
+  // pre-0027 provenance). Persisted onto both the capital row and the journal
+  // entry (migration 0027) so every reader/reconciler keeps it faithful.
+  isMonthlyFeeAggregate: boolean | null;
   postingState: string | null;
   skipReason: string | null;
   type: string | null;
@@ -93,6 +98,7 @@ export function journalEntryToCapitalRow(e: CapitalJournalRecord) {
     exchangeFromCurrency: e.exchangeFromCurrency,
     exchangeFromAmount: e.exchangeFromAmount,
     exchangeRate: e.exchangeRate,
+    isMonthlyFeeAggregate: e.isMonthlyFeeAggregate,
   };
 }
 
@@ -125,6 +131,7 @@ const CAPITAL_JOURNAL_COLUMNS = {
   exchangeFromCurrency: journalEntries.exchangeFromCurrency,
   exchangeFromAmount: journalEntries.exchangeFromAmount,
   exchangeRate: journalEntries.exchangeRate,
+  isMonthlyFeeAggregate: journalEntries.isMonthlyFeeAggregate,
   postingState: journalEntries.postingState,
   skipReason: journalEntries.skipReason,
   type: journalEntries.type,

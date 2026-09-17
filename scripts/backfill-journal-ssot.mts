@@ -72,6 +72,7 @@ interface CapitalRowLike {
   exchangeFromCurrency: string | null;
   exchangeFromAmount: string | null;
   exchangeRate: string | null;
+  isMonthlyFeeAggregate: boolean | null;
 }
 
 function rowToValidated(row: CapitalRowLike): ValidatedCapitalRow {
@@ -109,6 +110,7 @@ function rowToValidated(row: CapitalRowLike): ValidatedCapitalRow {
     exchangeFromCurrency: row.exchangeFromCurrency,
     exchangeFromAmount: row.exchangeFromAmount,
     exchangeRate: row.exchangeRate,
+    isMonthlyFeeAggregate: row.isMonthlyFeeAggregate,
   };
 }
 
@@ -163,6 +165,7 @@ async function backfillUser(
       exchangeFromCurrency: capitalTransactions.exchangeFromCurrency,
       exchangeFromAmount: capitalTransactions.exchangeFromAmount,
       exchangeRate: capitalTransactions.exchangeRate,
+      isMonthlyFeeAggregate: capitalTransactions.isMonthlyFeeAggregate,
     })
     .from(capitalTransactions)
     .where(eq(capitalTransactions.userId, userId))

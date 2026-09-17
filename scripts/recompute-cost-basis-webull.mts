@@ -59,6 +59,7 @@ interface LedgerRow extends GainLossBackfillRow {
   exchangeFromCurrency: string | null;
   exchangeFromAmount: string | null;
   exchangeRate: string | null;
+  isMonthlyFeeAggregate: boolean | null;
   costBasis: string | null;
   proceeds: string | null;
   realizedGainLoss: string | null;
@@ -90,6 +91,7 @@ const CAPITAL_TX = {
   exchangeFromCurrency: capitalTransactions.exchangeFromCurrency,
   exchangeFromAmount: capitalTransactions.exchangeFromAmount,
   exchangeRate: capitalTransactions.exchangeRate,
+  isMonthlyFeeAggregate: capitalTransactions.isMonthlyFeeAggregate,
   costBasis: capitalTransactions.costBasis,
   proceeds: capitalTransactions.proceeds,
   realizedGainLoss: capitalTransactions.realizedGainLoss,
@@ -177,6 +179,7 @@ function toValidatedRow(r: LedgerRow): ValidatedCapitalRow {
     exchangeFromCurrency: r.exchangeFromCurrency,
     exchangeFromAmount: r.exchangeFromAmount,
     exchangeRate: r.exchangeRate,
+    isMonthlyFeeAggregate: r.isMonthlyFeeAggregate,
   };
 }
 

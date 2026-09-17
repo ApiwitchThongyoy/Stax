@@ -401,6 +401,10 @@ export interface GeneralLedgerJournalTradeDetail {
   fxRateEffective: string | null;
   fxRateStatement: string | null;
   isFxConversion: boolean;
+  // R4: monthly-fee-aggregate provenance, tri-state (true = parser monthly
+  // aggregate -> SKIPPED, false = confirmed standalone, null = legacy/unknown
+  // pre-0027 provenance, never fabricated).
+  isMonthlyFeeAggregate?: boolean | null;
 }
 
 /** Journal entry (with its lines + trade detail) returned by GET /api/v1/journal. */

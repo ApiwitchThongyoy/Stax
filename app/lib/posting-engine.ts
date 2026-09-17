@@ -11,12 +11,42 @@
 // Posting decisions (default chart of accounts, USD broker + THB reporting):
 //   equity + CASH_IN   -> Dr broker-cash  / Cr owner-capital
 //   equity + CASH_OUT  -> Dr owner-capital / Cr broker-cash
-//   asset + BUY        -> Dr investments (net incl. fees) / Cr broker-cash   (fees capitalized)
+//   expense (positive) -> Dr fee/WHT expense / Cr broker-cash
+//   expense (negative, rebate) -> Dr broker-cash / Cr fee/WHT expense (contra-expense,
+//                         leg amounts positive, magnitude from the signed expense row)
+//   asset + BUY        -> Dr investments (PRINCIPAL = quantity x unitPrice via
+//                         Decimal, fees excluded, matching the avg-cost basis
+//                         so a full liquidation drains the asset to zero) / Dr
+//                         fee expense (fee = net - principal, derived; a rebate
+//                         credits the fee account) / Cr broker-cash (net, the
+//                         authoritative broker figure). If quantity x unitPrice
+//                         cannot yield a parseable positive principal the row is
+//                         SKIPPED — the net is NEVER capitalized into the asset
+//                         (that would bake fees into cost basis).
 //   asset + SELL       -> Dr broker-cash (net proceeds) / Cr investments (cost basis) +
-//                         gain -> Cr gains income | loss -> Dr losses expense
+//                         gain -> Cr gains income | loss -> Dr losses expense.
+//                         SELL FEE POLICY: realizedGainLoss = net proceeds -
+//                         costBasis. The SELL fee is ALREADY netted inside the
+//                         proceeds (broker net), so it is NEVER subtracted again
+//                         and NEVER posted as a separate expense line — doing
+//                         either would double-count it.
 //   asset + SELL (no basis) -> Dr broker-cash / Cr investments at proceeds (no gain split)
 //   income (dividend/interest) -> Dr broker-cash / Cr income account (gross)
-//   expense (fees/VAT/WHT)     -> Dr expense account / Cr broker-cash
+//   expense (WHT)               -> Dr expense account / Cr broker-cash
+//   expense (fee/VAT rows, isMonthlyFeeAggregate) -> tri-state SKIP rule:
+//                         TRUE (parser monthly aggregate) and NULL (legacy /
+//                         unknown pre-0027 provenance) are BOTH SKIPPED with
+//                         zero lines; only FALSE (confirmed standalone fee)
+//                         posts once. TRUE rows aggregate the month's
+//                         commission/VAT — already in the per-trade postings
+//                         (BUY fee leg / SELL net proceeds), so posting again
+//                         would double-count. NULL is UNKNOWN: the historical
+//                         row cannot be proved to be a monthly aggregate OR a
+//                         genuine standalone fee, so posting it risks
+//                         double-counting — it stays SKIPPED until the user
+//                         deletes + re-imports the statement to re-run the
+//                         parser for a deterministic TRUE/FALSE. The rule keys
+//                         on the provenance flag, NOT a section-name match.
 //
 // Currency-exchange-only rows (category "asset", no side) are NOT auto-posted —
 // they would break the agreed per-currency balance rule inside one entry. With
@@ -169,6 +199,8 @@ export function journalDetailOf(row: ValidatedCapitalRow): JournalTradeDetail {
     exchangeFromCurrency: row.exchangeFromCurrency ?? null,
     exchangeFromAmount: row.exchangeFromAmount ?? null,
     exchangeRate: row.exchangeRate ?? null,
+    isMonthlyFeeAggregate:
+    row.isMonthlyFeeAggregate == null ? null : row.isMonthlyFeeAggregate === true,
   };
 }
 
@@ -272,19 +304,56 @@ export function postCapitalRow(row: ValidatedCapitalRow): CapitalPostingResult {
   if (category === "asset") {
     if (row.side === "BUY") {
       const cash = cashAccountFor(row.currency);
+      // R4 (finalized): the investment is debited by the PRINCIPAL ONLY —
+      // quantity x unitPrice (Decimal), fees excluded — so it matches the
+      // Webull avg-cost basis and a full liquidation drains the asset to zero.
+      // The fee is recognized in the SAME entry: fee = net − principal
+      // (derived, never invented), so the entry always balances and a negative
+      // residual (broker rebate) credits the fee account instead of debiting it.
+      //
+      // Do NOT fall back to capitalizing the net amount as the asset value. That
+      // would bake the fees into the cost basis and break the running average.
+      // If quantity x unitPrice cannot be derived (missing/non-finite/non-positive),
+      // the row is NOT posted (SKIPPED): the amount stays recorded, no line is
+      // fabricated, and the caller records it as a non-computable buy.
+      const net = new Decimal(amount);
+      const qtyRaw = row.quantity;
+      const priceRaw = row.unitPrice;
+      const qty = qtyRaw != null && qtyRaw.trim() !== "" ? new Decimal(qtyRaw) : null;
+      const price = priceRaw != null && priceRaw.trim() !== "" ? new Decimal(priceRaw) : null;
+      const principal =
+        qty && price && qty.isFinite() && price.isFinite() && qty.gt(0) && price.gt(0)
+          ? qty.mul(price)
+          : null;
+      if (principal == null) {
+        return {
+          ok: false,
+          reason:
+            "BUY without a parseable positive principal (quantity x unitPrice) - not posted (net would wrongly capitalize the fee)",
+        };
+      }
+      const fee = net.minus(principal);
+      const lines: JournalLineInput[] = [
+        leg(INVEST_STOCKS, "debit", principal.toFixed(2), row),
+        leg(cash, "credit", amount, row),
+      ];
+      if (!fee.isZero()) {
+        if (fee.gt(0)) {
+          lines.push(leg(FEE_EXPENSE, "debit", fee.toFixed(2), row));
+        } else {
+          lines.push(leg(FEE_EXPENSE, "credit", fee.negated().toFixed(2), row));
+        }
+      }
       return {
         ok: true,
-        note: "buy (fees capitalized)",
+        note: "buy (principal + fee split)",
         entry: {
           entryDate: row.transactionDate,
           description: descriptionFor(row),
           sourceType: "STATEMENT",
           sourceDocumentId: row.sourceDocumentId,
           sourceTransactionId: row.transactionId,
-          lines: [
-            leg(INVEST_STOCKS, "debit", amount, row),
-            leg(cash, "credit", amount, row),
-          ],
+          lines,
         },
       };
     }
@@ -371,19 +440,72 @@ export function postCapitalRow(row: ValidatedCapitalRow): CapitalPostingResult {
 
   if (category === "expense") {
     const cash = cashAccountFor(row.currency);
+    // R4 fees: monthly fee/VAT summary rows flagged by the parser
+    // (isMonthlyFeeAggregate) aggregate every trade's commission and VAT for the
+    // whole month PER CURRENCY. Those fees are ALREADY in the per-trade
+    // postings (the BUY fee leg and the SELL netted proceeds), so posting the
+    // aggregate again would double-count the fee AND charge broker cash twice.
+    // Record the row as SKIPPED — amounts preserved for the archive, never
+    // posted to GL.
+    //
+    // The skip keys on the DETERMINISTIC parser provenance flag, NOT a
+    // section-name match: a genuine standalone broker fee (same fee section
+    // label, flag FALSE) is NOT skipped and posts as a real expense.
+    //
+    // TRI-STATE semantics (migration 0027):
+    //   TRUE  -> the row is a parser monthly aggregate: SKIPPED (no lines).
+    //   FALSE -> confirmed standalone fee: posted once (below).
+    //   NULL  -> legacy / unknown pre-0027 provenance: the parser emitted an
+    //            IDENTICAL persisted shape for aggregates AND genuine standalone
+    //            fees, so we cannot prove which this is. Posting it risks
+    //            double-counting the fee, so it is SKIPPED (no lines) with an
+    //            explicit reason. The flag is NEVER fabricated into a confirmed
+    //            false — every read/rebuild keeps the stored null so the
+    //            provenance stays visibly unknown. Delete + re-import of the
+    //            original statement is the ONLY supported way to obtain a
+    //            deterministic TRUE/FALSE for a legacy row.
+    if (row.isMonthlyFeeAggregate === true) {
+      return {
+        ok: false,
+        reason:
+          "monthly fee/VAT summary row - fees already in the trade postings (BUY fee leg / SELL net proceeds)",
+      };
+    }
+    if (row.isMonthlyFeeAggregate == null) {
+      return {
+        ok: false,
+        reason:
+          "legacy fee provenance unknown - re-import required for deterministic classification",
+      };
+    }
+    // R4 negative-fee/rebate: a NEGATIVE standalone expense amount is a broker
+    // rebate returning money to the account (the pipeline preserves the parser
+    // sign for expense rows). Post it as the contra-expense — Dr cash |amount|
+    // / Cr fee |amount| — NOT as a fee debit (that would post an expense for
+    // money received). Leg amounts stay POSITIVE because validateJournalEntry
+    // and the journal_entry_lines debit/credit CHECKs forbid non-positive
+    // line amounts. A positive amount keeps the regular Dr fee / Cr cash.
+    const signed = new Decimal(amount);
+    const isRebate = signed.isNegative();
+    const magnitude = signed.abs().toFixed(2);
     return {
       ok: true,
-      note: "expense",
+      note: isRebate ? "expense rebate (contra-expense)" : "expense",
       entry: {
         entryDate: row.transactionDate,
         description: descriptionFor(row),
         sourceType: "STATEMENT",
         sourceDocumentId: row.sourceDocumentId,
         sourceTransactionId: row.transactionId,
-        lines: [
-          leg(expenseAccountFor(row), "debit", amount, row),
-          leg(cash, "credit", amount, row),
-        ],
+        lines: isRebate
+          ? [
+              leg(cash, "debit", magnitude, row),
+              leg(expenseAccountFor(row), "credit", magnitude, row),
+            ]
+          : [
+              leg(expenseAccountFor(row), "debit", amount, row),
+              leg(cash, "credit", amount, row),
+            ],
       },
     };
   }

@@ -178,6 +178,7 @@ export interface PersistedJournalEntry {
     fxRateEffective: string | null;
     fxRateStatement: string | null;
     isFxConversion: boolean;
+    isMonthlyFeeAggregate: boolean | null;
   };
   lines: PersistedJournalLine[];
 }
@@ -332,6 +333,7 @@ export async function createJournalEntry(
           exchangeFromCurrency: entry.detail.exchangeFromCurrency,
           exchangeFromAmount: entry.detail.exchangeFromAmount,
           exchangeRate: entry.detail.exchangeRate,
+          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
           createdAt: now,
@@ -470,6 +472,7 @@ function manualCashDetail(
     exchangeFromCurrency: null,
     exchangeFromAmount: null,
     exchangeRate: null,
+    isMonthlyFeeAggregate: false,
   };
 }
 
@@ -555,6 +558,7 @@ export async function insertManualCashJournal(
           exchangeFromCurrency: entry.detail.exchangeFromCurrency,
           exchangeFromAmount: entry.detail.exchangeFromAmount,
           exchangeRate: entry.detail.exchangeRate,
+          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
           type: input.type,
@@ -678,6 +682,7 @@ export async function insertBackfilledJournalEntry(
           exchangeFromCurrency: entry.detail.exchangeFromCurrency,
           exchangeFromAmount: entry.detail.exchangeFromAmount,
           exchangeRate: entry.detail.exchangeRate,
+          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
           type: input.type,
@@ -755,6 +760,7 @@ export async function syncCapitalLedgerJournal(
         realizedGainLossThb: detail.realizedGainLossThb,
         averageCost: detail.averageCost,
         isFxConversion: detail.isFxConversion,
+        isMonthlyFeeAggregate: detail.isMonthlyFeeAggregate,
         updatedAt: new Date().toISOString(),
       })
       .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
@@ -1039,6 +1045,8 @@ export async function insertStatementImport(
           exchangeFromCurrency: row.exchangeFromCurrency,
           exchangeFromAmount: row.exchangeFromAmount,
           exchangeRate: row.exchangeRate,
+          isMonthlyFeeAggregate:
+            row.isMonthlyFeeAggregate == null ? null : row.isMonthlyFeeAggregate === true,
         })
         .execute();
       transactionIds.push(row.transactionId);
@@ -1085,6 +1093,7 @@ export async function insertStatementImport(
           exchangeFromCurrency: entry.detail.exchangeFromCurrency,
           exchangeFromAmount: entry.detail.exchangeFromAmount,
           exchangeRate: entry.detail.exchangeRate,
+          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
           type: plan.row.type,
@@ -1250,6 +1259,7 @@ interface RawLineWithEntry {
     fxRateEffective: string | null;
     fxRateStatement: string | null;
     isFxConversion: boolean;
+    isMonthlyFeeAggregate: boolean | null;
   };
 }
 
@@ -1301,6 +1311,7 @@ async function selectRawLines(conditions: (SQL | undefined)[]) {
         fxRateEffective: journalEntries.fxRateEffective,
         fxRateStatement: journalEntries.fxRateStatement,
         isFxConversion: journalEntries.isFxConversion,
+        isMonthlyFeeAggregate: journalEntries.isMonthlyFeeAggregate,
       },
     })
     .from(journalEntryLines)
@@ -1359,6 +1370,7 @@ function toPersistedEntry(
         fxRateEffective: entry.fxRateEffective,
         fxRateStatement: entry.fxRateStatement,
         isFxConversion: entry.isFxConversion,
+        isMonthlyFeeAggregate: entry.isMonthlyFeeAggregate,
       },
       lines: lines.map((l) => {
         const acc = accountMap[l.accountId];
@@ -1469,6 +1481,7 @@ async function fetchJournalHeaders(
       fxRateEffective: journalEntries.fxRateEffective,
       fxRateStatement: journalEntries.fxRateStatement,
       isFxConversion: journalEntries.isFxConversion,
+      isMonthlyFeeAggregate: journalEntries.isMonthlyFeeAggregate,
     })
     .from(journalEntries)
     .where(and(...conditions))

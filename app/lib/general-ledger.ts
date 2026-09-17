@@ -167,6 +167,10 @@ export interface JournalTradeDetail {
   exchangeFromCurrency: string | null;
   exchangeFromAmount: string | null;
   exchangeRate: string | null;
+  // R4: monthly-fee-aggregate provenance, tri-state (true = parser monthly
+  // aggregate -> SKIPPED, false = confirmed standalone fee, null = legacy /
+  // unknown pre-0027 provenance). null is NEVER fabricated into false.
+  isMonthlyFeeAggregate: boolean | null;
 }
 
 /** All-null trade detail (the default for manual / non-trade entries). */
@@ -196,6 +200,7 @@ export function emptyTradeDetail(): JournalTradeDetail {
     exchangeFromCurrency: null,
     exchangeFromAmount: null,
     exchangeRate: null,
+    isMonthlyFeeAggregate: false,
   };
 }
 
@@ -375,6 +380,7 @@ export function validateJournalEntry(
     exchangeFromCurrency: d.exchangeFromCurrency != null ? String(d.exchangeFromCurrency) : null,
     exchangeFromAmount: d.exchangeFromAmount != null ? String(d.exchangeFromAmount) : null,
     exchangeRate: d.exchangeRate != null ? String(d.exchangeRate) : null,
+    isMonthlyFeeAggregate: d.isMonthlyFeeAggregate == null ? null : Boolean(d.isMonthlyFeeAggregate),
   };
 
   return {
