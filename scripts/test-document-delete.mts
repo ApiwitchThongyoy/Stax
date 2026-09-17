@@ -263,6 +263,93 @@ for (const [name, src] of [
   );
 }
 
+// Execute the actual component handlers with a minimal hook/JSX harness.
+// Network, auth and IndexedDB are stubbed; deletion coordination is real.
+// Native dialog focus/layout is left to the browser, not simulated here.
+{
+  const ts = await import("typescript");
+  const { runInNewContext } = await import("node:vm");
+  const slots: any[] = [];
+  let cursor = 0;
+  let calls = 0;
+  let refreshes = 0;
+  let response = deferred<Response>();
+  const fixture = { id: "modal-doc", originalName: 'Statement "ไทย" <2026>.pdf', createdAt: "2026-01-01", fileSize: 10 };
+  const jsx = (type: any, props: any) => ({ type, props });
+  const react = {
+    useState(initial: any) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = initial;
+      return [slots[index], (value: any) => { slots[index] = typeof value === "function" ? value(slots[index]) : value; }];
+    },
+    useRef(initial: any) {
+      const index = cursor++;
+      return slots[index] ??= { current: initial };
+    },
+    useEffect() {},
+  };
+  const exported: any = {};
+  runInNewContext(ts.transpileModule(archive, { compilerOptions: {
+    module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX,
+  } }).outputText, {
+    exports: exported,
+    require(name: string) {
+      if (name === "react") return react;
+      if (name === "react/jsx-runtime") return { jsx, jsxs: jsx };
+      if (name === "lucide-react") return {};
+      if (name.endsWith("/auth")) return { useAuth: () => ({ user: { id: "test", accessToken: "test" } }) };
+      if (name.endsWith("/document-delete")) return { InFlightDeletionGuard, classifyDeleteDocumentResponse };
+      if (name.endsWith("/Documentstorage")) return { getLocalDocumentByName: async () => null };
+      if (name.endsWith("/server-api")) return { fetchUserDocuments: async () => [] };
+      throw new Error(`Unexpected import ${name}`);
+    },
+    fetch: () => { calls++; return response.promise; },
+  });
+  const render = () => { cursor = 0; return exported.default({ onDocumentDeleted: () => { refreshes++; } }); };
+  function nodes(tree: any): any[] {
+    if (!tree || typeof tree !== "object") return [];
+    if (Array.isArray(tree)) return tree.flatMap(nodes);
+    return [tree, ...nodes(tree.props?.children)];
+  }
+  const find = (tree: any, predicate: (node: any) => boolean) => nodes(tree).find(predicate);
+  render();
+  // Seed the documents/loading/folder hooks instead of running the mount fetch.
+  slots[0] = [{ ...fixture, fileName: fixture.originalName, uploadedAt: fixture.createdAt, size: fixture.fileSize }];
+  slots[1] = false;
+  const folderIndex = slots.findIndex(value => Object.prototype.toString.call(value) === "[object Set]" && value !== slots[2]);
+  slots[folderIndex] = new Set(["2026/01"]);
+  const trash = (tree: any) => find(tree, node => node.props?.["aria-label"] === "ลบไฟล์");
+  const cancel = (tree: any) => find(tree, node => node.type === "button" && node.props.children === "ยกเลิก");
+  const confirm = (tree: any) => find(tree, node => node.type === "button" && ["ลบเอกสาร", "กำลังลบ..."].includes(node.props.children));
+  trash(render()).props.onClick();
+  let tree = render();
+  ok(calls === 0 && slots.includes(slots[0][0]), "opening confirmation sends zero DELETE requests");
+  ok(find(tree, node => node.props?.id === "statement-delete-message").props.children.includes(fixture.originalName), "confirmation renders the actual filename as text");
+  cancel(tree).props.onClick();
+  ok(calls === 0, "cancel confirmation sends zero DELETE requests");
+  trash(render()).props.onClick();
+  tree = render();
+  const first = confirm(tree).props.onClick();
+  const repeated = confirm(tree).props.onClick();
+  tree = render();
+  ok(calls === 1, "rapid confirmation clicks send exactly one DELETE");
+  ok(confirm(tree).props.disabled && cancel(tree).props.disabled
+    && find(tree, node => node.props?.["aria-label"] === "กำลังลบไฟล์").props.disabled,
+    "confirm, cancel and row delete are disabled during DELETE");
+  response.resolve(new Response(null, { status: 200 }));
+  await Promise.all([first, repeated]);
+  ok(refreshes === 1, "successful confirmed deletion refreshes the parent once");
+  // A failure retains the document and surfaces the existing error message.
+  slots[0] = [{ ...fixture, fileName: fixture.originalName, uploadedAt: fixture.createdAt, size: fixture.fileSize }];
+  response = deferred<Response>();
+  trash(render()).props.onClick();
+  const failedDelete = confirm(render()).props.onClick();
+  response.resolve(new Response(null, { status: 500 }));
+  await failedDelete;
+  ok(slots[0].length === 1 && slots[3].length > 0 && refreshes === 1,
+    "failed confirmed deletion retains the row and existing error handling");
+}
+
 // The old single-global-flag guard that blocked ALL rows is gone from the archive
 // (it disabled every delete button whenever any delete was in flight).
 ok(

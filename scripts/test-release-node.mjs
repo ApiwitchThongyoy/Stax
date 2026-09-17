@@ -97,6 +97,17 @@ try {
     check((await request(path)).status === 200, `HTTP ${path} works`);
   }
   check((await request("admin/users")).status === 403, "HTTP USER cannot read admin users");
+  for (const endpoint of ["admin/documents", "admin/stats", "admin/audit-logs"]) {
+    check((await request(endpoint)).status === 403, `HTTP USER denied ${endpoint}`);
+  }
+  for (const endpoint of ["admin/users", "admin/documents", "admin/stats", "admin/audit-logs"]) {
+    check((await request(endpoint, "GET", undefined, false)).status === 401, `HTTP anonymous denied ${endpoint}`);
+  }
+
+  const financialPaths = ["capital-ledgers", "ledger/summary", "cash-summary", "cost-basis", "trading-journal",
+    "reports/trial-balance", "reports/income-statement", "reports/balance-sheet"];
+  const beforeStatement = new Map();
+  for (const endpoint of financialPaths) beforeStatement.set(endpoint, JSON.stringify(await request(endpoint)));
 
   const pdf = statementPdf();
   for (const [bytes, name, type] of [[pdf, "bad.txt", "application/pdf"], [pdf, "bad.pdf", "text/plain"],
@@ -135,13 +146,46 @@ try {
   check((await postPdf("upload", pdf)).body.data.existingDocumentId === documentId, "HTTP duplicate returns existing document");
   check((await request("portfolio/HTTPSMOKE")).status === 200, "HTTP imported symbol portfolio works");
   const [storedDoc] = await sql`SELECT file_path FROM documents WHERE id=${documentId} AND user_id=${userId}`;
+  const importedEntries = await sql`SELECT id FROM journal_entries WHERE user_id=${userId} AND source_document_id=${documentId}`;
+  const importedLines = await sql`SELECT id FROM journal_entry_lines WHERE user_id=${userId} AND journal_entry_id IN ${sql(importedEntries.map(row => row.id))}`;
+  check(importedEntries.length === imported.body.data.saved && importedLines.length > 0, "HTTP import creates complete journal dataset");
   check((await request(`documents/${documentId}`, "DELETE")).status === 200, "HTTP document delete succeeds");
+  await sql`UPDATE "User" SET role='ADMIN' WHERE id=${userId}`;
+  try {
+    const audits = await request("admin/audit-logs?limit=200");
+    const deletion = audits.body.data?.find(row => row.action === "STATEMENT_DELETE" && row.entityId === documentId);
+    check(audits.status === 200 && deletion?.details.originalName === "http-smoke.pdf", "HTTP admin audit exposes deleted originalName");
+    check(deletion && JSON.stringify(Object.keys(deletion.details).sort()) === JSON.stringify(["method", "originalName", "result", "route"]), "HTTP deletion audit never includes filePath");
+    const adminDocs = await request("admin/documents");
+    check(adminDocs.status === 200 && !adminDocs.body.data.some(row => row.id === documentId), "HTTP reloaded admin documents excludes deletion");
+    const stats = await request("admin/stats");
+    const [actual] = await sql`SELECT count(*)::int AS total FROM documents`;
+    check(stats.status === 200 && stats.body.data.documents.total === actual.total, "HTTP reloaded admin stats matches remaining documents");
+    check((await request("admin/documents", "DELETE")).status === 405, "HTTP admin documents has no delete capability");
+    check((await request(`admin/users/${userId}`, "PATCH", { status: "SUSPENDED" })).status === 400, "HTTP ADMIN account cannot be suspended");
+    check((await request(`admin/users/${userId}`, "PATCH", { status: "ACTIVE" })).status === 400, "HTTP ADMIN account cannot be reactivated through USER endpoint");
+  } finally {
+    await sql`UPDATE "User" SET role='USER' WHERE id=${userId}`;
+  }
   const remains = await access(path.resolve("storage/statements", storedDoc.file_path)).then(() => true, error => {
     if (error.code === "ENOENT") return false; throw error;
   });
   check(!remains, "HTTP document delete removes stored PDF");
   check((await sql`SELECT transaction_id FROM "Capital_Transactions" WHERE source_document_id=${documentId}`).length === 0, "document delete removes linked transactions");
   check((await request(`documents/${documentId}/transactions`)).status === 404, "deleted document is safely missing");
+  check((await sql`SELECT id FROM journal_entries WHERE user_id=${userId} AND id IN ${sql(importedEntries.map(row => row.id))}`).length === 0, "HTTP deletion removes statement journal entries");
+  check((await sql`SELECT id FROM journal_entry_lines WHERE user_id=${userId} AND id IN ${sql(importedLines.map(row => row.id))}`).length === 0, "HTTP deletion removes statement journal lines");
+  for (const endpoint of financialPaths) {
+    check(JSON.stringify(await request(endpoint)) === beforeStatement.get(endpoint), `HTTP ${endpoint} excludes deleted statement`);
+  }
+  check((await request("portfolio/HTTPSMOKE")).status === 404, "HTTP deleted symbol portfolio is gone");
+  const reimport = await postPdf("upload", pdf);
+  check(reimport.status === 200 && reimport.body.data.documentId !== documentId && reimport.body.data.saved === imported.body.data.saved, "HTTP re-import creates one fresh dataset");
+  check((await sql`SELECT id FROM journal_entries WHERE user_id=${userId} AND source_document_id IS NOT NULL`).length === importedEntries.length, "HTTP re-import never doubles journal data");
+  check((await sql`SELECT transaction_id FROM "Capital_Transactions" WHERE user_id=${userId} AND source_document_id IS NOT NULL`).length === imported.body.data.saved, "HTTP re-import never doubles capital data");
+  check((await sql`SELECT id FROM journal_entry_lines WHERE user_id=${userId} AND journal_entry_id IN
+    (SELECT id FROM journal_entries WHERE user_id=${userId} AND source_document_id=${reimport.body.data.documentId})`).length === importedLines.length,
+    "HTTP re-import has exactly one fresh set of posting lines");
   console.log(`Node production smoke: ${count} PASS / 0 FAIL`);
 } finally {
   // Also recover the fixture if an assertion failed immediately after register.

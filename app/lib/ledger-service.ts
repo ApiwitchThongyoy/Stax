@@ -12,6 +12,7 @@ import { assertOwnedReferences } from "./resource-ownership";
 import { safeErrorLog } from "./safe-error-log";
 import {
   accounts,
+  corporateActions,
   capitalTransactions,
   journalEntries,
   journalEntryLines,
@@ -36,7 +37,7 @@ import {
   type ValidatedJournalEntry,
 } from "./general-ledger";
 import { buildStatementJournalEntries } from "./posting-engine";
-import type { ValidatedCapitalRow } from "./statement-pipeline";
+import { recomputeAllGainLoss, recomputeCostBasisMap, saveCostBasisState, type CostBasisActionRow, type ValidatedCapitalRow } from "./statement-pipeline";
 
 Decimal.set({ precision: 40 });
 
@@ -1127,6 +1128,79 @@ export async function insertStatementImport(
 }
 
 // ---------------------------------------------------------------------------
+// Reconcile statement-derived state inside the caller's deletion transaction.
+// Reuse the parser's replay and posting engines; failures roll back deletion.
+export async function reconcileStatementDeletion(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  userId: string,
+  affectedSymbols: Set<string>,
+): Promise<void> {
+  const rows = await tx.select().from(capitalTransactions)
+    .where(eq(capitalTransactions.userId, userId))
+    .orderBy(capitalTransactions.transactionDate, capitalTransactions.transactionId);
+  const actions = await tx.select().from(corporateActions)
+    .where(eq(corporateActions.userId, userId)) as CostBasisActionRow[];
+  // A parent position can contribute basis to a renamed/spun-off child.
+  for (let i = 0; i < actions.length; i++) {
+    for (const action of actions) {
+      if (affectedSymbols.has(action.symbol) && action.newSymbol) affectedSymbols.add(action.newSymbol);
+    }
+  }
+  const { updates } = recomputeAllGainLoss(rows, actions);
+  const gains = new Map(updates.map(update => [update.transactionId, update.update]));
+  const accountRows = await tx.select().from(accounts).where(eq(accounts.userId, userId));
+  const lookup = new Map<string, ResolvedAccount>();
+  for (const account of accountRows) {
+    lookup.set(account.id, account);
+    lookup.set(account.code, account);
+  }
+  for (const row of rows) {
+    if (row.sourceType !== "AI_PARSED" || row.side !== "SELL" || !row.symbol || !affectedSymbols.has(row.symbol)) continue;
+    // A deleted BUY can make an already-computed SELL non-computable. The
+    // hole-only backfill cannot clear these stale values.
+    const update = gains.get(row.transactionId) ?? {
+      costBasis: null, proceeds: row.proceeds, realizedGainLoss: null, realizedGainLossThb: null,
+    };
+    const changed = Object.entries(update).some(([key, value]) => {
+      const old = row[key as keyof typeof update];
+      return old === null || value === null ? old !== value : !new Decimal(old).eq(value);
+    });
+    if (!changed) continue;
+    await tx.update(capitalTransactions).set(update).where(and(
+      eq(capitalTransactions.userId, userId), eq(capitalTransactions.transactionId, row.transactionId)));
+    const [plan] = buildStatementJournalEntries([{ ...row, ...update } as ValidatedCapitalRow]);
+    const resolved = resolveEntryAccountIds(plan.entry, lookup);
+    if (!resolved.ok) throw new Error("Cannot reconcile statement accounts");
+    const validated = validateJournalEntry({ ...plan.entry, lines: resolved.lines });
+    if (!validated.ok || currencyMismatchErrors(validated.entry, lookup).length) {
+      throw new Error("Cannot reconcile statement journal");
+    }
+    const entry = validated.entry;
+    const linked = await tx.select().from(journalEntries).where(and(
+      eq(journalEntries.userId, userId), eq(journalEntries.sourceType, "STATEMENT"),
+      eq(journalEntries.sourceTransactionId, row.transactionId)));
+    for (const journal of linked) {
+      await tx.delete(journalEntryLines).where(and(eq(journalEntryLines.userId, userId),
+        eq(journalEntryLines.journalEntryId, journal.id)));
+      await tx.update(journalEntries).set({
+        ...update, averageCost: entry.detail.averageCost,
+        postingState: entry.postingState, skipReason: entry.skipReason, updatedAt: new Date().toISOString(),
+      }).where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, journal.id)));
+      for (const line of entry.lines) {
+        await tx.insert(journalEntryLines).values({
+          id: randomUUID(), userId, journalEntryId: journal.id, accountId: line.accountId,
+          currency: line.currency, debitAmount: line.side === "DEBIT" ? line.amount : null,
+          creditAmount: line.side === "CREDIT" ? line.amount : null, amountThb: line.amountThb,
+          fxRateEffective: line.fxRateEffective, fxRateStatement: line.fxRateStatement,
+          fxRateProvider: line.fxRateProvider, memo: line.memo,
+        });
+      }
+    }
+  }
+  const basis = recomputeCostBasisMap(rows, actions);
+  await saveCostBasisState(userId, basis, tx);
+}
+
 // Reads + reports
 // ---------------------------------------------------------------------------
 

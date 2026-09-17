@@ -377,9 +377,10 @@ export async function loadCostBasisState(userId: string): Promise<CostBasisMap> 
  */
 export async function saveCostBasisState(
   userId: string,
-  map: CostBasisMap
+  map: CostBasisMap,
+  connection: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0] = db,
 ): Promise<void> {
-  await db.transaction(async (tx) => {
+  await connection.transaction(async (tx) => {
     await tx
       .delete(costBasisState)
       .where(eq(costBasisState.userId, userId))

@@ -36,6 +36,86 @@ September 18 Node backend handoff: [setup, release checks, and tester checklist]
 - **ราคาหุ้นรายวัน** — ดึงราคาปิดอัตโนมัติ (cron) แสดงมูลค่าตลาดแบบ display-only
 - **Admin** — จัดการผู้ใช้, สถิติ, เอกสารทั้งหมด, ประวัติกิจกรรม
 
+### Backend ที่ทำเสร็จแล้ว
+
+  Backend ของ STAX พัฒนาด้วย **Node.js / React Router, PostgreSQL และ Drizzle ORM**
+
+- **Authentication และสิทธิ์ผู้ใช้**
+  - สมัครสมาชิกและเข้าสู่ระบบด้วย JWT
+  - รองรับสิทธิ์ `USER` และ `ADMIN`
+  - ผู้ใช้ที่ถูกระงับ (Suspended) ไม่สามารถใช้งานระบบได้
+  - มี Rate Limit ป้องกันการ Login/Register ถี่เกินไป
+
+- **ความปลอดภัยของข้อมูลผู้ใช้**
+  - ข้อมูลของผู้ใช้แต่ละคนถูกแยกออกจากกัน
+  - User A ไม่สามารถอ่าน แก้ไข หรือลบข้อมูลของ User B ได้
+  - API สำหรับผู้ดูแลระบบอนุญาตเฉพาะบัญชี `ADMIN`
+
+- **Statement PDF**
+  - อัปโหลดและวิเคราะห์ Statement PDF
+  - ตรวจสอบชนิด ขนาด และความถูกต้องของไฟล์ก่อนนำเข้าระบบ
+  - ป้องกันการ Import Statement เดิมซ้ำ
+  - บันทึกเอกสารและธุรกรรมที่อ่านได้ลงฐานข้อมูล
+  - ดาวน์โหลดและลบ Statement ของตนเองได้
+  - เมื่อลบ Statement ข้อมูลทางการเงินที่สร้างจากเอกสารนั้นจะถูกลบและคำนวณใหม่ให้ถูกต้อง
+  - ไฟล์ PDF ที่เสียหรืออ่านไม่ได้จะไม่ทิ้งข้อมูลที่ไม่สมบูรณ์ไว้ในระบบ
+
+- **ระบบบัญชีและการลงทุน**
+  - Capital Transactions
+  - Double-entry Accounting
+  - Journal Entry และ Reverse Journal
+  - General Ledger
+  - Cash Summary
+  - Cost Basis
+  - Portfolio แยกตาม Symbol
+  - Corporate Actions
+  - Trading Journal
+  - ตรวจสอบให้ Debit และ Credit สมดุล
+
+- **รายงานทางการเงิน**
+  - Trial Balance
+  - Income Statement
+  - Balance Sheet
+  - ข้อมูลรายงานคำนวณจาก Backend เพื่อให้แต่ละหน้าของระบบใช้ข้อมูลจากแหล่งเดียวกัน
+
+- **Daily Stock Price**
+  - ดึงและจัดเก็บราคาหุ้นรายวัน
+  - Cache ราคาเพื่อลดการเรียก Provider ซ้ำ
+  - รองรับการใช้ข้อมูลเดิมเมื่อ Provider ขัดข้อง
+  - ป้องกันข้อมูลราคาซ้ำของ Symbol และวันที่เดียวกัน
+  - รองรับการ Refresh หลาย Symbol แม้บาง Symbol จะเกิดข้อผิดพลาด
+  - ADMIN สามารถสั่ง Refresh ราคาได้
+
+- **Stock Price Cron**
+  - มี API สำหรับอัปเดตราคาหุ้นอัตโนมัติ
+  - ป้องกัน Cron Endpoint ด้วย `CRON_SECRET`
+  - USER ทั่วไปไม่สามารถสั่ง Refresh ราคาหุ้นได้
+
+- **Database**
+  - ใช้ PostgreSQL และ Drizzle ORM
+  - มี Database Migration สำหรับสร้างฐานข้อมูลใหม่ตั้งแต่ต้น
+  - ใช้ Constraints ป้องกันข้อมูลผิดรูปแบบ
+  - รองรับข้อมูลเดิมโดยไม่ทำให้ Legacy Data เสียหาย
+
+- **Security และ Data Integrity**
+  - ป้องกัน Cross-user Data Access / IDOR
+  - ป้องกัน Duplicate Statement
+  - ป้องกัน Concurrent Registration
+  - ใช้ PostgreSQL Rate Limit รองรับการทำงานแบบ Serverless
+  - Error และ Log ไม่แสดง Secret หรือข้อมูลสำคัญ
+
+- **Testing และ CI**
+  - Backend / Unit Tests
+  - Database Integration Tests
+  - User Isolation Tests
+  - Statement Import/Delete Tests
+  - Stock Price และ Cron Tests
+  - Production Node HTTP Smoke Tests
+  - Fresh PostgreSQL Migration Tests
+  - TypeScript Typecheck และ Production Build
+  - GitHub Actions ตรวจสอบ Backend และ Database ก่อน Merge เข้า `main`
+
+
 หลักการสำคัญ: ตัวเลขการเงินทั้งหมดคำนวณฝั่ง server หน้าบ้านแสดงค่าตามที่ server ส่งมาเท่านั้น
 (ไม่คำนวณ P&L/FX ใหม่ใน React)
 

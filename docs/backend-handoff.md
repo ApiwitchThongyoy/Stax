@@ -83,7 +83,12 @@ can then occur; live Gemini requires an explicitly configured test key.
   authority. Valid but unsupported text PDFs may be archived with zero imported rows.
 - Reject invalid extension/MIME/header, files above 20 MB, corrupt/textless PDFs.
   List documents, inspect transactions, download original bytes, duplicate, delete,
-  and rebuild after derived-row deletion. Extraction/storage-write failures leave
+  and rebuild after derived-row deletion. After deleting a statement, verify its
+  capital rows AND journal entries/lines disappear, financial views return to their
+  pre-import values, and re-import creates exactly one fresh dataset. Manual rows,
+  other statements and other users must remain. Deleting a supporting BUY also
+  reconciles any remaining SELL's basis, gain/loss and report posting lines.
+  Extraction/storage-write failures leave
   no document rows. The final check fixed extraction errors leaving archived files.
 - Capital transactions, accounts, balanced journal create/reversal, account ledger,
   ledger/cash summaries, cost basis, symbol portfolio, corporate actions, and notes.
@@ -95,8 +100,16 @@ can then occur; live Gemini requires an explicitly configured test key.
 - HTTP smoke additionally covers root, settings, notifications, journal reversal,
   PDF persistence/download/delete and simulated local storage-write failure.
 
-Verification: 25/25 migrations; `test:w2` **487 PASS / 0 FAIL**; built Node HTTP
-smoke **51 PASS / 0 FAIL**. All 20 `npm test` suites, typecheck, build, Drizzle
+Verification after the deletion confirmation/audit and Admin review: 25/25 migrations;
+`test:w2` **532 PASS / 0 FAIL**; built Node HTTP smoke **81 PASS / 0 FAIL**.
+Archive trash now opens an in-app Thai confirmation with the actual filename and
+derived-financial-data warning. Cancel sends no DELETE; confirm sends one, retaining
+the existing in-flight guard, error handling and parent refresh. Successful delete
+audit details include originalName and exclude filePath. Admin review required no
+Admin changes: protected APIs, USER-only status updates, deletion audit visibility,
+reloaded documents/stats and no Admin delete capability were verified. Component
+handler tests cover confirmation behavior; browser visual QA was unavailable.
+All 20 `npm test` suites, typecheck, build, Drizzle
 check and whitespace check passed. No production services were used.
 
 ## Non-blocking follow-ups
@@ -108,6 +121,9 @@ check and whitespace check passed. No production services were used.
 - Vercel adapter/deployment compatibility is outside this Node handoff.
 - Physical file deletion after DB commit is best-effort: storage deletion failure
   can leave an orphan file for manual cleanup; it does not resurrect financial rows.
+- The deletion fix applies to documents that still exist. Journal data orphaned by
+  deletions performed before this fix needs a separately reviewed repair; this check
+  does not modify existing development/production data.
 - Live Gemini/Supabase/provider connectivity was not tested. Optional live AI uses
   a tester-supplied key; deterministic imports and release tests require none.
 - Previously documented same-user concurrent reversal and legacy data repair work

@@ -3768,6 +3768,9 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
   await runUserIsolationTests(client, ok, makePdf, tokenAd);
 
   // ================= CLEANUP =================
+  const { runStatementDeleteTests } = await import("./statement-delete-db.mjs");
+  await runStatementDeleteTests(client, ok, makePdf);
+
   console.log("\n=== CLEANUP ===");
   const cleanIds: string[] = [];
   if (userBTxnId) cleanIds.push(userBTxnId);
