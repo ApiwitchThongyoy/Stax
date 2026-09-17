@@ -365,6 +365,52 @@ async function main() {
     ...overrides,
   });
 
+  // R2/R8: zero gain is computable; an absent basis never becomes proceeds.
+  const zeroSell = baseRow({ category: "asset", side: "SELL", amountForeign: "1000.00",
+    costBasis: "1000.00", realizedGainLoss: "0.00", realizedGainLossThb: "0.00" });
+  const zeroPlan = buildStatementJournalEntries([zeroSell])[0];
+  ok(zeroPlan.postingState === "POSTED" && zeroPlan.entry.lines.length === 2 &&
+    zeroPlan.entry.lines.some(l => l.accountId === "1020" && l.debit === "1000.00") &&
+    zeroPlan.entry.lines.some(l => l.accountId === "1110" && l.credit === "1000.00"),
+    "R2: zero-gain SELL posts cash/investment only, no zero gain leg");
+  const missingPlan = buildStatementJournalEntries([{ ...zeroSell, costBasis: null }])[0];
+  ok(missingPlan.postingState === "SKIPPED" && missingPlan.entry.lines.length === 0 &&
+    missingPlan.entry.detail?.costBasis === null && missingPlan.entry.detail?.realizedGainLoss === null &&
+    missingPlan.entry.detail?.realizedGainLossThb === null && !!missingPlan.reason?.includes("NON_COMPUTABLE"),
+    "R8: missing basis stays visible with null gains, zero lines and explicit reason");
+
+  const conflicting = validateJournalEntry({
+    entryDate: "2026-01-15", description: "R5 conflicting THB",
+    detail: { currency: "USD", amount: "10.005", fxRateEffective: "35.42", amountThb: "999" },
+    lines: [
+      { accountId: "1020", currency: "USD", debit: "10.005", fxRateEffective: "35.42", amountThb: "999" },
+      { accountId: "3010", currency: "USD", credit: "10.005", fxRateEffective: "35.42", amountThb: "888" },
+    ],
+  });
+  ok(conflicting.ok && conflicting.entry.lines.every(l => l.amount === "10.01" && l.amountThb === "354.55") &&
+    conflicting.entry.detail.amountThb === "354.55",
+    "R5: server derives header and line THB from native cents, overriding conflicting input");
+  const roundingEdge = validateJournalEntry({
+    entryDate: "2026-01-15", description: "R5 raw balance is insufficient",
+    lines: [
+      { accountId: "1020", currency: "THB", debit: "0.005" },
+      { accountId: "1020", currency: "THB", debit: "0.005" },
+      { accountId: "3010", currency: "THB", credit: "0.010" },
+    ],
+  });
+  ok(!roundingEdge.ok && roundingEdge.errors.some(e => e.includes("does not balance")),
+    "R5: raw .005 + .005 = .010 rejected because persisted .01 + .01 != .01");
+  const thbEdge = validateJournalEntry({
+    entryDate: "2026-01-15", description: "R5 converted cents must balance",
+    lines: [
+      { accountId: "1020", currency: "USD", debit: "0.01", fxRateEffective: "35.42" },
+      { accountId: "1020", currency: "USD", debit: "0.01", fxRateEffective: "35.42" },
+      { accountId: "3010", currency: "USD", credit: "0.02", fxRateEffective: "35.42" },
+    ],
+  });
+  ok(!thbEdge.ok && thbEdge.errors.some(e => e.includes("THB does not balance")),
+    "R5: native-balanced entry rejected when THB .35 + .35 != .71");
+
   // Dividend income (no symbol) -> dividend account, memo carries the ticker.
   const div = postCapitalRow(baseRow({}));
   ok(div.ok && div.entry.lines.length === 2, "dividend income posts two legs");
@@ -456,7 +502,7 @@ async function main() {
       realizedGainLoss: null,
     })
   );
-  ok(sellNoBasis.ok && sellNoBasis.entry.description === "ขาย EOSE 3 @ 10.4 USD", "non-computable SELL keeps the bare ขาย … wording");
+  ok(!sellNoBasis.ok && sellNoBasis.reason.includes("NON_COMPUTABLE"), "non-computable SELL is explicitly skipped without a fake basis");
 
   // ---- Per-stock memo summary (dividend "เงินปันผล" by ticker) ------------
   const summarized = summarizeLinesBySymbol([
@@ -573,7 +619,7 @@ async function main() {
         d.netAmount === "363.70" &&
         d.currency === "USD" &&
         d.amount === "363.80" &&
-        d.amountThb === "3500.00",
+        d.amountThb === "12733.00",
       "POSTED detail carries grossAmount/fees/netAmount/currency/amount/amountThb"
     );
     ok(
@@ -1213,8 +1259,8 @@ async function main() {
   ok(
     sSell !== undefined &&
       sSell.netAmount === "1189" &&
-      sSell.costBasis === "1000" &&
-      sSell.realizedGainLoss === "189" &&
+      sSell.costBasis === "1000.00" &&
+      sSell.realizedGainLoss === "189.00" &&
       sSell.amountForeign === "1189.00",
     "R4-G5: real parser computes SELL net 1189 / basis 1000 / gain 189 (fee already netted)"
   );
@@ -1222,7 +1268,7 @@ async function main() {
   ok(
     sEntries.length === 1 &&
       sEntries[0].postingState === "POSTED" &&
-      sEntries[0].entry.lines.some((l) => l.accountId === "4020" && l.credit === "189") &&
+      sEntries[0].entry.lines.some((l) => l.accountId === "4020" && l.credit === "189.00") &&
       sEntries[0].entry.lines.every((l) => l.accountId !== "5010"),
     "R4-G5: real-parser SELL posts gain 189 with NO second fee subtraction (no 5010)"
   );

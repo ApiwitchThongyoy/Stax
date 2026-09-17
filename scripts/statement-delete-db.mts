@@ -145,6 +145,11 @@ export async function runStatementDeleteTests(sql: postgres.Sql,
     check(Object.values(remaining).every(value => value === null), "remaining SELL loses stale basis and gain/loss");
     const [remainingJournal] = await sql`SELECT cost_basis,realized_gain_loss,realized_gain_loss_thb FROM journal_entries WHERE source_document_id=${sell.documentId} AND side='SELL'`;
     check(Object.values(remainingJournal).every(value => value === null), "remaining journal detail reconciled");
+    const [uncomputable] = await sql`SELECT posting_state, skip_reason,
+      (SELECT count(*)::int FROM journal_entry_lines l WHERE l.journal_entry_id = j.id) AS line_count
+      FROM journal_entries j WHERE source_document_id=${sell.documentId} AND side='SELL'`;
+    check(uncomputable.posting_state === "SKIPPED" && uncomputable.line_count === 0 &&
+      !!uncomputable.skip_reason, "R8: deletion leaves visible SKIPPED SELL with reason and zero lines");
     const gainLines = await sql`SELECT l.id FROM journal_entry_lines l JOIN accounts ac ON ac.id=l.account_id
       JOIN journal_entries j ON j.id=l.journal_entry_id WHERE j.source_document_id=${sell.documentId} AND ac.code IN ('4020','5120')`;
     check(gainLines.length === 0, "reports lose stale gain/loss posting legs");

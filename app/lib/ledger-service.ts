@@ -1,3 +1,4 @@
+import { roundMoney, moneyInThb } from "./accounting-amounts";
 // General-ledger database service.
 //
 // Persists accounts/journal entries/lines and builds the pure-engine reports
@@ -424,7 +425,7 @@ function manualCashLines(
   input: { type: "CASH_IN" | "CASH_OUT"; amountForeign: string; currency: string; fxRateEffective: string }
 ): JournalLineInput[] {
   const cash = input.currency === "THB" ? MANUAL_CASH_THB : MANUAL_CASH_USD;
-  const fx = input.fxRateEffective || "1";
+  const fx = input.currency === "THB" ? "1" : input.fxRateEffective;
   const line = (accountId: string, side: "debit" | "credit"): JournalLineInput => {
     const base: JournalLineInput = {
       accountId,
@@ -464,9 +465,11 @@ function manualCashDetail(
     realizedGainLossThb: null,
     averageCost: null,
     currency: input.currency,
-    amount: input.amountForeign,
-    amountThb: input.amountThb,
-    fxRateEffective: input.fxRateEffective || "1",
+    amount: roundMoney(input.amountForeign),
+    amountThb: input.currency === "THB" ? roundMoney(input.amountForeign)
+      : input.fxRateEffective && new Decimal(input.fxRateEffective).isFinite() && new Decimal(input.fxRateEffective).gt(0)
+        ? moneyInThb(input.amountForeign, input.fxRateEffective) : null,
+    fxRateEffective: input.currency === "THB" ? "1" : input.fxRateEffective || null,
     fxRateStatement: null,
     isFxConversion: false,
     exchangeFromCurrency: null,
@@ -740,9 +743,9 @@ export async function syncCapitalLedgerJournal(
         description:
           current.type === "CASH_IN" ? "ฝากเงินเข้าบัญชี" : "ถอนเงินจากบัญชี",
         currency: current.currency,
-        amount: current.amountForeign,
-        amountThb: current.amountThb,
-        fxRateEffective: current.fxRateEffective || "1",
+        amount: detail.amount,
+        amountThb: detail.amountThb,
+        fxRateEffective: detail.fxRateEffective,
         type: current.type,
         category: detail.category,
         section: detail.section,

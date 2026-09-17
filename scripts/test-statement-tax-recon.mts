@@ -11,14 +11,14 @@
 //     gain/loss THB; provider-unavailable leaves fxRateEffective/amountThb NULL
 //     (never a fabricated 1:1 rate, never 0).
 //   - capitalRowToTransaction: effective-first FX rate fallback.
-//   - 2-stage gain rounding is INTENTIONAL: realizedGainLoss = round2(net -
-//     basis), then realizedGainLossThb = round2(roundedGain x fx), so the pair
-//     is always mutually consistent (never "simplify" to a single stage).
+//   - Persist proceeds and basis at 2dp before subtracting them for gain;
+//     realizedGainLossThb = round2(gain x fx). All persisted values reconcile.
 //
 // The imported modules instantiate a postgres client at load time but this
 // suite performs ZERO queries (pure functions only). Run:
 //   npx tsx scripts/test-statement-tax-recon.mts
 import "./_load-env.mjs";
+import { realizedAmounts } from "../app/lib/accounting-amounts";
 
 import {
   mapToCapitalRow,
@@ -39,7 +39,7 @@ import {
 } from "../app/lib/posting-engine";
 import { applyCorporateAction } from "../app/lib/corporate-action";
 import type { CostBasisMap } from "../app/lib/cost-basis-engine";
-import type { ExtractedTransaction } from "../app/lib/pdfStatementParser";
+import { parseStatementRows, type ExtractedTransaction } from "../app/lib/pdfStatementParser";
 
 let passed = 0;
 let failed = 0;
@@ -113,7 +113,7 @@ async function main() {
       rate: "35.42",
     })
   );
-  ok(usdSell.realizedGainLoss === "93.7", "realized gain/loss carried on computable SELL");
+  ok(usdSell.realizedGainLoss === "93.70", "realized gain/loss carried on computable SELL");
   // 93.7 * 35.42 = 3318.854 -> 3318.85
   ok(usdSell.realizedGainLossThb === "3318.85", "realized gain/loss converted to THB with effective rate");
   ok(usdSell.type === "CASH_IN", "SELL maps to CASH_IN (money in)");
@@ -611,9 +611,68 @@ async function main() {
     }),
   ]);
   const penny = bfPenny.updates.find((u) => u.transactionId === "sPenny");
+  const parsedPenny = parseStatementRows([
+    "TRADE RECORDS", "Currency: USD", "USD/THB = 35.42", "PPP",
+    "01/01/2026 10:00:00,GMT+07 01/01/2026 BUY 1 99.995 100.00 100.00 0.00 0.00 NASDAQ",
+    "PPP",
+    "02/01/2026 10:00:00,GMT+07 02/01/2026 SELL 1 110.00 110.00 110.00 0.00 0.00 NASDAQ",
+  ]);
+  const parsedRows = parsedPenny.transactions.filter(t => t.category === "asset").map(map);
+  const parsedGain = parsedRows.find(r => r.side === "SELL");
+  const parsedReplay = recomputeAllGainLoss(parsedRows).updates[0]?.update;
+  const parsedBackfill = computeGainLossBackfill(parsedRows.map(r => ({ ...r, realizedGainLossThb: null }))).updates[0]?.update;
+  ok(parsedGain?.realizedGainLoss === "10.00" && parsedGain.realizedGainLossThb === "354.20" &&
+    parsedReplay?.realizedGainLoss === parsedGain.realizedGainLoss &&
+    parsedReplay?.realizedGainLossThb === parsedGain.realizedGainLossThb &&
+    parsedBackfill?.realizedGainLoss === parsedGain.realizedGainLoss &&
+    parsedBackfill?.realizedGainLossThb === parsedGain.realizedGainLossThb,
+    "R2: parser/import/replay/backfill reconcile proceeds 110.00 minus rounded basis 100.00 = gain 10.00");
+  const persistedCents = realizedAmounts("100.005", "100.004", "35.42");
+  ok(persistedCents.proceeds === "100.01" && persistedCents.costBasis === "100.00" &&
+    persistedCents.realizedGainLoss === "0.01" && persistedCents.realizedGainLossThb === "0.35",
+    "R2: rounded proceeds 100.01 minus rounded basis 100.00 = gain 0.01 / THB 0.35");
+  const centsFresh = map(txn({ category: "asset", side: "SELL", symbol: "CENT",
+    quantity: 1, amount: 100.005, proceeds: 100.005, netAmount: 100.005,
+    costBasis: 100.004, realizedGainLoss: 0.001, rate: "35.42" }));
+  const centsHistory = [
+    bfRow({ transactionId: "cent-buy", symbol: "CENT", side: "BUY",
+      transactionDate: "2026-01-01", quantity: "1", unitPrice: "100.004" }),
+    bfRow({ transactionId: "cent-sell", symbol: "CENT", quantity: "1", netAmount: "100.005" }),
+  ];
+  const centsRecomputed = recomputeAllGainLoss(centsHistory).updates[0]?.update;
+  const centsBackfilled = computeGainLossBackfill(centsHistory).updates[0]?.update;
+  ok([centsFresh, centsRecomputed, centsBackfilled].every(r =>
+    r?.costBasis === persistedCents.costBasis &&
+    r.realizedGainLoss === persistedCents.realizedGainLoss &&
+    r.realizedGainLossThb === persistedCents.realizedGainLossThb),
+    "R2: fresh import, recompute and backfill share persisted-cent gain calculation");
+  ok([centsFresh, centsRecomputed, centsBackfilled].every(r => r?.proceeds === persistedCents.proceeds),
+    "R2: fresh import/recompute/backfill persist the helper's rounded proceeds");
+  const freshPenny = map(txn({ category: "asset", side: "SELL", symbol: "PPP",
+    quantity: 1, amount: 110.005, proceeds: 110.005, netAmount: 110.005,
+    costBasis: 100, realizedGainLoss: 10.005, rate: "35.42" }));
+  const replayPenny = recomputeAllGainLoss([
+    bfRow({ transactionId: "b", side: "BUY", symbol: "PPP", transactionDate: "2026-01-01",
+      quantity: "1", unitPrice: "100" }),
+    bfRow({ transactionId: "s", symbol: "PPP", quantity: "1", netAmount: "110.005" }),
+  ]).updates[0].update;
+  ok(freshPenny.realizedGainLoss === penny?.update.realizedGainLoss &&
+    freshPenny.realizedGainLossThb === penny?.update.realizedGainLossThb &&
+    replayPenny.realizedGainLoss === freshPenny.realizedGainLoss &&
+    replayPenny.realizedGainLossThb === freshPenny.realizedGainLossThb,
+    "R2: fresh import, replay/recompute/deletion and backfill agree on gain 10.01 / THB 354.55");
+  const canonicalSell = map(txn({ category: "asset", side: "SELL", amount: 1189,
+    netAmount: 1189, proceeds: 1189, costBasis: 1000, realizedGainLoss: 999, rate: "35.42" }));
+  ok(canonicalSell.realizedGainLoss === "189.00" && canonicalSell.realizedGainLossThb === "6694.38",
+    "R2: net 1189 minus basis 1000 derives gain 189 / THB 6694.38, ignoring supplied gain");
+  const noBasisSell = map(txn({ category: "asset", side: "SELL", amount: 1000,
+    proceeds: 1000, realizedGainLoss: 0, rate: "35.42" }));
+  ok(noBasisSell.costBasis === null && noBasisSell.realizedGainLoss === null &&
+    noBasisSell.realizedGainLossThb === null,
+    "R8: mapper cannot retain a fabricated zero gain without basis");
   ok(
     penny?.update.realizedGainLoss === "10.01",
-    "stage 1: raw gain 10.005 rounds half-up to stored 10.01"
+    "stage 1: rounded proceeds 110.01 minus rounded basis 100.00 gives gain 10.01"
   );
   ok(
     penny?.update.realizedGainLossThb === "354.55",

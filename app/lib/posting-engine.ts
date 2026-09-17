@@ -30,7 +30,7 @@
 //                         proceeds (broker net), so it is NEVER subtracted again
 //                         and NEVER posted as a separate expense line — doing
 //                         either would double-count it.
-//   asset + SELL (no basis) -> Dr broker-cash / Cr investments at proceeds (no gain split)
+//   asset + SELL (no basis) -> SKIPPED, zero lines, explicit reason
 //   income (dividend/interest) -> Dr broker-cash / Cr income account (gross)
 //   expense (WHT)               -> Dr expense account / Cr broker-cash
 //   expense (fee/VAT rows, isMonthlyFeeAggregate) -> tri-state SKIP rule:
@@ -187,8 +187,8 @@ export function journalDetailOf(row: ValidatedCapitalRow): JournalTradeDetail {
     netAmount: row.netAmount ?? null,
     proceeds: row.proceeds ?? null,
     costBasis: row.costBasis ?? null,
-    realizedGainLoss: row.realizedGainLoss ?? null,
-    realizedGainLossThb: row.realizedGainLossThb ?? null,
+    realizedGainLoss: row.side === "SELL" && row.costBasis == null ? null : row.realizedGainLoss ?? null,
+    realizedGainLossThb: row.side === "SELL" && row.costBasis == null ? null : row.realizedGainLossThb ?? null,
     averageCost,
     currency: row.currency ?? null,
     amount: row.amountForeign ?? null,
@@ -363,15 +363,15 @@ export function postCapitalRow(row: ValidatedCapitalRow): CapitalPostingResult {
       const costBasis = row.costBasis;
       const gain = row.realizedGainLoss;
       if (costBasis != null && gain != null) {
-        const g = Number(gain);
+        const g = new Decimal(gain).toDecimalPlaces(2);
         const lines: JournalLineInput[] = [
           leg(cash, "debit", proceeds, row),
           leg(INVEST_STOCKS, "credit", costBasis, row),
         ];
-        if (g >= 0) {
+        if (g.gt(0)) {
           lines.push(leg(GAIN_INCOME, "credit", gain, row, row.symbol));
-        } else {
-          lines.push(leg(LOSS_EXPENSE, "debit", String(Math.abs(g)), row, row.symbol));
+        } else if (g.lt(0)) {
+          lines.push(leg(LOSS_EXPENSE, "debit", g.abs().toFixed(2), row, row.symbol));
         }
         return {
           ok: true,
@@ -386,22 +386,9 @@ export function postCapitalRow(row: ValidatedCapitalRow): CapitalPostingResult {
           },
         };
       }
-      // Honest non-computable SELL: reduce the investment at the sale proceeds
-      // (no fabricated gain/loss). Keeps books balanced.
       return {
-        ok: true,
-        note: "sell without computable cost basis (no gain split)",
-        entry: {
-          entryDate: row.transactionDate,
-          description: descriptionFor(row),
-          sourceType: "STATEMENT",
-          sourceDocumentId: row.sourceDocumentId,
-          sourceTransactionId: row.transactionId,
-          lines: [
-            leg(cash, "debit", proceeds, row),
-            leg(INVEST_STOCKS, "credit", proceeds, row),
-          ],
-        },
+        ok: false,
+        reason: "SELL without trustworthy cost basis / realized gain - NON_COMPUTABLE, not posted",
       };
     }
     // Currency-exchange-only rows: not auto-posted.

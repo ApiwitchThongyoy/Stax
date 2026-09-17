@@ -3716,6 +3716,81 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
               ),
             "REG-mfa: rebuild from a legacy NULL row is SKIPPED with zero lines + explicit reason (detail stays null)"
           );
+          // R2/R5/R8: verify actual persisted headers/lines, not just pure plans.
+          const accountingRows = [
+            baseRow({ category: "asset", side: "SELL", symbol: "R258", amountForeign: "1189.00",
+              costBasis: "1000.00", proceeds: "1189.00", realizedGainLoss: "189.00",
+              realizedGainLossThb: "6694.38", fxRateEffective: "35.42", amountThb: "999" }),
+            baseRow({ category: "asset", side: "SELL", symbol: "R258", amountForeign: "1000.00",
+              costBasis: "1000.00", realizedGainLoss: "0.00", realizedGainLossThb: "0.00" }),
+            baseRow({ category: "asset", side: "SELL", symbol: "R258", amountForeign: "1000.00",
+              costBasis: null, realizedGainLoss: null, realizedGainLossThb: null }),
+          ];
+          await mfaLedger.insertStatementImport(mfaUserId, accountingRows);
+          const accountingIds = accountingRows.map(r => r.transactionId);
+          const persistedAccounting = await client`
+            SELECT e.source_transaction_id, e.posting_state, e.skip_reason,
+              e.cost_basis, e.realized_gain_loss, e.realized_gain_loss_thb, e.amount_thb,
+              count(l.id)::int AS line_count,
+              coalesce(sum(l.debit_amount),0) = coalesce(sum(l.credit_amount),0) AS native_balanced,
+              coalesce(sum(CASE WHEN l.debit_amount IS NOT NULL THEN l.amount_thb ELSE 0 END),0) =
+              coalesce(sum(CASE WHEN l.credit_amount IS NOT NULL THEN l.amount_thb ELSE 0 END),0) AS thb_balanced
+            FROM journal_entries e LEFT JOIN journal_entry_lines l ON l.journal_entry_id = e.id
+            WHERE e.source_transaction_id = ANY(${accountingIds}::text[])
+            GROUP BY e.id`;
+          const gainEntry = persistedAccounting.find(e => e.source_transaction_id === accountingIds[0]);
+          const zeroEntry = persistedAccounting.find(e => e.source_transaction_id === accountingIds[1]);
+          const missingEntry = persistedAccounting.find(e => e.source_transaction_id === accountingIds[2]);
+          ok(gainEntry?.posting_state === "POSTED" && Number(gainEntry.realized_gain_loss) === 189 &&
+            Number(gainEntry.realized_gain_loss_thb) === 6694.38 && Number(gainEntry.amount_thb) === 42114.38,
+            "REG-R258: gain 189 / THB 6694.38 persisted; conflicting header THB replaced");
+          ok(zeroEntry?.posting_state === "POSTED" && zeroEntry.line_count === 2,
+            "REG-R258: zero-gain SELL persists two positive lines");
+          ok(missingEntry?.posting_state === "SKIPPED" && missingEntry.line_count === 0 &&
+            missingEntry.cost_basis === null && missingEntry.realized_gain_loss === null &&
+            missingEntry.realized_gain_loss_thb === null && !!missingEntry.skip_reason,
+            "REG-R258: no-basis SELL persists null gains and zero lines with reason");
+          ok(persistedAccounting.every(e => e.native_balanced && e.thb_balanced),
+            "REG-R258: persisted native and THB debit/credit totals match");
+          const manual = await mfaLedger.createJournalEntry(mfaUserId, {
+            entryDate: "2026-01-15", description: "R5 conflicting line THB",
+            lines: [
+              { accountId: "1020", currency: "USD", debit: "10.005", fxRateEffective: "35.42", amountThb: "999" },
+              { accountId: "3010", currency: "USD", credit: "10.005", fxRateEffective: "35.42", amountThb: "888" },
+            ],
+          });
+          const manualLines = manual.ok ? await client`
+            SELECT debit_amount, credit_amount, amount_thb FROM journal_entry_lines
+            WHERE journal_entry_id = ${manual.entryId}` : [];
+          ok(manualLines.length === 2 && manualLines.every(l =>
+            Number(l.debit_amount ?? l.credit_amount) === 10.01 && Number(l.amount_thb) === 354.55),
+            "REG-R258: conflicting caller line THB cannot persist (10.01 -> 354.55)");
+          const edge = await mfaLedger.createJournalEntry(mfaUserId, {
+            entryDate: "2026-01-15", description: "R5 rounding rejection",
+            lines: [
+              { accountId: "1020", currency: "USD", debit: "0.005", fxRateEffective: "35" },
+              { accountId: "1020", currency: "USD", debit: "0.005", fxRateEffective: "35" },
+              { accountId: "3010", currency: "USD", credit: "0.010", fxRateEffective: "35" },
+            ],
+          });
+          ok(!edge.ok && edge.errors.some(e => e.includes("does not balance")),
+            "REG-R258: raw-balanced but rounded-unbalanced write is rejected");
+          // Execute the real recompute command: these SELLs have no supporting BUY.
+          execFileSync(process.execPath, ["./node_modules/tsx/dist/cli.mjs",
+            "./scripts/recompute-cost-basis-webull.mts", mfaUserId], { stdio: "pipe" });
+          const recomputedSells = await client`SELECT e.posting_state, e.cost_basis,
+            e.realized_gain_loss, e.realized_gain_loss_thb,
+            (SELECT count(*)::int FROM journal_entry_lines l WHERE l.journal_entry_id=e.id) AS line_count
+            FROM journal_entries e WHERE e.source_transaction_id = ANY(${accountingIds}::text[])
+              AND e.status='POSTED' AND e.source_type='STATEMENT'`;
+          ok(recomputedSells.length === 3 && recomputedSells.every(e =>
+            e.posting_state === "SKIPPED" && e.cost_basis === null && e.realized_gain_loss === null &&
+            e.realized_gain_loss_thb === null && e.line_count === 0),
+            "REG-R258: actual recompute clears unsupported basis/gains and retains line-less SELLs");
+          await client`DELETE FROM journal_entry_lines WHERE journal_entry_id IN
+            (SELECT id FROM journal_entries WHERE source_transaction_id = ANY(${accountingIds}::text[]))`;
+          await client`DELETE FROM journal_entries WHERE source_transaction_id = ANY(${accountingIds}::text[])`;
+          await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ANY(${accountingIds}::text[])`;
           // Self-cleaning (shared CLEANUP also removes this user's linked rows).
           await client`
             DELETE FROM journal_entry_lines

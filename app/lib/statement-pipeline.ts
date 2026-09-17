@@ -1,3 +1,4 @@
+import { moneyInThb, realizedAmounts, roundMoney } from "./accounting-amounts";
 import { assertOwnedReferences } from "./resource-ownership";
 import { safeErrorLog } from "./safe-error-log";
 import { randomUUID } from "node:crypto";
@@ -157,7 +158,7 @@ export function mapToCapitalRow(
   const amountForeign =
     t.category === "expense" ? t.amount : Math.abs(t.amount);
   const amountThb =
-    fxRateEffective !== null ? amountForeign * fxRateEffective : null;
+    fxRateEffective !== null ? moneyInThb(amountForeign, fxRateEffective) : null;
 
   // Determine cash direction deterministically. For an "expense" row the sign of
   // the amount IS the direction (positive = fee paid out; negative = rebate
@@ -173,17 +174,10 @@ export function mapToCapitalRow(
   // to 2dp first and gainThb is derived from that ROUNDED gain, so the pair is
   // always consistent (gainThb === round2(round2(gain) × fx)). See
   // realizedUpdateFor below for the canonical statement of this invariant.
-  let realizedGainLossThb: string | null = null;
-  if (
-    t.side === "SELL" &&
-    fxRateEffective !== null &&
-    t.realizedGainLoss !== undefined &&
-    Number.isFinite(t.realizedGainLoss)
-  ) {
-    const gain = new Decimal(decimalString(t.realizedGainLoss));
-    const eff = new Decimal(String(fxRateEffective));
-    realizedGainLossThb = gain.mul(eff).toFixed(2);
-  }
+  const net = t.netAmount ?? t.proceeds;
+  const realized = t.side === "SELL" && t.costBasis != null && Number.isFinite(t.costBasis)
+    && t.costBasis >= 0 && net != null && Number.isFinite(net)
+    ? realizedAmounts(net, t.costBasis, fxRateEffective) : null;
 
   // Symbol/ticker. Trade rows carry `t.symbol` directly (preserved verbatim);
   // dividend income rows embed the ticker in the section label
@@ -204,11 +198,11 @@ export function mapToCapitalRow(
     row: {
       transactionId: randomUUID(),
       userId,
-      amountForeign: amountForeign.toFixed(2),
+      amountForeign: roundMoney(amountForeign),
       currency,
       transactionDate,
       fxRateBot: null,
-      amountThb: amountThb !== null ? amountThb.toFixed(2) : null,
+      amountThb,
       type,
       sourceType: "AI_PARSED",
       sourceDocumentId,
@@ -220,19 +214,13 @@ export function mapToCapitalRow(
       unitPrice: t.unitPrice !== undefined ? decimalString(t.unitPrice) : null,
       grossAmount: t.grossAmount !== undefined ? decimalString(t.grossAmount) : null,
       fees: t.fees !== undefined && t.fees !== 0 ? decimalString(t.fees) : null,
-      proceeds:
-        t.proceeds !== undefined && Number.isFinite(t.proceeds)
+      proceeds: realized?.proceeds ??
+        (t.proceeds !== undefined && Number.isFinite(t.proceeds)
           ? decimalString(t.proceeds)
-          : null,
-      costBasis:
-        t.costBasis !== undefined && Number.isFinite(t.costBasis)
-          ? decimalString(t.costBasis)
-          : null,
-      realizedGainLoss:
-        t.realizedGainLoss !== undefined && Number.isFinite(t.realizedGainLoss)
-          ? decimalString(t.realizedGainLoss)
-          : null,
-      realizedGainLossThb,
+          : null),
+      costBasis: realized?.costBasis ?? null,
+      realizedGainLoss: realized?.realizedGainLoss ?? null,
+      realizedGainLossThb: realized?.realizedGainLossThb ?? null,
       fxRateStatement:
         fxRateStatement !== null ? String(fxRateStatement) : null,
       fxRateEffective: fxRateEffective !== null ? String(fxRateEffective) : null,
@@ -352,15 +340,15 @@ export async function applyFxRateFallback(
     }
 
     const eff = new Decimal(String(resolved.rate));
-    const nextThb = new Decimal(row.amountForeign).mul(eff);
+    const nextThb = moneyInThb(row.amountForeign, eff);
     let nextGainThb: string | null = null;
     if (row.realizedGainLoss != null && row.realizedGainLoss.trim() !== "") {
-      nextGainThb = new Decimal(row.realizedGainLoss).mul(eff).toFixed(2);
+      nextGainThb = moneyInThb(row.realizedGainLoss, eff);
     }
 
     out[i] = {
       ...row,
-      amountThb: nextThb.toFixed(2),
+      amountThb: nextThb,
       fxRateEffective: String(resolved.rate),
       realizedGainLossThb: nextGainThb,
     };
@@ -884,19 +872,8 @@ function realizedUpdateFor(
   }
   if (!eff.isFinite() || eff.lte(0)) return null;
 
-  const costBasis = new Decimal(String(avgCost)).mul(qty);
-  // Mirror the parser's THB conversion (parseTrade conclusion path): the THB
-  // gain is derived from the ROUNDED gain, so the stored pair is always
-  // consistent (realizedGainLossThb === round2(round2(gain) × fx)).
-  const roundedGain = net.minus(costBasis).toFixed(2);
-  const gainThb = new Decimal(roundedGain).mul(eff).toFixed(2);
-
-  return {
-    costBasis: new Decimal(String(avgCost)).mul(qty).toFixed(2),
-    proceeds: net.toFixed(2),
-    realizedGainLoss: roundedGain,
-    realizedGainLossThb: gainThb,
-  };
+  const result = realizedAmounts(net, new Decimal(String(avgCost)).mul(qty), eff);
+  return { ...result, realizedGainLossThb: result.realizedGainLossThb! };
 }
 
 export interface FullGainLossRecomputeStats {

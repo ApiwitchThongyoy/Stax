@@ -1,3 +1,4 @@
+import { roundMoney, moneyInThb } from "./accounting-amounts";
 // Double-entry general ledger core (บัญชีแยกประเภท).
 //
 // Pure + DB-free: all money math is Decimal, all invariant checks are
@@ -289,7 +290,8 @@ export function validateJournalEntry(
     }
 
     const raw = hasDebit ? line.debit : line.credit;
-    const amount = dec(raw as string | number);
+    const rawAmount = dec(raw as string | number);
+    const amount = rawAmount ? new Decimal(roundMoney(rawAmount)) : null;
     if (!amount || amount.lessThanOrEqualTo(0)) {
       errors.push(`${idx}: amount must be a positive finite number`);
       return;
@@ -313,7 +315,11 @@ export function validateJournalEntry(
       }
       eff = rawEff;
     }
-    const amountThb = dec(line.amountThb ?? "") ?? amount.mul(eff);
+    const amountThb = new Decimal(moneyInThb(amount, eff));
+    if (amountThb.lte(0)) {
+      errors.push(`${idx}: rounded THB amount must be positive`);
+      return;
+    }
 
     const side: Side = hasDebit ? "DEBIT" : "CREDIT";
     lines.push({
@@ -354,7 +360,17 @@ export function validateJournalEntry(
 
   if (errors.length > 0) return { ok: false, errors };
 
+  // Compare the exact persisted cents; cross-currency policy is unchanged.
+  if (!isSkipped && Object.keys(byCurrency).length === 1) {
+    const debitThb = Decimal.sum(0, ...lines.filter(l => l.side === "DEBIT").map(l => l.amountThb));
+    const creditThb = Decimal.sum(0, ...lines.filter(l => l.side === "CREDIT").map(l => l.amountThb));
+    if (!debitThb.eq(creditThb)) errors.push("THB does not balance: debit " + debitThb + " != credit " + creditThb);
+  }
+  if (errors.length > 0) return { ok: false, errors };
+
   const d = input.detail ?? {};
+  const detailAmount = dec(d.amount ?? "");
+  const detailFx = d.currency?.toUpperCase() === "THB" ? new Decimal(1) : dec(d.fxRateEffective ?? "");
   const detail: JournalTradeDetail = {
     category: d.category != null ? String(d.category) : null,
     section: d.section != null ? String(d.section) : null,
@@ -372,8 +388,8 @@ export function validateJournalEntry(
     realizedGainLossThb: d.realizedGainLossThb != null ? String(d.realizedGainLossThb) : null,
     averageCost: d.averageCost != null ? String(d.averageCost) : null,
     currency: d.currency != null ? String(d.currency) : null,
-    amount: d.amount != null ? String(d.amount) : null,
-    amountThb: d.amountThb != null ? String(d.amountThb) : null,
+    amount: detailAmount ? roundMoney(detailAmount) : null,
+    amountThb: detailAmount && detailFx?.gt(0) ? moneyInThb(detailAmount, detailFx) : null,
     fxRateEffective: d.fxRateEffective != null ? String(d.fxRateEffective) : null,
     fxRateStatement: d.fxRateStatement != null ? String(d.fxRateStatement) : null,
     isFxConversion: Boolean(d.isFxConversion),

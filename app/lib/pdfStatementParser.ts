@@ -1,3 +1,5 @@
+import Decimal from "decimal.js";
+import { realizedAmounts } from "./accounting-amounts";
 // หมายเหตุสำคัญ: ห้าม import "pdfjs-dist" แบบ static ที่ด้านบนไฟล์
 // เพราะโปรเจกต์นี้ใช้ SSR (React Router v7) — ถ้า import แบบ static ตอน server
 // จะพยายามรันโค้ดของ pdf.js ไปด้วย แล้วไปเจอ DOMMatrix ซึ่งมีแค่ในเบราว์เซอร์เท่านั้น
@@ -713,12 +715,12 @@ export function parseStatementRows(
     if (ev.side === "SELL" && sellBasis !== null) {
       // ใช้ "Net Amount" ที่โบรกเกอร์ระบุ (หักค่าธรรมเนียมแล้ว) เป็นยอดขายสุทธิ (authoritative)
       // แทนการสร้างยอดใหม่เอง: realized  = netProceeds - avgCost*qty
-      // ตั้งใจไม่ปัดทศนิยมที่นี่ — การปัด 2dp (2-stage: gain ก่อน แล้วค่อย ×fx)
-      // เกิดที่ statement-pipeline (mapToCapitalRow / realizedUpdateFor) เท่านั้น
-      pnlAmount = ev.net - sellBasis * ev.qty;
+      // Shared decimal calculation; the pipeline converts rounded gain to THB.
+      const calculated = realizedAmounts(ev.net, new Decimal(sellBasis).mul(ev.qty), null);
+      pnlAmount = Number(calculated.realizedGainLoss);
       realizedMeta = {
         proceeds: ev.net,
-        costBasis: sellBasis * ev.qty,
+        costBasis: new Decimal(sellBasis).mul(ev.qty).toNumber(),
         realizedGainLoss: pnlAmount,
       };
     } else if (ev.side === "SELL") {
