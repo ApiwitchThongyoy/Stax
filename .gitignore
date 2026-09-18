@@ -19,3 +19,5 @@
 
 # Local dev logs
 dev-server.log
+.vercel
+.env*
