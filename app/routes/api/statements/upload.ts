@@ -20,7 +20,11 @@ import {
   summarizeRows,
   type ValidatedCapitalRow,
 } from "~/lib/statement-pipeline";
-import { insertStatementImport, reconcileStatementImport } from "~/lib/ledger-service";
+import {
+  insertStatementImport,
+  reconcileStatementImport,
+  verifyStatementImportPersistence,
+} from "~/lib/ledger-service";
 import { resolveHistoricalFxRate } from "~/lib/historical-fx-provider";
 import {
   parseStatementWithGemini,
@@ -60,6 +64,49 @@ function affectedSymbolsOf(rows: ValidatedCapitalRow[]): Set<string> {
     }
   }
   return out;
+}
+
+/** Marker for the post-import persistence gate (never carries secrets/SQL). */
+class ImportPersistenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ImportPersistenceError";
+  }
+}
+
+/**
+ * Post-import persistence gate. insertStatementImport is atomic, but under a
+ * transaction pooler a silent driver-level failure can surface as a committed
+ * import with ZERO persisted rows (prepared-statement 26000 mid-flow). So after
+ * every import (fresh AND rebuild) we re-read the committed rows + their 1:1
+ * journal mirrors and REQUIRE the exact counts we reported before the route may
+ * write STATEMENT_IMPORT success or return a success body. On mismatch this
+ * throws (surfacing as the path's 500 catch below) — the import is NOT
+ * acknowledged, and the audit records nothing misleading.
+ */
+async function assertImportPersisted(input: {
+  userId: string;
+  documentId: string;
+  insertedCount: number;
+  transactionIds: string[];
+}): Promise<void> {
+  const proof = await verifyStatementImportPersistence(input);
+  if (proof.ok) return;
+  console.error("statement import persisted-state mismatch", {
+    userId: input.userId,
+    documentId: input.documentId,
+    expectedRows: proof.expectedRows,
+    capitalRows: proof.capitalRows,
+    missingRows: proof.missingRows.length,
+    journalEntries: proof.journalEntries,
+    duplicateJournalTransactions: proof.duplicateJournalTransactions.length,
+  });
+  throw new ImportPersistenceError(
+    "Statement import could not be verified after insert: " +
+      `missingRows=${proof.missingRows.length}, capitalRows=${proof.capitalRows}/` +
+      `${proof.expectedRows}, journalEntries=${proof.journalEntries}/` +
+      `${proof.expectedRows}, duplicateJournalTransactions=${proof.duplicateJournalTransactions.length}`
+  );
 }
 
 /**
@@ -255,6 +302,16 @@ async function rebuildStatementImport(input: {
   // Best-effort: a reconcile failure must not surface as a 500 once the rows
   // are committed.
   const result = await insertStatementImport(userId, fallbackRows);
+  // Persistence gate: REQUIRE the committed rows + 1:1 journal mirrors before
+  // acknowledging the rebuild (see assertImportPersisted). Mismatch throws and
+  // the caller's catch below returns a clean 500 — no success audit, no
+  // success body; a later retry re-enters this rebuild path.
+  await assertImportPersisted({
+    userId,
+    documentId,
+    insertedCount: result.insertedCount,
+    transactionIds: result.transactionIds,
+  });
   try {
     await reconcileStatementImport(userId, affectedSymbolsOf(fallbackRows));
   } catch (reconcileError) {
@@ -427,7 +484,13 @@ export async function action({ request }: Route.ActionArgs) {
             : "UnknownError",
       });
       return Response.json(
-        { success: false, message: "Internal server error" },
+        {
+          success: false,
+          message:
+            rebuildError instanceof ImportPersistenceError
+              ? "การนำเข้าไม่ได้รับการบันทึกในฐานข้อมูล (ตรวจพบหลัง insert) กรุณาลองนำเข้าอีกครั้ง"
+              : "Internal server error",
+        },
         { status: 500 }
       );
     }
@@ -568,6 +631,17 @@ export async function action({ request }: Route.ActionArgs) {
     //    the authoritative SSOT step.
     const result = await insertStatementImport(auth.userId, fallbackRows);
 
+    // Persistence gate: REQUIRE the committed rows + 1:1 journal mirrors before
+    // acknowledging the import. Mismatch throws and the catch below removes the
+    // stored file + document row and returns a clean 500 — the audit never
+    // records a false STATEMENT_IMPORT and a retry is a clear fresh import.
+    await assertImportPersisted({
+      userId: auth.userId,
+      documentId,
+      insertedCount: result.insertedCount,
+      transactionIds: result.transactionIds,
+    });
+
     // 7a. Reconcile ALL derived state deterministically from the final ledger:
     //     recompute the affected SELL gains + journal postings and rebuild the
     //     cost-basis cache from the committed rows + corporate actions — a pure
@@ -652,7 +726,13 @@ export async function action({ request }: Route.ActionArgs) {
       // best-effort row cleanup only
     }
     return Response.json(
-      { success: false, message: "Internal server error" },
+      {
+        success: false,
+        message:
+          error instanceof ImportPersistenceError
+            ? "การนำเข้าไม่ได้รับการบันทึกในฐานข้อมูล (ตรวจพบหลัง insert) กรุณาลองนำเข้าอีกครั้ง"
+            : "Internal server error",
+      },
       { status: 500 }
     );
   }

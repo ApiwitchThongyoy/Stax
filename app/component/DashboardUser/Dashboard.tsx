@@ -343,6 +343,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                     setGlTab("overview");
                     setActiveNav("gl");
                   }}
+                  onImportSuccess={refreshServerData}
                 />
               )}
 

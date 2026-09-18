@@ -129,9 +129,11 @@ function stepIndex(phase: Phase): number {
 export default function StatementUploadPage({
   onNavigateToArchive,
   onNavigateToOverview,
+  onImportSuccess,
 }: {
   onNavigateToArchive?: () => void;
   onNavigateToOverview?: () => void;
+  onImportSuccess?: () => void;
 }) {
   const { user } = useAuth();
   const accessToken = user?.accessToken ?? null;
@@ -226,6 +228,7 @@ export default function StatementUploadPage({
       // เหมือนเดิม (ไม่เปลี่ยน contract การอัปโหลด)
       let uploadPromise: Promise<void>;
       let importIsDuplicate = false;
+      let lastSaved = 0;
       try {
         const formData = new FormData();
         formData.append("file", f, f.name);
@@ -244,7 +247,7 @@ export default function StatementUploadPage({
           if (!res.ok || body.success !== true || !body.data) {
             throw new Error(body.message || "อัปโหลดไม่สำเร็จ");
           }
-          if (body.data.duplicate === true) {
+          if (body.data.duplicate === true || body.data.duplicates === true) {
             // ไฟล์ซ้ำ: ไม่นำเข้า ไม่โชว์หน้า "ผลการนำเข้า" และไม่เปิดให้
             // re-upload — หยุด animation, กลับหน้า dropzone (idle) แล้ว
             // แจ้งเตือนซ้ำตรงกลางจอ (import ต้องไม่ไปต่อ)
@@ -256,7 +259,21 @@ export default function StatementUploadPage({
               setPhase("idle");
             }
             setDuplicateModal({ open: true, fileName: f.name });
+          } else if (
+            body.data.saved === 0 ||
+            body.data.unsupported === true ||
+            body.data.duplicateDecision === "unsupported"
+          ) {
+            // "สำเร็จ" แต่ไม่มีรายการใดถูกบันทึก (หรือไฟล์ถอดรหัสไม่ได้):
+            // ต้องไม่แสดงเป็นหน้านำเข้าสำเร็จ — ยกเป็น error ชัดเจนแทน
+            throw new Error(
+              body.data.unsupported === true ||
+                body.data.duplicateDecision === "unsupported"
+                ? "ไฟล์นี้ยังถอดรหัสธุรกรรมไม่ได้ (ไม่พบรายการที่ระบบรู้จัก) กรุณาตรวจสอบไฟล์อีกครั้ง"
+                : "การนำเข้าไม่มีรายการใดถูกบันทึก กรุณาลองอีกครั้ง"
+            );
           } else {
+            lastSaved = body.data.saved;
             setResult(body.data);
           }
         })();
@@ -285,9 +302,14 @@ export default function StatementUploadPage({
         );
         return;
       }
-      if (mountedRef.current && !importIsDuplicate) setPhase("done");
+      if (mountedRef.current && !importIsDuplicate) {
+        setPhase("done");
+        // Genuine import success: let the Dashboard refresh server data so the
+        // home widgets (ledger / holdings / tax) reflect the new rows.
+        if (lastSaved > 0 && onImportSuccess) onImportSuccess();
+      }
     },
-    [accessToken, advanceThrough]
+    [accessToken, advanceThrough, onImportSuccess]
   );
 
   // ขั้นพรีวิวก่อน import: ถอดรหัสธุรกรรมจากไฟล์แบบ read-only (POST

@@ -6,7 +6,7 @@ import { roundMoney, moneyInThb } from "./accounting-amounts";
 // is stored as a decimal string; the pure engine (general-ledger.ts) stays
 // entirely framework/DB-free so all invariants are tested without a database.
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, gte, lte, max, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, lte, max, sql, type SQL } from "drizzle-orm";
 import { Decimal } from "decimal.js";
 import { db } from "./drizzle-db";
 import { assertOwnedReferences } from "./resource-ownership";
@@ -1105,6 +1105,92 @@ export async function insertStatementImport(
   });
 
   return { insertedCount: transactionIds.length, transactionIds, journal };
+}
+
+// ---------------------------------------------------------------------------
+// Persistence verification
+// ---------------------------------------------------------------------------
+
+export interface ImportPersistenceProof {
+  ok: boolean;
+  expectedRows: number;
+  capitalRows: number;
+  missingRows: string[];
+  journalEntries: number;
+  duplicateJournalTransactions: string[];
+}
+
+/**
+ * Post-import persistence check. insertStatementImport commits Capital_Transactions
+ * rows AND their journal entries atomically, but under a transaction pooler a
+ * silent driver-level failure could still surface as a "success" with zero
+ * persisted rows (the connection recycled mid-flow while named prepared
+ * statements were in flight). So after an import we re-read the committed state
+ * and require an EXACT match before the route writes STATEMENT_IMPORT success:
+ *   - capital row count for the user+document must equal the count we just
+ *     reported as inserted;
+ *   - every transaction id we claimed to insert must exist as a committed row;
+ *   - every claimed transaction id must have EXACTLY ONE linked journal entry
+ *     (source_transaction_id), so the journal stays a 1:1 mirror of the ledger.
+ * Pure read-only — never writes; safe to call after the import transaction.
+ */
+export async function verifyStatementImportPersistence(input: {
+  userId: string;
+  documentId: string;
+  insertedCount: number;
+  transactionIds: string[];
+}): Promise<ImportPersistenceProof> {
+  const { userId, documentId, insertedCount, transactionIds } = input;
+  const proof: ImportPersistenceProof = {
+    ok: false,
+    expectedRows: insertedCount,
+    capitalRows: 0,
+    missingRows: [],
+    journalEntries: 0,
+    duplicateJournalTransactions: [],
+  };
+
+  if (insertedCount === 0) return proof;
+
+  const capitalRows = await db
+    .select({ transactionId: capitalTransactions.transactionId })
+    .from(capitalTransactions)
+    .where(
+      and(
+        eq(capitalTransactions.userId, userId),
+        eq(capitalTransactions.sourceDocumentId, documentId),
+        inArray(capitalTransactions.transactionId, transactionIds)
+      )
+    )
+    .execute();
+  proof.capitalRows = capitalRows.length;
+
+  const foundIds = new Set(capitalRows.map((row) => row.transactionId));
+  for (const id of transactionIds) {
+    if (!foundIds.has(id)) proof.missingRows.push(id);
+  }
+
+  const journalProof = await db
+    .select({
+      sourceTransactionId: journalEntries.sourceTransactionId,
+      total: sql<number>`count(*)::int`,
+    })
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.userId, userId),
+        inArray(journalEntries.sourceTransactionId, transactionIds)
+      )
+    )
+    .groupBy(journalEntries.sourceTransactionId)
+    .execute();
+
+  proof.ok =
+    proof.missingRows.length === 0 &&
+    proof.capitalRows === insertedCount &&
+    proof.journalEntries === insertedCount &&
+    proof.duplicateJournalTransactions.length === 0;
+  return proof;
 }
 
 // ---------------------------------------------------------------------------
