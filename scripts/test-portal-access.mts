@@ -76,6 +76,18 @@ ok(
   loginPage.includes("result.success") && loginPage.includes("errorMessage"),
   "Login page surfaces the login rejection instead of navigating to /dashboard"
 );
+ok(
+  auth.includes("response.status === 429") &&
+    auth.includes("Retry-After") &&
+    auth.includes("retryMinutes"),
+  "USER login flow surfaces the server Retry-After window for HTTP 429"
+);
+ok(
+  loginPage.includes("if (isSubmitting) return;") &&
+    loginPage.includes("disabled={isSubmitting}") &&
+    loginPage.includes("กำลังเข้าสู่ระบบ..."),
+  "Login page blocks duplicate submissions while a login request is pending"
+);
 
 // B. ProtectedLayout must not render the Dashboard for a non-USER session.
 ok(
