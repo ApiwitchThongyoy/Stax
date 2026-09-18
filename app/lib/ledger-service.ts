@@ -47,18 +47,27 @@ Decimal.set({ precision: 40 });
 // Chart of accounts
 // ---------------------------------------------------------------------------
 
-/** Idempotent: seeds the default CoA once, leaving existing rows untouched. */
+/** Idempotent per-code: inserts ONLY the default codes the user is missing,
+ * leaving every existing row (incl. custom accounts) untouched. Grows the CoA
+ * for pre-existing users when a new default (e.g. 3020 THB owner capital) is
+ * introduced, exactly once per code — repeated calls are no-ops. */
 export async function seedDefaultChartOfAccounts(userId: string): Promise<number> {
-  const existing = await db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(eq(accounts.userId, userId))
-    .limit(1)
-    .execute();
-  if (existing.length > 0) return existing.length;
+  const existingCodes = new Set(
+    (
+      await db
+        .select({ code: accounts.code })
+        .from(accounts)
+        .where(eq(accounts.userId, userId))
+        .execute()
+    ).map((r) => r.code)
+  );
+  const missing = DEFAULT_CHART_OF_ACCOUNTS.filter(
+    (acc) => !existingCodes.has(acc.code)
+  );
+  if (missing.length === 0) return 0;
 
   const now = new Date().toISOString();
-  const values = DEFAULT_CHART_OF_ACCOUNTS.map((acc) => ({
+  const values = missing.map((acc) => ({
     id: randomUUID(),
     userId,
     code: acc.code,
@@ -267,6 +276,11 @@ export async function createJournalEntry(
   if (lookup.size === 0) {
     const seeded = await seedDefaultChartOfAccounts(userId);
     if (seeded > 0) lookup = await loadAccountLookup(userId);
+  } else if (!lookup.has("3020")) {
+    // Grown CoA: per-code idempotent seed adds newly-introduced defaults (3020
+    // THB owner capital) to existing users without touching custom accounts.
+    const seeded = await seedDefaultChartOfAccounts(userId);
+    if (seeded > 0) lookup = await loadAccountLookup(userId);
   }
   const resolved = resolveEntryAccountIds(input, lookup);
   if (!resolved.ok) {
@@ -422,6 +436,7 @@ export async function insertPostings(
 const MANUAL_CASH_THB = "1010";
 const MANUAL_CASH_USD = "1020";
 const MANUAL_EQUITY_CAPITAL = "3010";
+const MANUAL_EQUITY_CAPITAL_THB = "3020";
 
 export interface ManualCashJournalInput {
   transactionId: string;
@@ -437,6 +452,11 @@ function manualCashLines(
   input: { type: "CASH_IN" | "CASH_OUT"; amountForeign: string; currency: string; fxRateEffective: string }
 ): JournalLineInput[] {
   const cash = input.currency === "THB" ? MANUAL_CASH_THB : MANUAL_CASH_USD;
+  // THB deposits need a THB owner-capital account (3020) so both legs share a
+  // currency; USD uses the classic 3010. Unsupported currencies fall back to
+  // 3010 and are rejected later by the account-currency compatibility check,
+  // so they stay SKIPPED instead of posting mismatched legs.
+  const equity = input.currency === "THB" ? MANUAL_EQUITY_CAPITAL_THB : MANUAL_EQUITY_CAPITAL;
   const fx = input.currency === "THB" ? "1" : input.fxRateEffective;
   const line = (accountId: string, side: "debit" | "credit"): JournalLineInput => {
     const base: JournalLineInput = {
@@ -453,8 +473,8 @@ function manualCashLines(
   // CASH_IN: money into broker cash (Dr cash / Cr owner equity).
   // CASH_OUT: money out of broker cash (Cr cash / Dr owner equity).
   return input.type === "CASH_IN"
-    ? [line(cash, "debit"), line(MANUAL_EQUITY_CAPITAL, "credit")]
-    : [line(MANUAL_EQUITY_CAPITAL, "debit"), line(cash, "credit")];
+    ? [line(cash, "debit"), line(equity, "credit")]
+    : [line(equity, "debit"), line(cash, "credit")];
 }
 
 function manualCashDetail(
@@ -504,6 +524,9 @@ export async function insertManualCashJournal(
 ): Promise<CreateEntryResult> {
   let lookup = await loadAccountLookup(userId);
   if (lookup.size === 0) {
+    const seeded = await seedDefaultChartOfAccounts(userId);
+    if (seeded > 0) lookup = await loadAccountLookup(userId);
+  } else if (!lookup.has("3020")) {
     const seeded = await seedDefaultChartOfAccounts(userId);
     if (seeded > 0) lookup = await loadAccountLookup(userId);
   }
@@ -889,7 +912,12 @@ export async function insertStatementImport(
 
   let lookup = await loadAccountLookup(userId);
   // Lazy-seed once for pre-CoA users (idempotent), like createJournalEntry.
+  // seedDefaultChartOfAccounts is per-code idempotent, so this also grows the
+  // CoA for existing users when a new default (3020 THB owner capital) appears.
   if (lookup.size === 0) {
+    const seeded = await seedDefaultChartOfAccounts(userId);
+    if (seeded > 0) lookup = await loadAccountLookup(userId);
+  } else if (!lookup.has("3020")) {
     const seeded = await seedDefaultChartOfAccounts(userId);
     if (seeded > 0) lookup = await loadAccountLookup(userId);
   }
@@ -1305,6 +1333,132 @@ async function reconcileStatementState(
   }
   const basis = recomputeCostBasisMap(rows, actions);
   await saveCostBasisState(userId, basis, tx);
+}
+
+/** Result of a deterministic replay of SKIPPED STATEMENT equity rows. */
+export interface ReconcileSkippedEquityResult {
+  /** Journal entries whose linked source row was re-evaluated. */
+  scanned: number;
+  /** SKIPPED entries the replay promoted to POSTED (real lines written). */
+  promoted: number;
+  /** Rows that remain SKIPPED after the replay + why (idempotent re-run safe). */
+  stillSkipped: { transactionId: string; reason: string }[];
+}
+
+/**
+ * Deterministic reconcile of existing SKIPPED STATEMENT equity rows (the
+ * pre-3020 THB deposits are the motivating case: posted 1010/3010 was never
+ * possible, so imports SKIPPED them). This re-runs the REAL posting engine —
+ * postCapitalRow/buildStatementPostings — against the user's CURRENT chart of
+ * accounts (3020 seeded idempotently if missing). Every promoted entry is
+ * rebuilt through validateJournalEntry + resolveEntryAccountIds +
+ * currencyMismatchErrors, exactly like a fresh import, so NO hand-written lines
+ * and NO mutation of the source Capital_Transactions values: a re-import of the
+ * same statement produces the identical entry. Non-equity SKIPPED rows (SELL
+ * without basis, FX-only, standalone-fee ambiguity) are never touched.
+ */
+export async function reconcileSkippedEquityPostings(
+  userId: string
+): Promise<ReconcileSkippedEquityResult> {
+  await seedDefaultChartOfAccounts(userId);
+  const lookup = await loadAccountLookup(userId);
+
+  const rows = await db
+    .select()
+    .from(capitalTransactions)
+    .where(eq(capitalTransactions.userId, userId))
+    .orderBy(capitalTransactions.transactionDate, capitalTransactions.transactionId)
+    .execute();
+  const rowById = new Map(rows.map((r) => [r.transactionId, r]));
+
+  const skippedEntries = await db
+    .select()
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.userId, userId),
+        eq(journalEntries.sourceType, "STATEMENT"),
+        eq(journalEntries.postingState, "SKIPPED")
+      )
+    )
+    .orderBy(asc(journalEntries.entryNo))
+    .execute();
+
+  const result: ReconcileSkippedEquityResult = { scanned: 0, promoted: 0, stillSkipped: [] };
+  const now = new Date().toISOString();
+
+  for (const entry of skippedEntries) {
+    if (!entry.sourceTransactionId) continue;
+    const row = rowById.get(entry.sourceTransactionId);
+    if (!row) continue;
+    if ((row.category ?? "").trim().toLowerCase() !== "equity") continue;
+
+    result.scanned += 1;
+    // Replay ONLY through the pure engine (identical to a fresh import).
+    const [plan] = buildStatementJournalEntries([row as ValidatedCapitalRow]);
+    if (!plan || plan.postingState !== "POSTED") {
+      result.stillSkipped.push({
+        transactionId: row.transactionId,
+        reason: plan?.reason ?? entry.skipReason ?? "replay did not produce a keepable entry",
+      });
+      continue;
+    }
+
+    const resolved = resolveEntryAccountIds(plan.entry, lookup);
+    if (!resolved.ok) {
+      result.stillSkipped.push({
+        transactionId: row.transactionId,
+        reason: resolved.errors.join("; "),
+      });
+      continue;
+    }
+    const validated = validateJournalEntry({ ...plan.entry, lines: resolved.lines });
+    if (!validated.ok || currencyMismatchErrors(validated.entry, lookup).length > 0) {
+      const reason = !validated.ok
+        ? `invalid entry: ${validated.errors.join("; ")}`
+        : currencyMismatchErrors(validated.entry, lookup).join("; ");
+      result.stillSkipped.push({ transactionId: row.transactionId, reason });
+      continue;
+    }
+
+    // Promote: replace the SKIPPED record with the same header + REAL lines.
+    try {
+      await db.transaction(async (tx) => {
+        await tx
+          .delete(journalEntryLines)
+          .where(
+            and(
+              eq(journalEntryLines.userId, userId),
+              eq(journalEntryLines.journalEntryId, entry.id)
+            )
+          )
+          .execute();
+        await tx
+          .update(journalEntries)
+          .set({ postingState: "POSTED", skipReason: null, updatedAt: now })
+          .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entry.id)))
+          .execute();
+        for (const line of validated.entry.lines) {
+          await tx.insert(journalEntryLines).values({
+            id: randomUUID(), userId, journalEntryId: entry.id, accountId: line.accountId,
+            currency: line.currency, debitAmount: line.side === "DEBIT" ? line.amount : null,
+            creditAmount: line.side === "CREDIT" ? line.amount : null, amountThb: line.amountThb,
+            fxRateEffective: line.fxRateEffective, fxRateStatement: line.fxRateStatement,
+            fxRateProvider: line.fxRateProvider, memo: line.memo,
+          }).execute();
+        }
+      });
+      result.promoted += 1;
+    } catch (error) {
+      safeErrorLog(error);
+      result.stillSkipped.push({
+        transactionId: row.transactionId,
+        reason: "transaction failed during promotion",
+      });
+    }
+  }
+
+  return result;
 }
 
 // Reads + reports

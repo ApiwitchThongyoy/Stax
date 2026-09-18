@@ -2416,6 +2416,204 @@ async function main() {
     }
   }
 
+  // ================= REG: THB EQUITY (3020) + SKIPPED-EQUITY RECONCILE =================
+  // THB owner deposits can now be posted: the default chart of accounts includes
+  // 3020 (THB owner capital). This proves through the REAL routes + service that
+  // (a) a fresh user's CoA contains exactly one 3020, (b) a manual THB CASH_IN
+  // posts Dr 1010 / Cr 3020 (and USD still Dr 1020 / Cr 3010), and (c) the
+  // reconcile re-post of previously-SKIPPED STATEMENT equity rows is
+  // deterministic + idempotent (built via the real engine, never hand-written).
+  {
+    console.log("\n=== REG: THB EQUITY 3020 + SKIPPED-EQUITY RECONCILE ===");
+    const { randomUUID } = await import("node:crypto");
+    const equityAccountsRoute = await import("../app/routes/api/accounts");
+    const capitalLedgersRoute = await import("../app/routes/api/capital-ledgers");
+    const { reconcileSkippedEquityPostings } = await import(
+      "../app/lib/ledger-service"
+    );
+
+    const thbEmail = `thb-${randomUUID()}@test.local`;
+    const thbPassword = "ThbEquity!234";
+    const regRes = await registerAs(thbEmail, thbPassword);
+    const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
+    const thbUserId = regJson.data?.user?.id;
+    if (!thbUserId) {
+      ok(false, "REG-EQUITY: register failed to create the THB-equity user");
+    } else {
+      smokeUserIds.push(thbUserId);
+      const thbLogin = await loginAs(thbEmail, thbPassword);
+      const thbToken = thbLogin.data?.accessToken as string | undefined;
+      if (!thbToken) {
+        ok(false, "REG-EQUITY: registered THB-equity user could not log in");
+      } else {
+        // 1. Fresh registration seeds exactly one 3020 (THB owner capital).
+        const accRes = await equityAccountsRoute.loader({
+          request: authedRequest("GET", thbToken),
+        } as never);
+        const accBody = (await accRes.json()) as {
+          data?: { code: string; currency: string }[];
+        };
+        const accCodes = accBody.data ?? [];
+        const thbCap = accCodes.filter((a) => a.code === "3020");
+        ok(
+          thbCap.length === 1 && thbCap[0].currency === "THB",
+          "REG-EQUITY: fresh CoA has exactly one 3020 THB owner-capital account"
+        );
+
+        // 2. Manual THB CASH_IN -> Dr 1010 / Cr 3020 (owner deposit).
+        const thbIn = await capitalLedgersRoute.action({
+          request: jsonBody(
+            {
+              amountForeign: "5000.00",
+              currency: "THB",
+              transactionDate: "2026-01-10",
+              fxRateBot: "1",
+              amountThb: "5000.00",
+              type: "CASH_IN",
+              sourceType: "MANUAL",
+            },
+            "POST",
+            thbToken
+          ),
+        } as never);
+        const thbInJson = (await thbIn.json()) as { data?: { transactionId?: string } };
+        ok(
+          thbIn.status === 201 && !!thbInJson.data?.transactionId,
+          "REG-EQUITY: manual THB deposit created (201)"
+        );
+        if (thbInJson.data?.transactionId) {
+          const [je] = await client`
+            SELECT j.id, j.source_transaction_id, (SELECT count(*)::int FROM journal_entry_lines l WHERE l.journal_entry_id = j.id) AS lines
+            FROM journal_entries j WHERE j.source_transaction_id = ${thbInJson.data.transactionId}`;
+          ok(
+            !!je && je.lines === 2,
+            "REG-EQUITY: THB deposit mirrored in the journal with 2 lines"
+          );
+          if (je) {
+            const legs = await client`
+              SELECT a.code, a.currency, l.debit_amount, l.credit_amount
+              FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
+              WHERE l.journal_entry_id = ${je.id}`;
+            const dr = legs.find((l: any) => l.debit_amount);
+            const cr = legs.find((l: any) => l.credit_amount);
+            ok(
+              !!dr && dr.code === "1010" && dr.currency === "THB" &&
+                !!cr && cr.code === "3020" && cr.currency === "THB" &&
+                Number(dr.debit_amount) === 5000.0 && Number(cr.credit_amount) === 5000.0,
+              "REG-EQUITY: THB deposit posts Dr 1010 / Cr 3020 (not 3010)"
+            );
+          }
+        }
+
+        // 3. Manual USD CASH_IN still posts Dr 1020 / Cr 3010 (unchanged).
+        const usdIn = await capitalLedgersRoute.action({
+          request: jsonBody(
+            {
+              amountForeign: "100.00",
+              currency: "USD",
+              transactionDate: "2026-01-10",
+              fxRateBot: "35",
+              amountThb: "3500.00",
+              type: "CASH_IN",
+              sourceType: "MANUAL",
+            },
+            "POST",
+            thbToken
+          ),
+        } as never);
+        const usdInJson = (await usdIn.json()) as { data?: { transactionId?: string } };
+        if (usdInJson.data?.transactionId) {
+          const [je] = await client`
+            SELECT id FROM journal_entries WHERE source_transaction_id = ${usdInJson.data.transactionId}`;
+          const legs = await client`
+            SELECT a.code, l.debit_amount, l.credit_amount
+            FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
+            WHERE l.journal_entry_id = ${je.id}`;
+          const dr = legs.find((l: any) => l.debit_amount);
+          const cr = legs.find((l: any) => l.credit_amount);
+          ok(
+            !!dr && dr.code === "1020" && !!cr && cr.code === "3010",
+            "REG-EQUITY: USD deposit still posts Dr 1020 / Cr 3010"
+          );
+        }
+
+        // 4. Reconcile previously-SKIPPED STATEMENT equity rows. Simulate the
+        //    pre-3020 state: a THB equity STATEMENT row whose journal entry is
+        //    SKIPPED with zero lines + reason, exactly as imports recorded it.
+        const txSkipped = randomUUID();
+        await client`
+          INSERT INTO "Capital_Transactions"
+            (transaction_id, user_id, amount_foreign, currency, transaction_date,
+             amount_thb, type, source_type, source_document_id, category, section,
+             exchange, fx_rate_statement, fx_rate_effective, is_monthly_fee_aggregate)
+          VALUES (${txSkipped}, ${thbUserId}, '2500.00', 'THB', '2026-01-12', '2500.00',
+                  'CASH_IN', 'AI_PARSED', ${"doc-legacy"}, 'equity', 'ฝากเงิน',
+                  NULL, NULL, '1', false)`;
+        const entryId = randomUUID();
+        await client`
+          INSERT INTO journal_entries
+            (id, user_id, entry_no, entry_date, description, source_type,
+             source_transaction_id, status, category, section, currency,
+             amount, amount_thb, fx_rate_effective, posting_state, skip_reason,
+             created_at, updated_at, type)
+          VALUES (${entryId}, ${thbUserId}, 9001, '2026-01-12', 'รายการจากงบ (legacy THB deposit)',
+                  'STATEMENT', ${txSkipped}, 'POSTED', 'equity', 'ฝากเงิน',
+                  'THB', '2500.00', '2500.00', '1', 'SKIPPED',
+                  'no compatible THB account for 3010',
+                  ${new Date().toISOString()}, ${new Date().toISOString()}, 'CASH_IN')`;
+
+        const recon1 = await reconcileSkippedEquityPostings(thbUserId);
+        ok(
+          recon1.scanned >= 1 &&
+            recon1.stillSkipped.length === 0 &&
+            recon1.promoted >= 1,
+          "REG-EQUITY: reconcile promotes the SKIPPED THB equity entry"
+        );
+        const [postRecon] = await client`
+          SELECT posting_state, skip_reason FROM journal_entries WHERE id = ${entryId}`;
+        ok(
+          postRecon.posting_state === "POSTED" && postRecon.skip_reason === null,
+          "REG-EQUITY: promoted entry is POSTED with a cleared skip reason"
+        );
+        const legs = await client`
+          SELECT a.code, a.currency, l.debit_amount, l.credit_amount
+          FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
+          WHERE l.journal_entry_id = ${entryId}`;
+        const dr = legs.find((l: any) => l.debit_amount);
+        const cr = legs.find((l: any) => l.credit_amount);
+        ok(
+          !!dr && dr.code === "1010" && !!cr && cr.code === "3020" &&
+            Number(dr.debit_amount) === 2500.0 && Number(cr.credit_amount) === 2500.0,
+          "REG-EQUITY: reconciled entry posts real Dr 1010 / Cr 3020 lines"
+        );
+
+        // 5. Idempotent: a second reconcile touches nothing.
+        const recon2 = await reconcileSkippedEquityPostings(thbUserId);
+        ok(recon2.promoted === 0, "REG-EQUITY: re-running reconcile is a no-op");
+
+        // 6. The replay produces the identical entry as a fresh import of the
+        //    same row (same engine, same accounts) and NEVER mutates the source
+        //    Capital_Transactions row.
+        const [keptRow] = await client`
+          SELECT amount_foreign, currency, category, type, fx_rate_effective
+          FROM "Capital_Transactions" WHERE transaction_id = ${txSkipped}`;
+        ok(
+          !!keptRow && Number(keptRow.amount_foreign) === 2500.0 &&
+            keptRow.currency === "THB" && keptRow.category === "equity" &&
+            keptRow.type === "CASH_IN" &&
+            Number(keptRow.fx_rate_effective) === 1.0,
+          "REG-EQUITY: reconcile never mutates the source Capital_Transactions row"
+        );
+
+        // Self-clean the simulated rows (the shared CLEANUP also handles this
+        // user via smokeUserIds, but remove the doc-linked rows first).
+        await client`DELETE FROM journal_entry_lines WHERE user_id = ${thbUserId}`;
+        await client`DELETE FROM journal_entries WHERE user_id = ${thbUserId}`;
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${thbUserId}`;
+      }
+    }
+  }
+
   // ================= REG: TRANSACTION RECORD VIEW (ledger line -> source tx) =================
   // A statement posting attaches sourceTransactionId to each journal line; the
   // account-ledger route surfaces it on every line, and GET

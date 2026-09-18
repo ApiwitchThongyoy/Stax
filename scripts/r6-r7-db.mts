@@ -67,10 +67,12 @@ export async function runCurrencyExchangeTests(sql: postgres.Sql, ok: (value: bo
       const manual = await service.insertManualCashJournal(userId, input);
       check(manual.ok, currency + " manual cash remains recorded");
       const [entry] = await sql`SELECT * FROM journal_entries WHERE source_transaction_id=${txId}`;
-      const manualLines = await sql`SELECT l.*,a.currency AS account_currency FROM journal_entry_lines l
+      const manualLines = await sql`SELECT l.*,a.code,a.currency AS account_currency FROM journal_entry_lines l
         JOIN accounts a ON a.id=l.account_id WHERE l.journal_entry_id=${entry.id}`;
-      check(currency === "THB" ? entry.posting_state === "SKIPPED" && manualLines.length === 0 && !!entry.skip_reason
-        : entry.posting_state === "POSTED" && manualLines.length === 2 && manualLines.every(l => l.currency === l.account_currency),
+      check(entry.posting_state === "POSTED" && manualLines.length === 2 &&
+        manualLines.every(l => l.currency === l.account_currency) &&
+        manualLines.some(l => l.code === (currency === "THB" ? "1010" : "1020")) &&
+        manualLines.some(l => l.code === (currency === "THB" ? "3020" : "3010")),
         currency + " manual path enforces the same account-currency rule");
       await service.syncCapitalLedgerJournal(userId, txId, { ...input, currency: "USD", fxRateEffective: "35" });
       const updated = await sql`SELECT l.*,a.currency AS account_currency FROM journal_entry_lines l
@@ -81,8 +83,8 @@ export async function runCurrencyExchangeTests(sql: postgres.Sql, ok: (value: bo
       const [after] = await sql`SELECT posting_state,
         (SELECT count(*)::int FROM journal_entry_lines l WHERE l.journal_entry_id=e.id) AS line_count
         FROM journal_entries e WHERE id=${entry.id}`;
-      check(after.posting_state === "SKIPPED" && after.line_count === 0,
-        "manual update to unsupported THB leaves no incompatible lines");
+      check(after.posting_state === "POSTED" && after.line_count === 2,
+        "manual update to THB posts compatible 1010/3020 lines");
     }
     for (const [currency, cash] of [["THB", "1020"], ["USD", "1010"]]) {
       const rejected = await service.createJournalEntry(userId, {
