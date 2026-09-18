@@ -1063,6 +1063,165 @@ async function main() {
     }
   }
 
+  // ================= REG: IMPORT PERSISTENCE VERIFICATION =================
+  // Regression for the production symptom "UI shows success but nothing was
+  // persisted" (Supabase transaction-pooler prepared-statement failure surfacing
+  // as a committed-but-empty import). The upload route now gates its success
+  // response AND the STATEMENT_IMPORT audit behind verifyStatementImportPersistence,
+  // which re-reads the committed rows + their 1:1 journal mirrors. This block
+  // proves the gate's logic against the REAL database: a healthy import passes,
+  // a simulated pooler row loss is detected, a rebuild after loss restores the
+  // exact 1:1 state, and a duplicated journal mirror is rejected.
+  {
+    const { verifyStatementImportPersistence } = await import("../app/lib/ledger-service");
+    const persLines = [
+      "TRADE RECORDS",
+      "Currency: USD",
+      "USD/THB = 35.42",
+      "VRMAX",
+      "02/01/2026 10:00:00,GMT+07 02/01/2026 BUY 100 10.00 1000.00 1000.00 1.00 0.07 NASDAQ",
+      "VRMAX",
+      "03/01/2026 10:00:00,GMT+07 03/01/2026 BUY 100 20.00 2000.00 2000.00 1.50 0.10 NYSE",
+      "VRMAX",
+      "04/01/2026 10:00:00,GMT+07 04/01/2026 SELL 50 30.00 1500.00 1497.93 1.00 0.07 NASDAQ",
+      "PORTFOLIO SUMMARY",
+    ];
+    const persFile = new File(
+      [makePdf(persLines) as BlobPart],
+      "w2-persist-check.pdf",
+      { type: "application/pdf" }
+    );
+    const persUpload = (token: string) => {
+      const fd = new FormData();
+      fd.append("file", persFile);
+      return uploadRoute.action({
+        request: new Request("http://test.local/api/v1/statements/upload", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }),
+      } as never);
+    };
+    if (tokenA && userARow) {
+      // clean slate for the fixture
+      const priorPersDocs = await client`SELECT id FROM documents WHERE user_id = ${userARow.id} AND original_name = 'w2-persist-check.pdf'`;
+      for (const d of priorPersDocs) {
+        await client`DELETE FROM journal_entry_lines WHERE user_id = ${userARow.id} AND journal_entry_id IN (SELECT id FROM journal_entries WHERE user_id = ${userARow.id} AND source_document_id = ${d.id})`;
+        await client`DELETE FROM "Capital_Transactions" WHERE source_document_id = ${d.id} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM journal_entries WHERE source_document_id = ${d.id} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM documents WHERE id = ${d.id} AND user_id = ${userARow.id}`;
+      }
+
+      // 1. Healthy import passes the persistence gate.
+      const up1 = await persUpload(tokenA);
+      const up1Body = (await up1.json()) as {
+        data?: { documentId?: string; saved?: number; transactionIds?: string[] };
+      };
+      const persDoc = up1Body.data?.documentId;
+      const persSaved = up1Body.data?.saved ?? -1;
+      const persIds = up1Body.data?.transactionIds ?? [];
+      ok(
+        up1.status === 200 && persSaved >= 6 && !!persDoc && persIds.length >= 6,
+        "REG-persist: healthy import saves >= 6 rows and returns their transaction ids"
+      );
+      if (persDoc && persIds.length > 0) {
+        const proof1 = await verifyStatementImportPersistence({
+          userId: userARow.id,
+          documentId: persDoc,
+          insertedCount: persSaved,
+          transactionIds: persIds,
+        });
+        ok(
+          proof1.ok &&
+            proof1.capitalRows === persSaved &&
+            proof1.journalEntries === persSaved &&
+            proof1.missingRows.length === 0 &&
+            proof1.duplicateJournalTransactions.length === 0,
+          "REG-persist: persistence gate PASSES on a healthy import (rows + 1:1 journal mirrors)"
+        );
+
+        // 2. Simulate the pooler loss (rows silently vanish). The gate must FAIL.
+        await client`DELETE FROM journal_entry_lines WHERE user_id = ${userARow.id} AND journal_entry_id IN (SELECT id FROM journal_entries WHERE user_id = ${userARow.id} AND source_document_id = ${persDoc})`;
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${userARow.id} AND source_document_id = ${persDoc}`;
+        await client`DELETE FROM journal_entries WHERE user_id = ${userARow.id} AND source_document_id = ${persDoc}`;
+        const proof2 = await verifyStatementImportPersistence({
+          userId: userARow.id,
+          documentId: persDoc,
+          insertedCount: persSaved,
+          transactionIds: persIds,
+        });
+        ok(
+          !proof2.ok &&
+            proof2.capitalRows === 0 &&
+            proof2.missingRows.length === persSaved,
+          "REG-persist: gate FAILS when the committed rows silently vanish (the production symptom)"
+        );
+
+        // 3. Reload the file (rebuild path) -> the gate passes again after restore.
+        const up2 = await persUpload(tokenA);
+        const up2Body = (await up2.json()) as {
+          data?: { documentId?: string; saved?: number; transactionIds?: string[]; rebuilt?: boolean };
+        };
+        ok(
+          up2.status === 200 &&
+            up2Body.data?.documentId === persDoc &&
+            up2Body.data?.rebuilt === true &&
+            (up2Body.data?.saved ?? 0) === persSaved,
+          "REG-persist: re-upload rebuilds under the SAME document id and reports the same count"
+        );
+        const proof3 = await verifyStatementImportPersistence({
+          userId: userARow.id,
+          documentId: persDoc,
+          insertedCount: persSaved,
+          transactionIds: up2Body.data?.transactionIds ?? [],
+        });
+        ok(
+          proof3.ok &&
+            proof3.capitalRows === persSaved &&
+            proof3.journalEntries === persSaved,
+          "REG-persist: gate PASSES again after the rebuild (full restoration + 1:1 mirrors)"
+        );
+
+        // 4. Duplicated journal mirror for one transaction -> gate rejects it.
+        const dupTxnId = up2Body.data?.transactionIds?.[0];
+        if (dupTxnId && proof3.capitalRows > 1) {
+          const dupSource = (await client`
+            SELECT id, source_transaction_id FROM journal_entries
+            WHERE user_id = ${userARow.id} AND source_document_id = ${persDoc}
+            AND source_transaction_id != ${dupTxnId} LIMIT 1`)[0] as { id: string; source_transaction_id: string } | undefined;
+          if (dupSource) {
+            await client`
+              UPDATE journal_entries SET source_transaction_id = ${dupTxnId}
+              WHERE id = ${dupSource.id} AND user_id = ${userARow.id}`;
+            const proof4 = await verifyStatementImportPersistence({
+              userId: userARow.id,
+              documentId: persDoc,
+              insertedCount: persSaved,
+              transactionIds: up2Body.data?.transactionIds ?? [],
+            });
+            ok(
+              !proof4.ok &&
+                proof4.duplicateJournalTransactions.includes(dupTxnId),
+              "REG-persist: gate rejects a duplicated journal mirror (source_transaction_id is not 1:1)"
+            );
+            await client`
+              UPDATE journal_entries SET source_transaction_id = ${dupSource.source_transaction_id}
+              WHERE id = ${dupSource.id} AND user_id = ${userARow.id}`;
+          } else {
+            ok(true, "REG-persist: (vacuous) no second transaction to duplicate - skipped");
+          }
+        }
+
+        // cleanup
+        await client`DELETE FROM journal_entry_lines WHERE user_id = ${userARow.id} AND journal_entry_id IN (SELECT id FROM journal_entries WHERE user_id = ${userARow.id} AND source_document_id = ${persDoc})`;
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${userARow.id} AND source_document_id = ${persDoc}`;
+        await client`DELETE FROM journal_entries WHERE source_document_id = ${persDoc} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM documents WHERE id = ${persDoc} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM notifications WHERE entity_id = ${persDoc}`;
+      }
+    }
+  }
+
   // ================= REG: STATEMENT PREVIEW (แสดงรายละเอียดก่อน + OK ค่อยนำเข้า) =================
   // POST /api/v1/statements/preview must return the FULL parsed rows + stats for
   // the "ตรวจสอบเอกสารก่อนนำเข้า" screen WITHOUT persisting anything (no storage

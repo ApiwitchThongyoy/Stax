@@ -400,8 +400,9 @@ ok(
     uploadPage.includes("setDuplicateModal({ open: true, fileName: f.name })") &&
     uploadPage.includes("!importIsDuplicate") &&
     uploadPage.includes("setPhase(\"done\")") &&
-    uploadPage.includes("if (mountedRef.current && !importIsDuplicate) setPhase(\"done\")"),
-  "duplicate stops the loading animation, returns to idle (never 'ผลการนำเข้า'), and the done transition is guarded by !importIsDuplicate"
+    uploadPage.includes("if (mountedRef.current && !importIsDuplicate) {") &&
+    uploadPage.includes("lastSaved > 0 && onImportSuccess"),
+  "duplicate stops the loading animation, returns to idle (never 'ผลการนำเข้า'), and the done transition is guarded by !importIsDuplicate (refresh fires only on a genuine save)"
 );
 
 // ---------------------------------------------------------------------------
@@ -518,6 +519,22 @@ ok(
   uploadPage.includes("duplicateDecision === \"rebuilt\"") &&
     uploadPage.includes("ข้อมูลเก่าของ Statement นี้ถูกลบไปก่อนหน้า"),
   "rebuild preview explains the re-import semantics before the user commits with OK"
+);
+ok(
+  uploadPage.includes("body.data.duplicate === true || body.data.duplicates === true") &&
+    uploadPage.includes("body.data.saved === 0") &&
+    uploadPage.includes("body.data.unsupported === true") &&
+    uploadPage.includes("duplicateDecision === \"unsupported\""),
+  "an upload result with saved 0 / duplicates / unsupported never renders as a normal success (guarded in the upload path)"
+);
+ok(
+  uploadPage.includes("lastSaved > 0 && onImportSuccess") &&
+    uploadPage.includes("onImportSuccess?: () => void"),
+  "a genuinely successful import (saved > 0) pings the Dashboard refresh via the optional onImportSuccess prop"
+);
+ok(
+  dashboard.includes("onImportSuccess={refreshServerData}"),
+  "Dashboard wires StatementUploadPage.onImportSuccess to refreshServerData so home widgets update after an import"
 );
 
 // ---------------------------------------------------------------------------
