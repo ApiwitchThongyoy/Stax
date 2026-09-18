@@ -243,8 +243,11 @@ function resolveEntryAccountIds(
   return { ok: true, lines };
 }
 
-async function nextEntryNo(userId: string): Promise<number> {
-  const [{ value }] = await db
+async function nextEntryNo(
+  userId: string,
+  conn: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0] = db,
+): Promise<number> {
+  const [{ value }] = await conn
     .select({ value: max(journalEntries.entryNo) })
     .from(journalEntries)
     .where(eq(journalEntries.userId, userId))
@@ -306,7 +309,7 @@ export async function createJournalEntry(
   try {
     await db.transaction(async (tx) => {
       await assertOwnedReferences(tx, userId, entry);
-      const entryNo = await nextEntryNo(userId);
+      const entryNo = await nextEntryNo(userId, tx);
       await tx
         .insert(journalEntries)
         .values({
@@ -538,7 +541,7 @@ export async function insertManualCashJournal(
   try {
     await db.transaction(async (tx) => {
       await assertOwnedReferences(tx, userId, entry);
-      const entryNo = await nextEntryNo(userId);
+      const entryNo = await nextEntryNo(userId, tx);
       await tx
         .insert(journalEntries)
         .values({
@@ -662,7 +665,7 @@ export async function insertBackfilledJournalEntry(
   try {
     await db.transaction(async (tx) => {
       await assertOwnedReferences(tx, userId, entry);
-      const entryNo = await nextEntryNo(userId);
+      const entryNo = await nextEntryNo(userId, tx);
       await tx
         .insert(journalEntries)
         .values({
@@ -1023,7 +1026,7 @@ export async function insertStatementImport(
       transactionIds.push(row.transactionId);
     }
 
-    const base = await nextEntryNo(userId);
+    const base = await nextEntryNo(userId, tx);
     for (const [idx, plan] of plans.entries()) {
       const entryNo = base + idx + 1;
       const entry = plan.validated.entry;
