@@ -44,6 +44,17 @@ function readStoredUser(): AuthUser | null {
   }
 }
 
+function loginRateLimitMessage(response: Response): string {
+  const retryAfterSeconds = Number(response.headers.get("Retry-After"));
+
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    const retryMinutes = Math.max(1, Math.ceil(retryAfterSeconds / 60));
+    return `มีการพยายามเข้าสู่ระบบหลายครั้งเกินไป กรุณาลองใหม่อีกครั้งในประมาณ ${retryMinutes} นาที`;
+  }
+
+  return "มีการพยายามเข้าสู่ระบบหลายครั้งเกินไป กรุณารอสักครู่แล้วลองใหม่อีกครั้ง";
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(() => readStoredUser());
 
@@ -77,6 +88,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         data = await response.json();
       } catch {
         data = {};
+      }
+
+      if (response.status === 429) {
+        return { success: false, error: loginRateLimitMessage(response) };
       }
 
       if (response.status === 401) {
