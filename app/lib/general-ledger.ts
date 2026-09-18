@@ -684,3 +684,124 @@ export function summarizeLinesBySymbol(
     }))
     .sort((a, b) => a.symbol.localeCompare(b.symbol) || a.currency.localeCompare(b.currency));
 }
+
+// ---------------------------------------------------------------------------
+// Account-category batch summary (one server call for ALL accounts of a class,
+// no N+1). Mirrors getAccountLedger semantics so the category page and the
+// per-account detail page can never disagree:
+//   - opening    = account.openingBalance + POSTED postings with entryDate < from
+//   - movement   = net POSTED activity on/after `from` (on the account's normal
+//                  side: ASSET/EXPENSE debit-positive, LIABILITY/EQUITY/INCOME
+//                  credit-positive)
+//   - closing    = opening + movement
+//   - lineCount  = number of POSTED journal lines in the period
+// SKIPPED entries are handled upstream (only POSTED lines are ever passed in) —
+// this engine never sees them and therefore never counts them.
+// ---------------------------------------------------------------------------
+
+export interface AccountLedgerSummaryLineInput {
+  accountId: string;
+  /** ISO date (yyyy-mm-dd) of the owning journal entry. */
+  entryDate: string;
+  side: Side;
+  amount: string;
+}
+
+export interface AccountLedgerSummaryInput extends AccountInfo {
+  accountId: string;
+  /** accounts.openingBalance (null = no opening balance recorded). */
+  openingBalance: string | null;
+}
+
+/** One row per account in the queried category, native currency only. */
+export interface AccountLedgerSummaryRow extends AccountInfo {
+  accountId: string;
+  /** Balance accumulated before `from` (openingBalance + prior POSTED lines). */
+  opening: string;
+  /** Gross POSTED debits in the period. */
+  debitMovement: string;
+  /** Gross POSTED credits in the period. */
+  creditMovement: string;
+  /** netMovement on the account's normal side (closing − opening). */
+  netMovement: string;
+  /** opening + netMovement (balance through the as-of cutoff). */
+  closing: string;
+  /** POSTED journal lines in the period. */
+  lineCount: number;
+}
+
+export interface AccountLedgerSummaryCurrencyTotal {
+  currency: string;
+  opening: string;
+  movement: string;
+  closing: string;
+}
+
+export interface AccountLedgerSummaryResult {
+  rows: AccountLedgerSummaryRow[];
+  totalsByCurrency: AccountLedgerSummaryCurrencyTotal[];
+}
+
+export function summarizeAccountLedgers(
+  accounts: readonly AccountLedgerSummaryInput[],
+  lines: readonly AccountLedgerSummaryLineInput[],
+  from?: string
+): AccountLedgerSummaryResult {
+  const linesByAccount = new Map<string, AccountLedgerSummaryLineInput[]>();
+  for (const line of lines) {
+    const bucket = linesByAccount.get(line.accountId);
+    if (bucket) bucket.push(line);
+    else linesByAccount.set(line.accountId, [line]);
+  }
+  const rows: AccountLedgerSummaryRow[] = [];
+  for (const a of accounts) {
+    const normalSide = normalSideOf(a.type);
+    const movementOf = (l: AccountLedgerSummaryLineInput) =>
+      new Decimal(l.amount).mul(l.side === normalSide ? 1 : -1);
+
+    let opening = new Decimal(a.openingBalance ?? "0");
+    const period: AccountLedgerSummaryLineInput[] = [];
+    for (const l of linesByAccount.get(a.accountId) ?? []) {
+      if (from && l.entryDate < from) {
+        opening = opening.plus(movementOf(l));
+      } else {
+        period.push(l);
+      }
+    }
+
+    let debit = new Decimal(0);
+    let credit = new Decimal(0);
+    for (const l of period) {
+      if (l.side === "DEBIT") debit = debit.plus(l.amount);
+      else credit = credit.plus(l.amount);
+    }
+    const net = normalSide === "DEBIT" ? debit.minus(credit) : credit.minus(debit);
+    const closing = opening.plus(net);
+
+    rows.push({
+      accountId: a.accountId,
+      code: a.code,
+      name: a.name,
+      type: a.type,
+      currency: a.currency,
+      opening: fmt(opening),
+      debitMovement: fmt(debit),
+      creditMovement: fmt(credit),
+      netMovement: fmt(net),
+      closing: fmt(closing),
+      lineCount: period.length,
+    });
+  }
+  const totalsByCurrency = [...new Set(rows.map((r) => r.currency))]
+    .sort()
+    .map((currency) => {
+      const rs = rows.filter((r) => r.currency === currency);
+      return {
+        currency,
+        opening: fmt(rs.reduce((s, r) => s.plus(r.opening), new Decimal(0))),
+        movement: fmt(rs.reduce((s, r) => s.plus(r.netMovement), new Decimal(0))),
+        closing: fmt(rs.reduce((s, r) => s.plus(r.closing), new Decimal(0))),
+      };
+    });
+  return { rows, totalsByCurrency };
+}

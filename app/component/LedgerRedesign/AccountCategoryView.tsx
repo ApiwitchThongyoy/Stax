@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { Plus, X, Landmark, ArrowLeft, Wallet, Percent, Receipt, PiggyBank, Table2, ChevronLeft, ChevronRight, Search } from "lucide-react";
 import { useAuth } from "../../lib/auth";
@@ -7,11 +7,13 @@ import {
   flagSuspendedFromResponse,
 } from "../../lib/suspended-account";
 import {
-  fetchAccounts,
   fetchAccountLedger,
+  fetchAccountCategorySummary,
   fetchUserTransaction,
   type CapitalLedgerRow,
   type GeneralLedgerAccount,
+  type GeneralLedgerAccountCategoryRow,
+  type GeneralLedgerAccountCategorySummary,
   type GeneralLedgerAccountType,
   type GeneralLedgerLineView,
   type GeneralLedgerSymbolSummary,
@@ -20,7 +22,6 @@ import {
   AccountTypeBadge,
   formatAmount,
   formatSignedAmount,
-  formatBaht,
   PeriodFilter,
   defaultPeriod,
   LoadingRows,
@@ -143,6 +144,18 @@ export default function AccountCategoryView({
   const [form, setForm] = useState<AddForm>(emptyAddForm(type));
   const [formError, setFormError] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+  // Batch ledger summary for THIS category loaded with ONE request (no N+1).
+  const [categorySummary, setCategorySummary] =
+    useState<GeneralLedgerAccountCategorySummary | null>(null);
+  const summaryRows = useMemo(() => {
+    const m = new Map<string, GeneralLedgerAccountCategoryRow>();
+    for (const r of categorySummary?.summary.rows ?? []) m.set(r.accountId, r);
+    return m;
+  }, [categorySummary]);
+  const categoryTotals = categorySummary?.summary.totalsByCurrency ?? [];
+  const [categoryPeriod, setCategoryPeriod] = useState(defaultPeriod);
+  const [categoryRange, setCategoryRange] = useState(categoryPeriod);
+  const categoryRequest = useRef(0);
 
   // ---- ดูรายละเอียดบัญชี (account ledger) ----
   const [selected, setSelected] = useState<GeneralLedgerAccount | null>(null);
@@ -206,24 +219,34 @@ export default function AccountCategoryView({
   const loadAccounts = useCallback(async () => {
     if (suspended) return;
     if (!user?.accessToken) return;
+    const requestId = ++categoryRequest.current;
     setLoadState("loading");
+    setCategorySummary(null);
     setLoadError("");
     try {
-      const rows = await fetchAccounts(user.accessToken);
-      const filtered = rows.filter((a) => a.type === type);
-      setAccounts(filtered);
+      const summary = await fetchAccountCategorySummary(
+          user.accessToken,
+          type,
+          categoryRange.from,
+          categoryRange.to
+        );
+      if (requestId !== categoryRequest.current) return;
+      setAccounts(summary.accounts);
+      setCategorySummary(summary);
       setLoadState("success");
     } catch {
+      if (requestId !== categoryRequest.current) return;
       setLoadState("error");
       setLoadError("ดึงผังบัญชีไม่สำเร็จ กรุณาลองใหม่อีกครั้ง");
     }
-  }, [user?.accessToken, suspended, type]);
+  }, [user?.accessToken, suspended, type, categoryRange]);
 
   useEffect(() => {
     setSelected(null);
     setForm(emptyAddForm(type));
     setFormError("");
     void loadAccounts();
+    return () => { categoryRequest.current++; };
   }, [type, loadAccounts]);
 
   // ---- ดูรายละเอียดบัญชี ----
@@ -350,7 +373,7 @@ export default function AccountCategoryView({
       return;
     }
 
-    setAccounts((prev) => [...prev, data.data as GeneralLedgerAccount]);
+    void loadAccounts();
     setIsSaving(false);
     closeModal();
   };
@@ -728,12 +751,6 @@ export default function AccountCategoryView({
     );
   }
 
-  // สรุปหมวด
-  const totalOpening = accounts.reduce((sum, a) => {
-    const n = a.openingBalance == null ? 0 : Number(a.openingBalance);
-    return sum + (Number.isFinite(n) ? n : 0);
-  }, 0);
-
   const searching = query.trim() !== "";
   const filteredAccounts = searching
     ? accounts.filter((row) => {
@@ -783,10 +800,23 @@ export default function AccountCategoryView({
           <p className="text-xl font-semibold text-gray-800 mt-2">{accounts.length}</p>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
-          <span className="text-xs text-gray-400">ยอดยกมารวม</span>
-          <p className="text-xl font-semibold text-gray-800 mt-2">
-            {totalOpening !== 0 ? formatBaht(totalOpening) : "฿0.00"}
-          </p>
+          <span className="text-xs text-gray-400">ยอดคงเหลือตามสกุล</span>
+          {categoryTotals.length === 0 ? (
+            <p className="text-sm font-medium text-gray-600 mt-2">-</p>
+          ) : (
+            <div className="mt-2 space-y-1.5">
+              {categoryTotals.map((t) => (
+                <p key={t.currency} className="text-sm font-semibold text-gray-800">
+                  {t.currency} · ปิด {formatAmount(t.closing)}
+                  <span className="text-xs text-gray-400 font-normal">
+                    {" "}
+                    (ยกมา {formatAmount(t.opening)} · เคลื่อนไหว{" "}
+                    {formatSignedAmount(t.movement)})
+                  </span>
+                </p>
+              ))}
+            </div>
+          )}
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <span className="text-xs text-gray-400">สถานะ</span>
@@ -797,6 +827,20 @@ export default function AccountCategoryView({
       </div>
 
       <div className="mt-6">
+        <div className="mb-4">
+          <PeriodFilter
+            from={categoryPeriod.from}
+            to={categoryPeriod.to}
+            onFromChange={(from) => setCategoryPeriod((p) => ({ ...p, from }))}
+            onToChange={(to) => setCategoryPeriod((p) => ({ ...p, to }))}
+            onApply={() => setCategoryRange({ ...categoryPeriod })}
+            onClear={() => {
+              const range = defaultPeriod();
+              setCategoryPeriod(range);
+              setCategoryRange(range);
+            }}
+          />
+        </div>
         <Panel
           title={`รายการบัญชี${label}`}
           actions={
@@ -863,11 +907,16 @@ export default function AccountCategoryView({
                     <th className="px-5 py-3 font-medium">ประเภท</th>
                     <th className="px-5 py-3 font-medium">สกุลเงิน</th>
                     <th className="px-5 py-3 font-medium text-right">ยอดยกมา</th>
-                    <th className="px-5 py-3" />
+                    <th className="px-5 py-3 font-medium text-right">เคลื่อนไหว</th>
+                    <th className="px-5 py-3 font-medium text-right">ยอดคงเหลือ</th>
+                    <th className="px-5 py-3 font-medium text-right">จำนวนรายการ</th>
+                    <th className="px-5 py-3 font-medium text-right">ดูรายละเอียด</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredAccounts.map((row) => (
+                  {filteredAccounts.map((row) => {
+                    const s = summaryRows.get(row.id);
+                    return (
                     <tr
                       key={row.id}
                       onClick={() => setSelected(row)}
@@ -884,9 +933,16 @@ export default function AccountCategoryView({
                       </td>
                       <td className="px-5 py-3.5 text-gray-500">{row.currency}</td>
                       <td className="px-5 py-3.5 text-gray-600 text-right whitespace-nowrap">
-                        {row.openingBalance != null
-                          ? formatAmount(row.openingBalance)
-                          : "-"}
+                        {s ? formatAmount(s.opening) : "-"}
+                      </td>
+                      <td className="px-5 py-3.5 text-gray-600 text-right whitespace-nowrap">
+                        {s ? formatSignedAmount(s.netMovement) : "-"}
+                      </td>
+                      <td className="px-5 py-3.5 text-gray-700 font-medium text-right whitespace-nowrap">
+                        {s ? formatSignedAmount(s.closing) : "-"}
+                      </td>
+                      <td className="px-5 py-3.5 text-gray-600 text-right">
+                        {s ? s.lineCount : "-"}
                       </td>
                       <td className="px-5 py-3.5">
                         <div className="flex items-center justify-end text-blue-800 text-xs font-medium">
@@ -894,7 +950,8 @@ export default function AccountCategoryView({
                         </div>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

@@ -498,6 +498,23 @@ export type GeneralLedgerTotalsThb = GeneralLedgerSummary["totalsThb"];
 /** Result of GET /api/v1/ledger/summary (overview numbers, all server-computed). */
 export type GeneralLedgerSummary = import("./ledger-service").LedgerSummary;
 
+/** Batch account-category summary row: GET /api/v1/ledger/accounts/summary. */
+export type GeneralLedgerAccountCategoryRow = import("./general-ledger").AccountLedgerSummaryRow;
+
+export type GeneralLedgerAccountCategoryCurrencyTotal = import("./general-ledger").AccountLedgerSummaryCurrencyTotal;
+
+/** Result shape of the batch category summary endpoint. */
+export interface GeneralLedgerAccountCategorySummary {
+  accounts: GeneralLedgerAccount[];
+  type: GeneralLedgerAccountType;
+  from: string | null;
+  to: string | null;
+  summary: {
+    rows: GeneralLedgerAccountCategoryRow[];
+    totalsByCurrency: GeneralLedgerAccountCategoryCurrencyTotal[];
+  };
+}
+
 /** Single holding returned by GET /api/v1/cost-basis. */
 export interface CostBasisHolding {
   symbol: string;
@@ -697,6 +714,31 @@ export async function fetchAccountLedger(
   const out = await okJson<GeneralLedgerAccountLedger>(res);
   if (!out.ok || !out.data) {
     throw new Error(out.message || "Failed to load account ledger");
+  }
+  return out.data;
+}
+
+/**
+ * Fetch the batch summary for EVERY account of one account class in ONE request
+ * (no per-account N+1). opening = balance before `from`, movement/closing and
+ * lineCount come from POSTED lines in [from, to]; totals stay grouped by native
+ * currency. All server-computed — the UI never recomputes balances.
+ */
+export async function fetchAccountCategorySummary(
+  accessToken: string,
+  type: GeneralLedgerAccountType,
+  from?: string,
+  to?: string
+): Promise<GeneralLedgerAccountCategorySummary> {
+  const params = new URLSearchParams({ type });
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  const res = await fetch(`/api/v1/ledger/accounts/summary?${params.toString()}`, {
+    headers: authHeaders(accessToken),
+  });
+  const out = await okJson<GeneralLedgerAccountCategorySummary>(res);
+  if (!out.ok || !out.data) {
+    throw new Error(out.message || "Failed to load account summary");
   }
   return out.data;
 }

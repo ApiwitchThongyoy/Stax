@@ -16,9 +16,12 @@ import {
   balanceSheet,
   buildReversal,
   incomeStatement,
+  summarizeAccountLedgers,
   summarizeLinesBySymbol,
   trialBalance,
   validateJournalEntry,
+  type AccountLedgerSummaryInput,
+  type AccountLedgerSummaryLineInput,
   type AccountMap,
   type JournalEntryInput,
 } from "../app/lib/general-ledger";
@@ -1586,6 +1589,177 @@ async function main() {
     sellRow.type === null && sellRow.costBasis === "359.52",
     "mapper: SELL keeps null type + preserved basis"
   );
+
+  // ---- R18: account-category batch summary (pure engine) ----
+  console.log("=== ACCOUNT-CATEGORY BATCH SUMMARY (summarizeAccountLedgers) ===");
+  {
+    const accounts: AccountLedgerSummaryInput[] = [
+      {
+        accountId: "a-1010",
+        code: "1010",
+        name: "เงินสด (THB)",
+        type: "ASSET",
+        currency: "THB",
+        openingBalance: "1000",
+      },
+      {
+        accountId: "a-3010",
+        code: "3010",
+        name: "ส่วนทุน",
+        type: "EQUITY",
+        currency: "THB",
+        openingBalance: "0",
+      },
+      {
+        accountId: "a-4010",
+        code: "4010",
+        name: "เงินปันผล",
+        type: "INCOME",
+        currency: "USD",
+        openingBalance: "900",
+      },
+      {
+        accountId: "a-5010",
+        code: "5010",
+        name: "ค่าธรรมเนียม",
+        type: "EXPENSE",
+        currency: "USD",
+        openingBalance: null,
+      },
+    ];
+    const lines: AccountLedgerSummaryLineInput[] = [
+      // prior-period -> opening only
+      { accountId: "a-1010", entryDate: "2025-12-15", side: "DEBIT", amount: "500" },
+      { accountId: "a-3010", entryDate: "2025-12-20", side: "CREDIT", amount: "1500" },
+      // exactly ON `from` -> period, not opening
+      { accountId: "a-1010", entryDate: "2026-01-01", side: "DEBIT", amount: "200" },
+      { accountId: "a-1010", entryDate: "2026-01-05", side: "CREDIT", amount: "100" },
+      { accountId: "a-3010", entryDate: "2026-01-02", side: "CREDIT", amount: "300" },
+      { accountId: "a-4010", entryDate: "2026-01-03", side: "CREDIT", amount: "700" },
+      { accountId: "a-4010", entryDate: "2026-01-07", side: "DEBIT", amount: "40" },
+      // line dated AFTER to is dropped by the caller (to filter), so the engine
+      // must not see it; here it is simply absent from the input lines.
+    ];
+
+    const res = summarizeAccountLedgers(accounts, lines, "2026-01-01");
+    const byId = new Map(res.rows.map((r) => [r.accountId, r]));
+
+    ok(res.rows.length === 4, "one row per account in the category");
+    const a1010 = byId.get("a-1010");
+    ok(
+      a1010?.opening === "1500.00" &&
+        a1010?.debitMovement === "200.00" &&
+        a1010?.creditMovement === "100.00" &&
+        a1010?.netMovement === "100.00" &&
+        a1010?.closing === "1600.00",
+      "ASSET (debit-normal): prior + openingBalance -> opening 1500, period net +100, closing 1600"
+    );
+    ok(a1010?.lineCount === 2, "lineCount = POSTED lines on/after from only (2)");
+    ok(
+      a1010?.opening === "1500.00" && a1010?.debitMovement === "200.00",
+      "line dated exactly on `from` is treated as period, NOT opening (opening stays 1500)"
+    );
+
+    const a3010 = byId.get("a-3010");
+    ok(
+      a3010?.opening === "1500.00" &&
+        a3010?.netMovement === "300.00" &&
+        a3010?.closing === "1800.00",
+      "EQUITY (credit-normal): prior credit -> opening 1500, period net +300, closing 1800"
+    );
+
+    const a4010 = byId.get("a-4010");
+    ok(
+      a4010?.opening === "900.00" &&
+        a4010?.debitMovement === "40.00" &&
+        a4010?.creditMovement === "700.00" &&
+        a4010?.netMovement === "660.00" &&
+        a4010?.closing === "1560.00",
+      "INCOME (credit-normal): opening 900 preserved, credit-debit net +660, closing 1560"
+    );
+    ok(a4010?.lineCount === 2, "income lineCount counts both period lines");
+
+    const a5010 = byId.get("a-5010");
+    ok(
+      a5010?.opening === "0.00" &&
+        a5010?.debitMovement === "0.00" &&
+        a5010?.creditMovement === "0.00" &&
+        a5010?.netMovement === "0.00" &&
+        a5010?.closing === "0.00" &&
+        a5010?.lineCount === 0,
+      "null openingBalance -> 0 opening; no lines -> zero row"
+    );
+
+    const thb = res.totalsByCurrency.find((t) => t.currency === "THB");
+    const usd = res.totalsByCurrency.find((t) => t.currency === "USD");
+    ok(
+      thb?.opening === "3000.00" &&
+        thb?.movement === "400.00" &&
+        thb?.closing === "3400.00",
+      "THB totals: opening 3000, movement (net) 400, closing 3400"
+    );
+    ok(
+      usd?.opening === "900.00" &&
+        usd?.movement === "660.00" &&
+        usd?.closing === "1560.00",
+      "USD totals stay separate from THB (never summed across currencies)"
+    );
+    ok(
+      res.totalsByCurrency.map((t) => t.currency).join(",") === "THB,USD",
+      "totalsByCurrency sorted by currency code"
+    );
+
+    const noFrom = summarizeAccountLedgers(
+      [
+        {
+          accountId: "a-1010",
+          code: "1010",
+          name: "เงินสด (THB)",
+          type: "ASSET",
+          currency: "THB",
+          openingBalance: "0",
+        },
+      ],
+      lines.filter((l) => l.accountId === "a-1010")
+    );
+    ok(
+      noFrom.rows[0]?.opening === "0.00" &&
+        noFrom.rows[0]?.netMovement === "600.00" &&
+        noFrom.rows[0]?.closing === "600.00" &&
+        noFrom.rows[0]?.lineCount === 3,
+      "no `from`: every line is period, opening = openingBalance only"
+    );
+
+    const empty = summarizeAccountLedgers(
+      [{ accountId: "x", code: "9999", name: "ว่าง", type: "EXPENSE", currency: "THB", openingBalance: null }],
+      []
+    );
+    ok(
+      empty.rows.length === 1 &&
+        empty.rows[0].closing === "0.00" &&
+        empty.rows[0].lineCount === 0 &&
+        empty.totalsByCurrency.length === 1 &&
+        empty.totalsByCurrency[0].closing === "0.00",
+      "empty category input -> zeroed totals (never invent movement)"
+    );
+    const none = summarizeAccountLedgers([], []);
+    ok(
+      none.rows.length === 0 && none.totalsByCurrency.length === 0,
+      "no accounts -> empty result"
+    );
+    for (const type of ["ASSET", "EXPENSE", "LIABILITY", "EQUITY", "INCOME"] as const) {
+      const signed = summarizeAccountLedgers([
+        { accountId: "signed", code: "9998", name: "Signed balance", type, currency: "USD", openingBalance: "10" },
+      ], [
+        { accountId: "signed", entryDate: "2025-12-31", side: "CREDIT", amount: "3" },
+        { accountId: "signed", entryDate: "2026-01-01", side: "DEBIT", amount: "2.25" },
+        { accountId: "signed", entryDate: "2026-01-01", side: "CREDIT", amount: "20.50" },
+      ], "2026-01-01").rows[0];
+      const debitNormal = type === "ASSET" || type === "EXPENSE";
+      ok(signed.opening === (debitNormal ? "7.00" : "13.00") && signed.netMovement === (debitNormal ? "-18.25" : "18.25") && signed.closing === (debitNormal ? "-11.25" : "31.25") && signed.lineCount === 2,
+        `${type}: prior and period use normal-side signs, exact cents and negative balances`);
+    }
+  }
 
   runReportRegressions(ok);
   console.log("================ SUMMARY ================");
