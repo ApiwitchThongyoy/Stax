@@ -404,6 +404,56 @@ ok(
     uploadPage.includes("lastSaved > 0 && onImportSuccess"),
   "duplicate stops the loading animation, returns to idle (never 'ผลการนำเข้า'), and the done transition is guarded by !importIsDuplicate (refresh fires only on a genuine save)"
 );
+ok(
+  !uploadPage.includes("settle(duration * 6, done)") &&
+    !uploadPage.includes("advanceThrough((done)") &&
+    !uploadPage.includes("setPhase(\"done\")") === false &&
+    uploadPage.includes("advanceThrough()"),
+  "done is never reached by the progress-animation timer chain (advanceThrough takes no done callback) — a slow server can't flash an empty success screen"
+);
+ok(
+  uploadPage.includes("await uploadPromise") &&
+    uploadPage.includes("if (mountedRef.current && !importIsDuplicate) {") &&
+    uploadPage.includes("lastSaved > 0"),
+  "the done transition happens ONLY after `await uploadPromise` resolves and only when saved > 0"
+);
+ok(
+  uploadPage.includes('phase === "done" && result && result.saved > 0'),
+  "the success screen never renders unless result is present AND result.saved > 0 (no zero-count 'ผลการนำเข้า')"
+);
+ok(
+  (uploadPage.match(/result\?\.saved \?\? 0/g) ?? []).length >= 1 &&
+    uploadPage.includes("result?.stats?.buyCount ?? 0"),
+  "done screen renders the server response counts verbatim (e.g. saved = 42 renders 42), never fabricated totals"
+);
+{
+  const awaitIdx = uploadPage.indexOf("await uploadPromise");
+  const doneIdx = uploadPage.indexOf('setPhase("done")', awaitIdx);
+  const preDone = awaitIdx !== -1 && doneIdx !== -1
+    ? uploadPage.slice(awaitIdx, doneIdx)
+    : "";
+  ok(
+    awaitIdx !== -1 && doneIdx !== -1 && preDone.includes("clearTimers();"),
+    "a genuinely successful import (<10s or >10s) clears the animation timers BEFORE the done transition, so a stale timer can never flip the screen away from 'done'"
+  );
+}
+{
+  const awaitIdx = uploadPage.indexOf("await uploadPromise");
+  const catchIdx = uploadPage.indexOf("catch (err)", awaitIdx);
+  const errIdx = catchIdx !== -1 ? uploadPage.indexOf('setPhase("error")', catchIdx) : -1;
+  const catchBlock = catchIdx !== -1 && errIdx !== -1
+    ? uploadPage.slice(catchIdx, errIdx + 30)
+    : "";
+  ok(
+    catchIdx !== -1 && errIdx !== -1 && catchBlock.includes("clearTimers();"),
+    "a network/server error that lands after the animation reached 'posting' still ends in error (the await-catch clears timers before setPhase('error')), never a success screen"
+  );
+}
+ok(
+  uploadPage.includes("settle(duration * 5, () => setPhase(\"posting\"))") &&
+    !uploadPage.includes("settle(duration * 6"),
+  "the animation timer chain advances only storing→extracting→parsing→computing→posting and STOPS at posting — an upload taking >10s stays at phase='posting' (loading), never auto-advances to done"
+);
 
 // ---------------------------------------------------------------------------
 // 7b. Statement preview-before-import (แสดงรายละเอียดก่อน + ปุ่ม OK ค่อยนำเข้าจริง)

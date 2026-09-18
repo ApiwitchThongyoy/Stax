@@ -169,18 +169,24 @@ export default function StatementUploadPage({
     timersRef.current.push(t);
   };
 
-  const advanceThrough = useCallback(
-    (done: () => void) => {
-      const duration = 700;
-      settle(duration, () => setPhase("storing"));
-      settle(duration * 2, () => setPhase("extracting"));
-      settle(duration * 3, () => setPhase("parsing"));
-      settle(duration * 4, () => setPhase("computing"));
-      settle(duration * 5, () => setPhase("posting"));
-      settle(duration * 6, done);
-    },
-    [settle]
-  );
+  // Progress ANIMATION ONLY. It advances through the client-side steps and
+  // then HOLDS at "posting" — it NEVER transitions to "done" on a timer. The
+  // success phase is reached exclusively after the server response + persisted
+  // rows prove the import (see the upload() await below), so a slow server can
+  // never flash an empty "ผลการนำเข้า" (zeros) while still in-flight.
+  const clearTimers = () => {
+    for (const t of timersRef.current) window.clearTimeout(t);
+    timersRef.current = [];
+  };
+
+  const advanceThrough = useCallback(() => {
+    const duration = 700;
+    settle(duration, () => setPhase("storing"));
+    settle(duration * 2, () => setPhase("extracting"));
+    settle(duration * 3, () => setPhase("parsing"));
+    settle(duration * 4, () => setPhase("computing"));
+    settle(duration * 5, () => setPhase("posting"));
+  }, [settle]);
 
   const validateLocal = (f: File): string | null => {
     if (!f.name.toLowerCase().endsWith(".pdf")) {
@@ -252,8 +258,7 @@ export default function StatementUploadPage({
             // re-upload — หยุด animation, กลับหน้า dropzone (idle) แล้ว
             // แจ้งเตือนซ้ำตรงกลางจอ (import ต้องไม่ไปต่อ)
             importIsDuplicate = true;
-            for (const t of timersRef.current) window.clearTimeout(t);
-            timersRef.current = [];
+            clearTimers();
             if (mountedRef.current) {
               setResult(null);
               setPhase("idle");
@@ -278,6 +283,7 @@ export default function StatementUploadPage({
           }
         })();
       } catch (networkError) {
+        clearTimers();
         setPhase("error");
         setError(
           networkError instanceof Error
@@ -287,29 +293,33 @@ export default function StatementUploadPage({
         return;
       }
 
-      // เริ่มลำดับอนิเมชั่นทันที; สลับไป "เสร็จสิ้น" เมื่อ server ตอบจริง
-      // (เว้นแต่เป็นการซ้ำ — import ไม่ไปต่อ แล้วจะกลับ idle แทน)
-      advanceThrough(() => {
-        if (mountedRef.current) setPhase("done");
-      });
+      // เริ่มลำดับอนิเมชั่นทันที (แค่ขยับขั้นว่า "กำลังทำอะไร") — ห้ามย้ายไป
+      // "เสร็จสิ้น" ด้วย timer เด็ดขาด: หน้า success จะเปิดก็ต่อเมื่อ server
+      // ตอบจริง + บันทึกจริง (saved > 0) ตาม await ด้านล่าง
+      advanceThrough();
       try {
         await uploadPromise;
+        if (mountedRef.current && !importIsDuplicate) {
+          if (lastSaved > 0) {
+            // Genuine save (saved > 0). clearTimers() prevents any in-flight
+            // animation timer from clobbering the terminal done state, and the
+            // done screen only renders when result.saved > 0.
+            clearTimers();
+            setPhase("done");
+            if (lastSaved > 0 && onImportSuccess) onImportSuccess();
+          }
+        }
       } catch (err) {
         if (!mountedRef.current) return;
+        clearTimers();
         setPhase("error");
         setError(
           err instanceof Error ? err.message : "เกิดข้อผิดพลาดระหว่างการอัปโหลด"
         );
         return;
       }
-      if (mountedRef.current && !importIsDuplicate) {
-        setPhase("done");
-        // Genuine import success: let the Dashboard refresh server data so the
-        // home widgets (ledger / holdings / tax) reflect the new rows.
-        if (lastSaved > 0 && onImportSuccess) onImportSuccess();
-      }
     },
-    [accessToken, advanceThrough, onImportSuccess]
+    [accessToken, advanceThrough, clearTimers, onImportSuccess]
   );
 
   // ขั้นพรีวิวก่อน import: ถอดรหัสธุรกรรมจากไฟล์แบบ read-only (POST
@@ -414,8 +424,7 @@ export default function StatementUploadPage({
   };
 
   const reset = () => {
-    for (const t of timersRef.current) window.clearTimeout(t);
-    timersRef.current = [];
+    clearTimers();
     setFile(null);
     setResult(null);
     setPreview(null);
@@ -503,7 +512,7 @@ export default function StatementUploadPage({
           </div>
         </label>
         </div>
-      ) : phase === "done" ? (
+      ) : phase === "done" && result && result.saved > 0 ? (
         <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
           <div className="flex items-center gap-2 px-5 py-4 border-b border-gray-100">
             <CheckCircle2 className="w-4 h-4 text-emerald-500" />
