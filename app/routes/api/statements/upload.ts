@@ -17,11 +17,10 @@ import {
   applyFxRateFallback,
   hasSavedDocumentRows,
   loadCostBasisState,
-  saveCostBasisState,
-  backfillComputedGainLoss,
   summarizeRows,
+  type ValidatedCapitalRow,
 } from "~/lib/statement-pipeline";
-import { insertStatementImport } from "~/lib/ledger-service";
+import { insertStatementImport, reconcileStatementImport } from "~/lib/ledger-service";
 import { resolveHistoricalFxRate } from "~/lib/historical-fx-provider";
 import {
   parseStatementWithGemini,
@@ -46,6 +45,21 @@ function isAuthError(result: unknown): result is { status: number; message: stri
     "status" in result &&
     "message" in result
   );
+}
+
+/**
+ * The set of tickers touched by a just-imported statement. The deterministic
+ * ledger reconcile only needs to recompute these symbols' SELL rows + journal
+ * postings; the cost-basis cache is rebuilt in full either way.
+ */
+function affectedSymbolsOf(rows: ValidatedCapitalRow[]): Set<string> {
+  const out = new Set<string>();
+  for (const row of rows) {
+    if (row.symbol && row.symbol.trim() !== "") {
+      out.add(row.symbol.trim().toUpperCase());
+    }
+  }
+  return out;
 }
 
 /**
@@ -236,23 +250,15 @@ async function rebuildStatementImport(input: {
   }
 
   // Insert authority FIRST (rows AND their journal entries commit atomically),
-  // then reconcile the cost-basis cache so the cache is only ever rewritten from
-  // rows that actually committed. Best-effort: a basis-write failure must not
-  // surface as a 500 once the rows are committed.
+  // then reconcile the derived state deterministically from the final ledger
+  // (affected SELL gains + journal postings + full cost-basis cache rebuild).
+  // Best-effort: a reconcile failure must not surface as a 500 once the rows
+  // are committed.
   const result = await insertStatementImport(userId, fallbackRows);
   try {
-    await saveCostBasisState(userId, built.updatedCostBasis);
-  } catch (basisError) {
-    console.error("Statement rebuild: cost-basis persist failed", basisError);
-  }
-
-  // Heal any legacy frozen SELL rows whose realized gain/loss only became
-  // computable once this (or another) statement's buys are in the ledger.
-  // Best-effort — never fails an already-committed rebuild.
-  try {
-    await backfillComputedGainLoss(userId);
-  } catch (backfillError) {
-    console.error("Statement rebuild: gain-loss backfill failed", backfillError);
+    await reconcileStatementImport(userId, affectedSymbolsOf(fallbackRows));
+  } catch (reconcileError) {
+    console.error("Statement rebuild: ledger reconcile failed", reconcileError);
   }
 
   // The journal was written inside the same transaction as the rows above
@@ -562,24 +568,16 @@ export async function action({ request }: Route.ActionArgs) {
     //    the authoritative SSOT step.
     const result = await insertStatementImport(auth.userId, fallbackRows);
 
-    // 7a. Persist the updated running-average cost basis only AFTER the rows
-    //     have actually committed, so the derived cache can never be written
-    //     from rows that failed to insert (which would poison future realized
-    //     gain/loss). Best-effort: a basis-write failure must not push this
-    //     import into the cleanup/error path — the ledger rows are committed.
+    // 7a. Reconcile ALL derived state deterministically from the final ledger:
+    //     recompute the affected SELL gains + journal postings and rebuild the
+    //     cost-basis cache from the committed rows + corporate actions — a pure
+    //     function of the row set, so a later delete + re-import of this (or an
+    //     interleaved) statement converges to the same state as a clean import.
+    //     Best-effort — a reconcile failure must not fail the committed import.
     try {
-      await saveCostBasisState(auth.userId, built.updatedCostBasis);
-    } catch (basisError) {
-      console.error("Statement upload: cost-basis persist failed", basisError);
-    }
-
-    // 7a2. Heal any legacy frozen SELL rows whose realized gain/loss only
-    //     became computable once this (or historical) statement's buys are in
-    //     the ledger. Best-effort — never fails an already-committed import.
-    try {
-      await backfillComputedGainLoss(auth.userId);
-    } catch (backfillError) {
-      console.error("Statement upload: gain-loss backfill failed", backfillError);
+      await reconcileStatementImport(auth.userId, affectedSymbolsOf(fallbackRows));
+    } catch (reconcileError) {
+      console.error("Statement upload: ledger reconcile failed", reconcileError);
     }
 
     // 7b. The journal was written inside the same transaction as the rows above

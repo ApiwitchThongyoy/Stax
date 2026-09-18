@@ -29,6 +29,7 @@ import {
   isTradeJournalRow,
 } from "../app/lib/trading-journal-engine";
 import type { CapitalJournalRecord } from "../app/lib/journal-ledger-read";
+import type { CorporateActionInput } from "../app/lib/corporate-action";
 
 let passed = 0;
 let failed = 0;
@@ -321,6 +322,108 @@ async function main() {
     gainsOnly.avgHoldingDays !== null &&
       Math.abs(gainsOnly.avgHoldingDays - 1) < 1e-9,
     "single-day hold measures 1 day"
+  );
+
+  // --- buildTradingJournalEntries: corporate-action-aware replay (R13 G) ---
+  // SPLIT 1:2 between BUY and SELL halves the per-share average: the SELL must
+  // report 5.0 (the split position's own basis), not the pre-split 10.
+  const caSplit: CorporateActionInput[] = [
+    { symbol: "X", actionType: "SPLIT", transactionDate: "2026-01-07", ratioOld: "1", ratioNew: "2" },
+  ];
+  const caSplitEntries = buildTradingJournalEntries(
+    [
+      journalRow({ sourceTransactionId: "ca-b1", entryDate: "2026-01-05", side: "BUY", symbol: "X", quantity: "100", unitPrice: "10.00" }),
+      journalRow({ sourceTransactionId: "ca-s1", entryDate: "2026-01-10", side: "SELL", symbol: "X", quantity: "50", unitPrice: "15.00", realizedGainLossThb: "200.00" }),
+    ],
+    caSplit
+  );
+  ok(caSplitEntries.length === 2, "split: entries pass through unchanged");
+  ok(
+    caSplitEntries[0].avgCostAtTime === null &&
+      caSplitEntries[1].avgCostAtTime === 5.0,
+    "split: SELL reports post-split avg 5.0 (pre-split 10, split 1:2 halves it)"
+  );
+
+  // Same-date trade + action: trades apply BEFORE actions, so the SELL snapshot
+  // is the PRE-split average and only the holdings after it scale.
+  const sameDateSplit = buildTradingJournalEntries(
+    [
+      journalRow({ sourceTransactionId: "sd-buy", entryDate: "2026-01-05", side: "BUY", symbol: "Y", quantity: "80", unitPrice: "20.00" }),
+      journalRow({ sourceTransactionId: "sd-sell", entryDate: "2026-01-05", side: "SELL", symbol: "Y", quantity: "40", unitPrice: "25.00", realizedGainLossThb: "300.00" }),
+    ],
+    [
+      { symbol: "Y", actionType: "SPLIT", transactionDate: "2026-01-05", ratioOld: "1", ratioNew: "2" },
+    ]
+  );
+  ok(
+    sameDateSplit[0].avgCostAtTime === null &&
+      sameDateSplit[1].avgCostAtTime === 20.0,
+    "same-date split: SELL sees pre-split avg 20 (trades before actions)"
+  );
+
+  // RENAME then a BUY under the new symbol inherits the renamed position.
+  const renameEntries = buildTradingJournalEntries(
+    [
+      journalRow({ sourceTransactionId: "rn-buy1", entryDate: "2026-01-05", side: "BUY", symbol: "OLD", quantity: "60", unitPrice: "10.00" }),
+      journalRow({ sourceTransactionId: "rn-buy2", entryDate: "2026-01-10", side: "BUY", symbol: "NEW", quantity: "10", unitPrice: "12.00" }),
+    ],
+    [
+      { symbol: "OLD", actionType: "RENAME", transactionDate: "2026-01-07", newSymbol: "NEW" },
+    ]
+  );
+  ok(renameEntries[0].avgCostAtTime === null, "rename: first BUY (old name) reports null");
+  ok(
+    Math.abs((renameEntries[1].avgCostAtTime ?? 0) - 10.0) < 1e-9,
+    "rename: second BUY under NEW inherits the renamed position avg 10.0"
+  );
+
+  // --- buildBehaviorStats: action-aware vintage replay (R13 G) ---
+  // SPLIT doubles the vintage qty so the post-split SELL is within holdings
+  // and the holding period (BUY 01-05 -> SELL 01-10) stays 5 days.
+  const splitBehavior = buildBehaviorStats(
+    [
+      journalRow({ sourceTransactionId: "sb-buy", entryDate: "2026-01-05", side: "BUY", symbol: "Z", quantity: "100", unitPrice: "10.00" }),
+      journalRow({ sourceTransactionId: "sb-sell", entryDate: "2026-01-10", side: "SELL", symbol: "Z", quantity: "50", unitPrice: "15.00", realizedGainLossThb: "250.00" }),
+    ],
+    [
+      { symbol: "Z", actionType: "SPLIT", transactionDate: "2026-01-07", ratioOld: "1", ratioNew: "2" },
+    ]
+  );
+  ok(
+    splitBehavior.computableSellCount === 1 && splitBehavior.avgHoldingDays !== null,
+    "split: SELL counted and holding period measurable (vintage qty scaled)"
+  );
+  ok(
+    Math.abs((splitBehavior.avgHoldingDays ?? 0) - 5) < 1e-9,
+    "split: holding period 5 days (BUY 01-05 -> SELL 01-10)"
+  );
+
+  // A malformed legacy/hand-inserted action row (e.g. SPLIT without ratioNew)
+  // must NOT crash the replay: it is skipped and the symbol's averages fall
+  // back to trades-only semantics (same degradation as a missing table).
+  const malformedSplitEntries = buildTradingJournalEntries(
+    [
+      journalRow({ sourceTransactionId: "mf-buy", entryDate: "2026-01-05", side: "BUY", symbol: "M", quantity: "100", unitPrice: "10.00" }),
+      journalRow({ sourceTransactionId: "mf-sell", entryDate: "2026-01-10", side: "SELL", symbol: "M", quantity: "50", unitPrice: "15.00", realizedGainLossThb: "200.00" }),
+    ],
+    [{ symbol: "M", actionType: "SPLIT", transactionDate: "2026-01-07" }]
+  );
+  ok(
+    malformedSplitEntries.length === 2 &&
+      malformedSplitEntries[1].avgCostAtTime === 10.0,
+    "malformed SPLIT (no ratioNew) is skipped: SELL still reports the trades-only avg 10.0"
+  );
+  const malformedSplitBehavior = buildBehaviorStats(
+    [
+      journalRow({ sourceTransactionId: "mf-buy", entryDate: "2026-01-05", side: "BUY", symbol: "M", quantity: "100", unitPrice: "10.00" }),
+      journalRow({ sourceTransactionId: "mf-sell", entryDate: "2026-01-10", side: "SELL", symbol: "M", quantity: "50", unitPrice: "15.00", realizedGainLossThb: "200.00" }),
+    ],
+    [{ symbol: "M", actionType: "SPLIT", transactionDate: "2026-01-07" }]
+  );
+  ok(
+    malformedSplitBehavior.computableSellCount === 1 &&
+      malformedSplitBehavior.avgHoldingDays !== null,
+    "malformed SPLIT never crashes the behavior replay either (vintage skips it)"
   );
 
   console.log(`\n================ SUMMARY ================`);

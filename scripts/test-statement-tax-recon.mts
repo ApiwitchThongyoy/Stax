@@ -39,7 +39,7 @@ import {
   buildStatementJournalEntries,
 } from "../app/lib/posting-engine";
 import { applyCorporateAction } from "../app/lib/corporate-action";
-import type { CostBasisMap } from "../app/lib/cost-basis-engine";
+import { applyAverageCostTrade, type CostBasisMap } from "../app/lib/cost-basis-engine";
 import { parseStatementRows, type ExtractedTransaction } from "../app/lib/pdfStatementParser";
 
 let passed = 0;
@@ -914,6 +914,78 @@ async function main() {
     fmvThrow = e instanceof Error ? e.message : String(e);
   }
   ok(fmvThrow.includes("both-or-neither"), "one-sided FMV spin-off throws (both-or-neither)");
+
+  // ---- SPLIT / REVERSE_SPLIT: cumCost preserved exactly (A / B) ----
+  const splitBase: CostBasisMap = {
+    AAA: { quantity: 100, avgCost: 10, cumQuantity: 100, cumCost: 1000 },
+  };
+  const split1 = applyCorporateAction(splitBase, {
+    symbol: "AAA", actionType: "SPLIT", transactionDate: "2026-02-01",
+    ratioOld: "1", ratioNew: "2",
+  });
+  ok(
+    split1.AAA?.quantity === 200 && split1.AAA?.cumQuantity === 200 &&
+      split1.AAA?.avgCost === 5 && Math.abs((split1.AAA?.cumCost ?? 0) - 1000) < 1e-9,
+    "SPLIT 1:2 scales qty/cumQty by 2, avg halves, cumCost preserved (1000)"
+  );
+  const revSplit = applyCorporateAction(splitBase, {
+    symbol: "AAA", actionType: "REVERSE_SPLIT", transactionDate: "2026-02-01",
+    ratioOld: "10", ratioNew: "1",
+  });
+  ok(
+    revSplit.AAA?.quantity === 10 && revSplit.AAA?.cumQuantity === 10 &&
+      revSplit.AAA?.avgCost === 100 && Math.abs((revSplit.AAA?.cumCost ?? 0) - 1000) < 1e-9,
+    "REVERSE_SPLIT 10:1 scales qty/cumQty by 0.1, avg ×10, cumCost preserved (1000)"
+  );
+
+  // ---- RENAME simple move + deterministic collision merge (C) ----
+  const renameBase: CostBasisMap = {
+    OLD: { quantity: 60, avgCost: 10, cumQuantity: 60, cumCost: 600 },
+  };
+  const renSimple = applyCorporateAction(renameBase, {
+    symbol: "OLD", actionType: "RENAME", transactionDate: "2026-03-01", newSymbol: "NEW",
+  });
+  ok(
+    renSimple["OLD"] === undefined && renSimple["NEW"] !== undefined &&
+      renSimple["NEW"]?.quantity === 60 && renSimple["NEW"]?.cumCost === 600,
+    "RENAME moves position to new key; old key absent"
+  );
+
+  const mergeBase: CostBasisMap = {
+    AAA: { quantity: 100, avgCost: 10, cumQuantity: 100, cumCost: 1000 },
+    BBB: { quantity: 50, avgCost: 20, cumQuantity: 50, cumCost: 1000 },
+  };
+  const merged = applyCorporateAction(mergeBase, {
+    symbol: "AAA", actionType: "RENAME", transactionDate: "2026-03-01", newSymbol: "BBB",
+  });
+  ok(
+    merged["AAA"] === undefined && merged["BBB"] !== undefined,
+    "RENAME collision: old key removed, destination survives"
+  );
+  ok(
+    merged["BBB"]?.quantity === 150 && merged["BBB"]?.cumQuantity === 150 &&
+      Math.abs((merged["BBB"]?.cumCost ?? 0) - 2000) < 1e-9 &&
+      Math.abs((merged["BBB"]?.avgCost ?? 0) - 2000 / 150) < 1e-6,
+    "RENAME collision: basis pooled (qty 150, cumQty 150, cumCost 2000, avg ≈13.333)"
+  );
+
+  // ---- RENAME merge then SELL uses the merged basis ----
+  const mergedBasis = { BBB: merged["BBB"]! } as CostBasisMap;
+  const renAfterSell = applyAverageCostTrade(mergedBasis, "BBB", "SELL", 150, 20);
+  ok(
+    renAfterSell.sellBasis !== null && Math.abs((renAfterSell.sellBasis ?? 0) - 2000 / 150) < 1e-6,
+    "SELL after RENAME-merge reports the merged avgCost as sellBasis"
+  );
+
+  // ---- SPIN_OFF FMV never exceeds parent cumCost (E / F) ----
+  ok(
+    momCost < 5000 && kidCost > 0,
+    "FMV spin-off child basis < parent original cumCost; parent basis stays positive"
+  );
+  ok(
+    spinFmv.MOM?.cumCost !== undefined && spinFmv.MOM?.cumCost > 0,
+    "FMV spin-off parent cumCost remains positive after allocation"
+  );
 
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);

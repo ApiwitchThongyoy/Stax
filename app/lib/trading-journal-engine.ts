@@ -20,6 +20,7 @@ import {
   applyAverageCostTrade,
   type CostBasisMap,
 } from "./cost-basis-engine";
+import { applyCorporateAction, type CorporateActionInput } from "./corporate-action";
 import type { CapitalJournalRecord } from "./journal-ledger-read";
 
 /** The only 3 kinds the trading journal carries; OTHER is a never-in-scope catch-all. */
@@ -83,6 +84,56 @@ function toNum(value: string | null): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+type JournalReplayEvent =
+  | { kind: "trade"; row: CapitalJournalRecord }
+  | { kind: "action"; action: CorporateActionInput };
+
+/**
+ * Merge journal rows and corporate actions into one chronological replay
+ * stream. Uses the SAME ordering rule as statement-pipeline.recomputeCostBasisMap
+ * so the replayed averages agree with the full-ledger recompute: dates
+ * ascending; same-date TRADES apply BEFORE same-date actions (a same-day split
+ * never rewrites the snapshot a trade reports); stable within each kind.
+ */
+function mergeJournalReplayEvents(
+  rows: CapitalJournalRecord[],
+  actions: CorporateActionInput[]
+): JournalReplayEvent[] {
+  const events: JournalReplayEvent[] = [
+    ...rows.map((r) => ({ kind: "trade" as const, row: r })),
+    ...actions.map((a) => ({ kind: "action" as const, action: a })),
+  ];
+  events.sort((a, b) => {
+    const da = a.kind === "trade" ? a.row.entryDate : a.action.transactionDate;
+    const db = b.kind === "trade" ? b.row.entryDate : b.action.transactionDate;
+    const d = da.localeCompare(db);
+    if (d !== 0) return d;
+    if (a.kind !== b.kind) return a.kind === "trade" ? -1 : 1;
+    return 0;
+  });
+  return events;
+}
+
+/**
+ * Apply a corporate action to the replay map, SKIPPING structurally invalid
+ * rows instead of crashing the whole replay. A malformed legacy or
+ * hand-inserted row (e.g. a SPLIT without ratioNew) cannot be faithfully
+ * replayed, so the affected symbol's averages simply fall back to
+ * trades-only semantics for that action — the same graceful degradation a
+ * missing corporate_actions table already gives. Write paths still reject
+ * invalid actions via applyCorporateAction itself.
+ */
+function applyActionOrSkip(
+  map: CostBasisMap,
+  action: CorporateActionInput
+): CostBasisMap {
+  try {
+    return applyCorporateAction(map, action);
+  } catch {
+    return map;
+  }
+}
+
 /**
  * Build trading-journal entries from journal records.
  *
@@ -91,14 +142,25 @@ function toNum(value: string | null): number | null {
  * BUY/SELL chronologically through the average-cost engine; dividend rows
  * pass through with avgCostAtTime null. Only asset BUY/SELL rows move the
  * engine — nothing else touches the basis.
+ *
+ * Corporate actions (split / reverse split / rename / spin-off) interleave
+ * into the same chronological replay (trades before same-date actions), so
+ * the reported avgCostAtTime agrees with what the statement pipeline writes
+ * to cost_basis_state after those actions.
  */
 export function buildTradingJournalEntries(
-  rows: CapitalJournalRecord[]
+  rows: CapitalJournalRecord[],
+  actions: CorporateActionInput[] = []
 ): TradingJournalEntry[] {
-  const map: CostBasisMap = {};
+  let map: CostBasisMap = {};
   const out: TradingJournalEntry[] = [];
 
-  for (const r of rows) {
+  for (const ev of mergeJournalReplayEvents(rows, actions)) {
+    if (ev.kind === "action") {
+      map = applyActionOrSkip(map, ev.action);
+      continue;
+    }
+    const r = ev.row;
     const journalSide = classifyJournalSide(r.side, r.category, r.section);
     const symbol =
       journalSide === "DIVIDEND"
@@ -197,6 +259,69 @@ function isoToEpochDay(iso: string): number | null {
 }
 
 /**
+ * Apply a corporate action to the quantity-weighted vintage map, mirroring
+ * cost-basis-engine semantics with the SAME date as the holding period:
+ *   SPLIT / REVERSE_SPLIT — scale the key's live qty by the ratio.
+ *   RENAME — move the key; a destination key with its own vintage merges by
+ *     pooled qty (holding-day weight-averaged, never destroyed).
+ *   SPIN_OFF — a child key starts its holding period on the action date.
+ * Purely structural (this map only tracks { qty, day }); cash/FMV never matter.
+ */
+function applyActionToVintage(
+  vintage: Map<string, { qty: number; day: number }>,
+  action: CorporateActionInput
+): void {
+  const symbol = action.symbol.trim().toUpperCase();
+  if (action.actionType === "SPLIT" || action.actionType === "REVERSE_SPLIT") {
+    const ratioOld = parseFloat(action.ratioOld ?? "1");
+    const ratioNew = parseFloat(action.ratioNew ?? "");
+    if (
+      !Number.isFinite(ratioOld) ||
+      !Number.isFinite(ratioNew) ||
+      ratioOld <= 0 ||
+      ratioNew <= 0
+    ) {
+      return;
+    }
+    const cur = vintage.get(symbol);
+    if (cur) vintage.set(symbol, { qty: cur.qty * (ratioNew / ratioOld), day: cur.day });
+    return;
+  }
+  if (action.actionType === "RENAME") {
+    const newSymbol = (action.newSymbol ?? "").trim().toUpperCase();
+    if (!newSymbol || newSymbol === symbol) return;
+    const cur = vintage.get(symbol);
+    if (!cur) return;
+    const existing = vintage.get(newSymbol);
+    if (!existing) {
+      vintage.set(newSymbol, cur);
+      vintage.delete(symbol);
+      return;
+    }
+    const qty = cur.qty + existing.qty;
+    vintage.set(newSymbol, {
+      qty,
+      day: qty > 0 ? (cur.qty * cur.day + existing.qty * existing.day) / qty : existing.day,
+    });
+    vintage.delete(symbol);
+    return;
+  }
+  if (action.actionType === "SPIN_OFF") {
+    const shares = parseFloat(action.sharesOut ?? "");
+    const day = isoToEpochDay(action.transactionDate);
+    if (!Number.isFinite(shares) || shares <= 0 || day === null) return;
+    const rawChild = action.newSymbol ?? `${symbol}-SP`;
+    const child = (rawChild.trim() === "" ? `${symbol}-SP` : rawChild).toUpperCase();
+    const cur = vintage.get(child);
+    if (!cur) vintage.set(child, { qty: shares, day });
+    else {
+      const qty = cur.qty + shares;
+      vintage.set(child, { qty, day: (cur.qty * cur.day + shares * day) / qty });
+    }
+  }
+}
+
+/**
  * Build portfolio-level behavior statistics from journal records.
  *
  * Expects rows oldest-first. Only computable SELLs (a stored
@@ -205,9 +330,14 @@ function isoToEpochDay(iso: string): number | null {
  * "vintage": the quantity-weighted average purchase date, replayed with the
  * same math as the average-cost engine (BUYs weight in, SELLs reduce the
  * live quantity but never move the vintage). Dividends and non-trade rows
- * never touch the vintage.
+ * never touch the vintage. Corporate actions interleave into the same
+ * chronological replay so split/rename/spin-off positions measure holding
+ * periods on the same adjusted quantities as the cost-basis cache.
  */
-export function buildBehaviorStats(rows: CapitalJournalRecord[]): BehaviorStats {
+export function buildBehaviorStats(
+  rows: CapitalJournalRecord[],
+  actions: CorporateActionInput[] = []
+): BehaviorStats {
   const vintage = new Map<string, { qty: number; day: number }>();
   let computable = 0;
   let wins = 0;
@@ -221,7 +351,12 @@ export function buildBehaviorStats(rows: CapitalJournalRecord[]): BehaviorStats 
   let holdDaySum = 0;
   let holdCount = 0;
 
-  for (const r of rows) {
+  for (const ev of mergeJournalReplayEvents(rows, actions)) {
+    if (ev.kind === "action") {
+      applyActionToVintage(vintage, ev.action);
+      continue;
+    }
+    const r = ev.row;
     if (r.side === "BUY" && r.symbol) {
       const qty = toNum(r.quantity);
       const day = isoToEpochDay(r.entryDate);

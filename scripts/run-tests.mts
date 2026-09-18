@@ -891,6 +891,178 @@ async function main() {
     }
   }
 
+  // ================= REG: DETERMINISTIC REIMPORT (numeric reproducibility) =================
+  // R17: delete + re-import must converge to EXACTLY the state a clean import of
+  // the same statements produced. The import path runs a FULL deterministic
+  // reconcile (recomputeAllGainLoss + scoped journal re-post + whole-history
+  // recomputeCostBasisMap) instead of an incremental cache-upsert + fill-NULL
+  // backfill. Discriminator: A = BUY X 100@10 (2026-01-05), B = SELL X 50@15
+  // (2026-01-10). Clean -> basis X qty 50; DELETE A -> basis empty + SELL
+  // non-computable; REIMPORT A -> basis X qty 50 again. An incremental path
+  // replays the BUY from an EMPTY cache and would leave qty 100 (the bug).
+  {
+    const { randomUUID } = await import("node:crypto");
+    const detLines = (kind: "a" | "b") =>
+      kind === "a"
+        ? [
+            "TRADE RECORDS",
+            "Currency: USD",
+            "USD/THB = 35.42",
+            "X",
+            "05/01/2026 10:00:00,GMT+07 05/01/2026 BUY 100 10.00 1000.00 1000.00 1.00 0.07 NASDAQ",
+            "PORTFOLIO SUMMARY",
+          ]
+        : [
+            "TRADE RECORDS",
+            "Currency: USD",
+            "USD/THB = 35.42",
+            "X",
+            "10/01/2026 10:00:00,GMT+07 10/01/2026 SELL 50 15.00 750.00 748.50 1.00 0.07 NASDAQ",
+            "PORTFOLIO SUMMARY",
+          ];
+    const detFile = (kind: "a" | "b") =>
+      new File([makePdf(detLines(kind)) as BlobPart], `w2-det-${kind}.pdf`, {
+        type: "application/pdf",
+      });
+    const detUpload = (token: string, file: File) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return uploadRoute.action({
+        request: new Request("http://test.local/api/v1/statements/upload", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }),
+      } as never);
+    };
+    const basisOfX = () =>
+      client`SELECT quantity, avg_cost, cum_quantity, cum_cost FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol = 'X'`;
+    const sellRowOfX = () =>
+      client`SELECT realized_gain_loss, realized_gain_loss_thb, cost_basis FROM "Capital_Transactions" WHERE user_id = ${userARow.id} AND symbol = 'X' AND side = 'SELL'`;
+    if (tokenA && userARow) {
+      // purge leftovers from a previous run
+      const priorDocs = await client`SELECT id FROM documents WHERE user_id = ${userARow.id} AND original_name IN ('w2-det-a.pdf', 'w2-det-b.pdf')`;
+      for (const d of priorDocs) {
+        await client`DELETE FROM journal_entry_lines WHERE user_id = ${userARow.id} AND journal_entry_id IN (SELECT id FROM journal_entries WHERE user_id = ${userARow.id} AND source_document_id = ${d.id})`;
+        await client`DELETE FROM "Capital_Transactions" WHERE source_document_id = ${d.id} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM journal_entries WHERE source_document_id = ${d.id} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM documents WHERE id = ${d.id} AND user_id = ${userARow.id}`;
+      }
+      await client`DELETE FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol IN ('X', 'Y')`;
+
+      // 1. Clean chain: import A (BUY) then B (SELL) — the reproducibility target.
+      const a1 = await detUpload(tokenA, detFile("a"));
+      const a1Body = (await a1.json()) as { data?: { documentId?: string } };
+      const aDoc = a1Body.data?.documentId;
+      const b1 = await detUpload(tokenA, detFile("b"));
+      const b1Body = (await b1.json()) as { data?: { documentId?: string } };
+      const bDoc = b1Body.data?.documentId;
+      ok(
+        a1.status === 200 && b1.status === 200 && !!aDoc && !!bDoc,
+        "REG-det: both statements import (A BUY 100@10 + B SELL 50@15)"
+      );
+      const cleanBasis = await basisOfX();
+      ok(
+        cleanBasis.length === 1 && parseFloat(cleanBasis[0].quantity ?? "") === 50,
+        "REG-det: clean basis holds X qty 50 after the SELL"
+      );
+      const cleanSell = await sellRowOfX();
+      ok(
+        cleanSell.length === 1 &&
+          parseFloat(cleanSell[0].cost_basis ?? "") === 500 &&
+          parseFloat(cleanSell[0].realized_gain_loss ?? "") === 248.5,
+        "REG-det: clean SELL realized 248.50 = net 748.50 - basis 500.00 (50 shares x avg 10)"
+      );
+
+      // 2. DELETE A -> basis must empty + the remaining SELL become non-computable.
+      const delA = aDoc
+        ? await documentRoute.action({
+            request: authedRequest("DELETE", tokenA),
+            params: { id: aDoc },
+          } as never)
+        : null;
+      ok(delA?.status === 200, "REG-det: statement A deletion succeeds");
+      const basisAfterDelete = await basisOfX();
+      const sellAfterDelete = await sellRowOfX();
+      ok(
+        basisAfterDelete.length === 0,
+        "REG-det: after deleting A the basis is empty (no BUY remains)"
+      );
+      ok(
+        sellAfterDelete.length === 1 && sellAfterDelete[0].realized_gain_loss === null,
+        "REG-det: SELL becomes non-computable (realized NULL) after deleting its supporting BUY"
+      );
+
+      // 3. MANUAL row must survive the later reimport reconcile untouched.
+      const manualId = randomUUID();
+      await client`
+        INSERT INTO "Capital_Transactions"
+          (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, category, symbol, side, quantity, unit_price, gross_amount, fees, net_amount, proceeds, cost_basis, realized_gain_loss, realized_gain_loss_thb, fx_rate_statement, fx_rate_effective)
+        VALUES
+          (${manualId}, ${userARow.id}, '80.00', 'USD', '2026-01-08', '2833.60', 'BUY', 'MANUAL', 'asset', 'Y', 'BUY', '10', '8.00', '80.00', '0.05', '80.00', NULL, NULL, NULL, NULL, '35.42', '35.42')`;
+      await client`DELETE FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol = 'Y'`;
+
+      // 4. REIMPORT A -> the FULL reconcile must reproduce the CLEAN state.
+      const a2 = await detUpload(tokenA, detFile("a"));
+      const a2Body = (await a2.json()) as { data?: { documentId?: string } };
+      const a2Doc = a2Body.data?.documentId;
+      ok(a2.status === 200 && !!a2Doc, "REG-det: re-upload of A after deletion imports");
+      const basisAfterReimport = await basisOfX();
+      ok(
+        basisAfterReimport.length === 1 &&
+          parseFloat(basisAfterReimport[0].quantity ?? "") === 50,
+        "REG-det: reimport A reproduces qty 50 (== clean; the incremental path would leave 100)"
+      );
+      ok(
+        basisAfterReimport.length === 1 &&
+          parseFloat(basisAfterReimport[0].cum_quantity ?? "") === 100 &&
+          parseFloat(basisAfterReimport[0].cum_cost ?? "") === 1000,
+        "REG-det: reimport A reproduces the clean lifetime cum fields (cumQuantity 100, cumCost 1000 — the Webull accumulator is NOT reduced by SELL)"
+      );
+      const sellAfterReimport = await sellRowOfX();
+      ok(
+        sellAfterReimport.length === 1 &&
+          sellAfterReimport[0].realized_gain_loss === cleanSell[0].realized_gain_loss &&
+          sellAfterReimport[0].realized_gain_loss_thb === cleanSell[0].realized_gain_loss_thb,
+        "REG-det: SELL realized gain/loss (native + THB) matches the CLEAN state exactly"
+      );
+      const manualRowAfter = await client`
+        SELECT source_type, realized_gain_loss FROM "Capital_Transactions" WHERE transaction_id = ${manualId} AND user_id = ${userARow.id}`;
+      ok(
+        manualRowAfter.length === 1 &&
+          manualRowAfter[0].source_type === "MANUAL" &&
+          manualRowAfter[0].realized_gain_loss === null,
+        "REG-det: MANUAL row untouched by the reimport reconcile (still MANUAL, realized NULL)"
+      );
+      const manualBasisAfter = await client`
+        SELECT quantity FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol = 'Y'`;
+      ok(
+        manualBasisAfter.length === 1 && parseFloat(manualBasisAfter[0].quantity ?? "") === 10,
+        "REG-det: MANUAL BUY contributes to the rebuilt basis (Y qty 10) and is not clobbered"
+      );
+      const postedEntries = a2Doc && bDoc ? await client`
+        SELECT COUNT(*)::int AS n FROM journal_entries
+        WHERE user_id = ${userARow.id} AND posting_state = 'POSTED' AND side IN ('BUY', 'SELL') AND (source_document_id = ${a2Doc} OR source_document_id = ${bDoc})` : [{ n: -1 }];
+      ok(
+        postedEntries[0]?.n === 2,
+        "REG-det: exactly 2 POSTED trade journal entries across the reimported A and B (BUY + SELL, no duplicates; VAT/fee/summary rows stay SKIPPED)"
+      );
+
+      // cleanup (audit rows are removed globally at the end)
+      for (const d of [a2Doc, bDoc]) {
+        if (d) {
+          await client`DELETE FROM journal_entry_lines WHERE user_id = ${userARow.id} AND journal_entry_id IN (SELECT id FROM journal_entries WHERE user_id = ${userARow.id} AND source_document_id = ${d})`;
+          await client`DELETE FROM "Capital_Transactions" WHERE source_document_id = ${d} AND user_id = ${userARow.id}`;
+          await client`DELETE FROM journal_entries WHERE source_document_id = ${d} AND user_id = ${userARow.id}`;
+          await client`DELETE FROM documents WHERE id = ${d} AND user_id = ${userARow.id}`;
+          await client`DELETE FROM notifications WHERE entity_id = ${d}`;
+        }
+      }
+      await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ${manualId} AND user_id = ${userARow.id}`;
+      await client`DELETE FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol IN ('X', 'Y')`;
+    }
+  }
+
   // ================= REG: STATEMENT PREVIEW (แสดงรายละเอียดก่อน + OK ค่อยนำเข้า) =================
   // POST /api/v1/statements/preview must return the FULL parsed rows + stats for
   // the "ตรวจสอบเอกสารก่อนนำเข้า" screen WITHOUT persisting anything (no storage

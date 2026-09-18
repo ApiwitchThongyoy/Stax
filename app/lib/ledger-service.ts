@@ -1108,12 +1108,41 @@ export async function insertStatementImport(
 }
 
 // ---------------------------------------------------------------------------
-// Reconcile statement-derived state inside the caller's deletion transaction.
-// Reuse the parser's replay and posting engines; failures roll back deletion.
+// Reconcile statement-derived state (SELL gains, journal postings, cost-basis
+// cache) from the FINAL authoritative ledger rows + corporate actions. A pure
+// function of the row set, so the outcome never depends on import/delete order:
+//   - reconcileStatementDeletion — runs INSIDE the caller's deletion
+//     transaction, AFTER the deleted rows/entries are gone (failures roll back
+//     the whole delete).
+//   - reconcileStatementImport   — runs inside its OWN transaction AFTER an
+//     import committed, so deleting a statement and re-importing it converges
+//     to the SAME state as a clean (never-deleted) import of the same set.
+//
+// Recomputed deterministically (never a fill-NULL-only backfill): the affected
+// AI_PARSED SELL rows, their linked journal entries (accounts resolved, entries
+// validated, lines rewritten) and the rebuilt cost-basis cache.
 export async function reconcileStatementDeletion(
   tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
   userId: string,
   affectedSymbols: Set<string>,
+): Promise<void> {
+  await reconcileStatementState(userId, affectedSymbols, tx);
+}
+
+/** Reconcile in a fresh transaction after a committed statement import. */
+export async function reconcileStatementImport(
+  userId: string,
+  affectedSymbols: Set<string>,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    await reconcileStatementState(userId, affectedSymbols, tx);
+  });
+}
+
+async function reconcileStatementState(
+  userId: string,
+  affectedSymbols: Set<string>,
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
 ): Promise<void> {
   const rows = await tx.select().from(capitalTransactions)
     .where(eq(capitalTransactions.userId, userId))
