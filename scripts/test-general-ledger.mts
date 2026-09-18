@@ -1,3 +1,4 @@
+import { runReportRegressions } from "./report-regressions.mjs";
 // Double-entry general-ledger pure engine tests (DB-free).
 //
 // Covers the invariants that must NEVER regress:
@@ -220,10 +221,10 @@ async function main() {
   ];
   const tb = trialBalance(tbLines, ACCOUNTS);
   ok(tb.balanced, "trial balance balanced");
-  ok(tb.totalDebit === "1400.00" && tb.totalCredit === "1400.00", "total debit == total credit (1400)");
+  ok(tb.totalDebit === "1000.00" && tb.totalCredit === "1000.00", "closing debit == closing credit (1000)");
   ok(tb.rows.length === 3, "three accounts in trial balance");
   const cashRow = tb.rows.find((r) => r.accountId === CASH);
-  ok(cashRow !== undefined && cashRow.debit === "1000.00" && cashRow.credit === "400.00", "cash account grouped (1000 dr / 400 cr)");
+  ok(cashRow !== undefined && cashRow.debit === "600.00" && cashRow.credit === "0.00", "cash closing balance (600 dr / 0 cr)");
 
   console.log("=== INCOME STATEMENT ===");
 
@@ -1557,6 +1558,7 @@ async function main() {
     "mapper: SELL keeps null type + preserved basis"
   );
 
+  runReportRegressions(ok);
   console.log("================ SUMMARY ================");
   console.log(`PASS: ${passed}   FAIL: ${failed}`);
   if (failed > 0) {

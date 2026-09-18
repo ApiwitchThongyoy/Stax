@@ -26,6 +26,7 @@ import {
   incomeStatement,
   summarizeLinesBySymbol,
   trialBalance,
+  normalSideOf,
   validateJournalEntry,
   type AccountMap,
   type BalanceSheetRow,
@@ -1287,7 +1288,9 @@ async function selectRawLines(conditions: (SQL | undefined)[]) {
     .from(journalEntryLines)
     .innerJoin(journalEntries, and(eq(journalEntryLines.journalEntryId, journalEntries.id), eq(journalEntries.userId, journalEntryLines.userId)))
     .innerJoin(accounts, and(eq(accounts.id, journalEntryLines.accountId), eq(accounts.userId, journalEntryLines.userId)))
-    .where(and(...conditions))
+    // REVERSED originals remain posted economic events: their reversing entry offsets them.
+    // Excluding the original would count only the inverse and corrupt every report.
+    .where(and(...conditions, eq(journalEntries.postingState, "POSTED")))
     .orderBy(asc(journalEntries.entryDate), asc(journalEntries.entryNo), asc(journalEntryLines.id))
     .execute();
   return rows as unknown as RawLineWithEntry[];
@@ -1488,7 +1491,7 @@ function toSymbolSummaryLine(r: RawLineWithEntry) {
 }
 
 /**
- * Account ledger with a running balance (signed debit-credit). `opening` is the
+ * Account ledger with a running balance (positive on the account normal side). `opening` is the
  * balance accumulated before `from` (account opening balance + prior postings).
  * `symbolSummary` groups the period's lines by their memo label (per-stock, for
  * a dividend account) — empty when no memo'd lines.
@@ -1500,28 +1503,33 @@ export async function getAccountLedger(
   to?: string
 ): Promise<{
   opening: string;
+  movement: string;
+  closing: string;
+  normalSide: Side;
   lines: LedgerLineView[];
   symbolSummary: LedgerSymbolSummary[];
 } | null> {
   const [account, raw] = await Promise.all([
     db
-      .select({ openingBalance: accounts.openingBalance })
+      .select({ openingBalance: accounts.openingBalance, type: accounts.type })
       .from(accounts)
       .where(and(eq(accounts.userId, userId), eq(accounts.id, accountId)))
       .limit(1)
       .execute(),
-    fetchRawLinesForAccount(userId, accountId, from, to),
+    fetchRawLinesForAccount(userId, accountId, undefined, to),
   ]);
 
   if (!account.length) return null;
 
-  const openingDec = new Decimal(account[0]?.openingBalance ?? "0");
+  const normalSide = normalSideOf(account[0].type as AccountMap[string]["type"]);
+  let openingDec = new Decimal(account[0]?.openingBalance ?? "0");
+  const movementOf = (r: RawLineWithEntry) => new Decimal(r.line.debitAmount ?? r.line.creditAmount ?? "0").mul((r.line.debitAmount != null ? "DEBIT" : "CREDIT") === normalSide ? 1 : -1);
+  for (const r of raw) if (from && r.entry.entryDate < from) openingDec = openingDec.plus(movementOf(r));
+  const period = raw.filter(r => !from || r.entry.entryDate >= from);
   let running = openingDec;
   const lines: LedgerLineView[] = [];
-  for (const r of raw) {
-    const amount = new Decimal(r.line.debitAmount ?? r.line.creditAmount ?? "0");
-    if (r.line.debitAmount != null) running = running.plus(amount);
-    else running = running.minus(amount);
+  for (const r of period) {
+    running = running.plus(movementOf(r));
     lines.push({
       lineId: r.line.id,
       journalEntryId: r.entry.id,
@@ -1541,8 +1549,11 @@ export async function getAccountLedger(
   }
   return {
     opening: openingDec.toFixed(2),
+    movement: running.minus(openingDec).toFixed(2),
+    closing: running.toFixed(2),
+    normalSide,
     lines,
-    symbolSummary: summarizeLinesBySymbol(raw.map(toSymbolSummaryLine)),
+    symbolSummary: summarizeLinesBySymbol(period.map(toSymbolSummaryLine)),
   };
 }
 
@@ -1561,9 +1572,9 @@ export async function fetchRawLinesForAccount(
   return selectRawLines(conditions);
 }
 
-/** Trial balance for a date range. */
+/** Actual balances through to; from is retained for API compatibility, not a lower cutoff. */
 export async function getTrialBalance(userId: string, from?: string, to?: string) {
-  const [accountRows, raw] = await Promise.all([getAccounts(userId), fetchRawLines(userId, from, to)]);
+  const [accountRows, raw] = await Promise.all([getAccounts(userId), fetchRawLines(userId, undefined, to)]);
   const accountMap = toAccountMap(accountRows);
   const lines = raw.map((r) => ({
     accountId: r.line.accountId,
@@ -1572,7 +1583,7 @@ export async function getTrialBalance(userId: string, from?: string, to?: string
     amountThb: r.line.amountThb,
     currency: r.line.currency,
   }));
-  return trialBalance(lines, accountMap);
+  return trialBalance(lines, accountMap, Object.fromEntries(accountRows.filter(a => a.openingBalance != null).map(a => [a.id, a.openingBalance!])));
 }
 
 /** Sorted for stable UI rendering, oldest entry first. */
@@ -1617,6 +1628,7 @@ export async function getIncomeStatement(userId: string, from?: string, to?: str
 
 /** Balance sheet as of `to` (postings on or before the date + opening balances). */
 export async function getBalanceSheet(userId: string, to?: string) {
+  const periodFrom = (to ?? new Date().toISOString().slice(0,10)).slice(0,4) + "-01-01";
   const [accountRows, raw] = await Promise.all([
     getAccounts(userId),
     fetchRawLines(userId, undefined, to),
@@ -1628,7 +1640,7 @@ export async function getBalanceSheet(userId: string, to?: string) {
     if (acc.openingBalance != null) {
       openingBalances[acc.id] = acc.openingBalance;
       // Only THB-denominated openings convert 1:1; foreign openings have no
-      // rate at this layer, so they contribute 0 to the THB-base sums.
+      // rate at this layer, so nonzero foreign openings make THB totals unavailable.
       if (acc.currency === "THB") openingBalancesThb[acc.id] = acc.openingBalance;
     }
   }
@@ -1638,192 +1650,32 @@ export async function getBalanceSheet(userId: string, to?: string) {
     amount: r.line.debitAmount ?? r.line.creditAmount ?? "0",
     amountThb: r.line.amountThb,
   }));
-  return balanceSheet(lines, accountMap, openingBalances, openingBalancesThb);
+  return { ...balanceSheet(lines, accountMap, openingBalances, openingBalancesThb, lines.filter((_, i) => raw[i].entry.entryDate >= periodFrom)), periodFrom };
 }
 
 // ---------------------------------------------------------------------------
 // Ledger summary (overview)
 // ---------------------------------------------------------------------------
 
-export interface LedgerSummaryGroup {
-  code: string;
-  name: string;
-  currency: string;
-  /** Positive magnitude on the account's normal side. */
-  balance: string;
-  /** Same magnitude in THB-base. */
-  balanceThb: string;
+export async function getLedgerSummary(userId: string) {
+  const sheet = await getBalanceSheet(userId);
+  const groups = (["ASSET", "LIABILITY", "EQUITY"] as const).flatMap(type => {
+    const rows = type === "ASSET" ? sheet.assets : type === "LIABILITY" ? sheet.liabilities : sheet.equity;
+    return [...new Set(rows.map(r => r.currency))].map(currency => {
+      const accounts = rows.filter(r => r.currency === currency);
+      return { type, currency, accounts,
+        total: accounts.reduce((s,r) => s.plus(r.balance),new Decimal(0)).toFixed(2),
+        totalThb: accounts.some(r => r.balanceThb == null) ? null : accounts.reduce((s,r) => s.plus(r.balanceThb!),new Decimal(0)).toFixed(2) };
+    });
+  });
+  return { groups, totalsByCurrency: sheet.totalsByCurrency,
+    totalsThb: { assets: sheet.totalAssetsThb, liabilities: sheet.totalLiabilitiesThb, equity: sheet.totalEquityThb,
+      netIncome: sheet.netIncomeThb, totalAssets: sheet.totalAssetsThb, totalEquityAndLiabilities: sheet.totalEquityAndLiabilitiesThb, balanced: sheet.balancedThb },
+    reportingStatus: sheet.reportingStatus, balanced: sheet.balanced, totalAssetsNaive: sheet.totalAssets, totalEquityAndLiabilitiesNaive: sheet.totalEquityAndLiabilities };
 }
-
-export interface LedgerSummaryByType {
-  type: "ASSET" | "LIABILITY" | "EQUITY" | "INCOME" | "EXPENSE";
-  currency: string;
-  /** Signed total across accounts of this type/currency (normal-side positive). */
-  total: string;
-  /** Same total in THB-base. */
-  totalThb: string;
-  accounts: LedgerSummaryGroup[];
-}
-
-export interface LedgerSummary {
-  /** Cash accounts (1010/1020/… whatever presents as cash) by currency. */
-  groups: LedgerSummaryByType[];
-  /** Balance-sheet totals per currency (A / L / E). */
-  totalsByCurrency: {
-    currency: string;
-    assets: string;
-    liabilities: string;
-    equity: string;
-    netIncome: string;
-    /** THB-base parallels of the row above. */
-    assetsThb: string;
-    liabilitiesThb: string;
-    equityThb: string;
-    netIncomeThb: string;
-    balanced: boolean;
-  }[];
-  /** THB-base grand totals across all currencies (the reportable sums). */
-  totalsThb: {
-    assets: string;
-    liabilities: string;
-    equity: string;
-    netIncome: string;
-    totalAssets: string;
-    totalEquityAndLiabilities: string;
-    balanced: boolean;
-  };
-  /** Raw balance-sheet flags (cross-currency naive totals, informational). */
-  balanced: boolean;
-  totalAssetsNaive: string;
-  totalEquityAndLiabilitiesNaive: string;
-}
-
-/** Group the user's balance-sheet rows by (type, currency) for the overview. */
-export function getLedgerSummary(userId: string): Promise<LedgerSummary> {
-  return (async () => {
-    const sheet = await getBalanceSheet(userId);
-
-    const groups: LedgerSummaryByType[] = [];
-    // Totals are accumulated per CURRENCY so one "งบดุล (USD)" card shows the
-    // combined A / L / E for that currency (2030 asset + 2080 equity both USD
-    // land in the same row). Grouped rows stay split by (type, currency).
-    const totalsMap = new Map<
-      string,
-      {
-        assets: Decimal;
-        liabilities: Decimal;
-        equity: Decimal;
-        assetsThb: Decimal;
-        liabilitiesThb: Decimal;
-        equityThb: Decimal;
-      }
-    >();
-
-    const pushGroup = (
-      type: "ASSET" | "LIABILITY" | "EQUITY",
-      rows: BalanceSheetRow[]
-    ) => {
-      const byCurrency = new Map<string, BalanceSheetRow[]>();
-      for (const r of rows) {
-        const arr = byCurrency.get(r.currency) ?? [];
-        arr.push(r);
-        byCurrency.set(r.currency, arr);
-      }
-      for (const [currency, rows2] of byCurrency) {
-        let total = new Decimal(0);
-        let totalThb = new Decimal(0);
-        for (const acc of rows2) {
-          total = total.plus(new Decimal(acc.balance));
-          totalThb = totalThb.plus(new Decimal(acc.balanceThb));
-        }
-        const entry = totalsMap.get(currency) ?? {
-          assets: new Decimal(0),
-          liabilities: new Decimal(0),
-          equity: new Decimal(0),
-          assetsThb: new Decimal(0),
-          liabilitiesThb: new Decimal(0),
-          equityThb: new Decimal(0),
-        };
-        if (type === "ASSET") {
-          entry.assets = entry.assets.plus(total);
-          entry.assetsThb = entry.assetsThb.plus(totalThb);
-        }
-        if (type === "LIABILITY") {
-          entry.liabilities = entry.liabilities.plus(total);
-          entry.liabilitiesThb = entry.liabilitiesThb.plus(totalThb);
-        }
-        if (type === "EQUITY") {
-          entry.equity = entry.equity.plus(total);
-          entry.equityThb = entry.equityThb.plus(totalThb);
-        }
-        totalsMap.set(currency, entry);
-        groups.push({
-          type,
-          currency,
-          total: total.toFixed(2),
-          totalThb: totalThb.toFixed(2),
-          accounts: rows2.map((a) => ({
-            code: a.code,
-            name: a.name,
-            currency: a.currency,
-            balance: a.balance,
-            balanceThb: a.balanceThb,
-          })),
-        });
-      }
-    };
-
-    pushGroup("ASSET", sheet.assets);
-    pushGroup("LIABILITY", sheet.liabilities);
-    pushGroup("EQUITY", sheet.equity);
-
-    const totalsByCurrency = Array.from(totalsMap.entries()).map(
-      ([currency, val]) => {
-        return {
-          currency,
-          assets: val.assets.toFixed(2),
-          liabilities: val.liabilities.toFixed(2),
-          equity: val.equity.toFixed(2),
-          // Net income is folded into equity by the pure engine; it is not
-          // broken out per foreign currency, so per-currency NI stays 0.00
-          // while the THB-base NI below carries the reportable figure.
-          netIncome: "0.00",
-          assetsThb: val.assetsThb.toFixed(2),
-          liabilitiesThb: val.liabilitiesThb.toFixed(2),
-          equityThb: val.equityThb.toFixed(2),
-          netIncomeThb: sheet.netIncomeThb,
-          balanced: val.assets.equals(val.liabilities.plus(val.equity)),
-        };
-      }
-    );
-
-    return {
-      groups,
-      totalsByCurrency,
-      totalsThb: {
-        assets: sheet.totalsByCurrency.reduce(
-          (s, t) => s.plus(new Decimal(t.assetsThb)),
-          new Decimal(0)
-        ).toFixed(2),
-        liabilities: sheet.totalsByCurrency.reduce(
-          (s, t) => s.plus(new Decimal(t.liabilitiesThb)),
-          new Decimal(0)
-        ).toFixed(2),
-        equity: sheet.totalsByCurrency.reduce(
-          (s, t) => s.plus(new Decimal(t.equityThb)),
-          new Decimal(0)
-        ).toFixed(2),
-        netIncome: sheet.netIncomeThb,
-        totalAssets: sheet.totalAssetsThb,
-        totalEquityAndLiabilities: sheet.totalEquityAndLiabilitiesThb,
-        balanced: sheet.balancedThb,
-      },
-      balanced: sheet.balanced,
-      totalAssetsNaive: sheet.totalAssets,
-      totalEquityAndLiabilitiesNaive: sheet.totalEquityAndLiabilities,
-    };
-  })();
-}
+export type LedgerSummary = Awaited<ReturnType<typeof getLedgerSummary>>;
+export type LedgerSummaryByType = LedgerSummary["groups"][number];
+export type LedgerSummaryGroup = LedgerSummaryByType["accounts"][number];
 
 // ---------------------------------------------------------------------------
 // Reversal

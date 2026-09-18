@@ -2,7 +2,8 @@ import type { ReactNode } from "react";
 import { AlertCircle, BookOpen, RefreshCw, Search } from "lucide-react";
 
 export function formatBaht(value: string | number | null | undefined): string {
-  const n = value == null ? 0 : Number(value);
+  if (value == null) return "-";
+  const n = Number(value);
   if (!Number.isFinite(n)) return "-";
   return `${n < 0 ? "-" : ""}฿${Math.abs(n).toLocaleString(undefined, {
     minimumFractionDigits: 2,
@@ -13,7 +14,8 @@ export function formatBaht(value: string | number | null | undefined): string {
 export function formatSignedBaht(
   value: string | number | null | undefined
 ): string {
-  const n = value == null ? 0 : Number(value);
+  if (value == null) return "-";
+  const n = Number(value);
   if (!Number.isFinite(n)) return "-";
   return `${n >= 0 ? "+" : "-"}฿${Math.abs(n).toLocaleString(undefined, {
     minimumFractionDigits: 2,
@@ -24,7 +26,8 @@ export function formatSignedBaht(
 export function formatAmount(
   value: string | number | null | undefined
 ): string {
-  const n = value == null ? 0 : Number(value);
+  if (value == null) return "-";
+  const n = Number(value);
   if (!Number.isFinite(n)) return "-";
   return n.toLocaleString(undefined, {
     minimumFractionDigits: 2,
@@ -35,7 +38,8 @@ export function formatAmount(
 export function formatSignedAmount(
   value: string | number | null | undefined
 ): string {
-  const n = value == null ? 0 : Number(value);
+  if (value == null) return "-";
+  const n = Number(value);
   if (!Number.isFinite(n)) return "-";
   return `${n >= 0 ? "+" : "-"}${Math.abs(n).toLocaleString(undefined, {
     minimumFractionDigits: 2,

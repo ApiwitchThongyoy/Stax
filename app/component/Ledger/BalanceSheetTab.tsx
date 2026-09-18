@@ -26,7 +26,7 @@ function SheetSection({
   title: string;
   rows: GeneralLedgerBalanceSheetRow[];
   showNetIncome?: boolean;
-  netIncome?: string;
+  netIncome?: string | null;
 }) {
   return (
     <>

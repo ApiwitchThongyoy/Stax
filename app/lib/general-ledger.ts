@@ -490,506 +490,124 @@ export interface AccountInfo {
 
 export type AccountMap = Record<string, AccountInfo>;
 
+/** Null means no honest reporting value is available. Native totals only exist for one currency. */
+type ReportLine = {
+    accountId: string;
+    currency?: string;
+    side: Side;
+    amount: string;
+    amountThb?: string | null;
+    postingState?: string;
+};
+export type ReportingStatus = "COMPLETE" | "PARTIAL" | "UNAVAILABLE";
+const sumMoney = (vs: (string | null)[]): string | null => vs.some(v => v == null) ? null : fmt(vs.reduce<Decimal>((s, v) => s.plus(v!), new Decimal(0)));
+const minusMoney = (a: string | null, b: string | null) => a == null || b == null ? null : fmt(new Decimal(a).minus(b));
+const statusOf = (vs: (string | null)[]): ReportingStatus => vs.every(v => v != null) ? "COMPLETE" : vs.some(v => v != null) ? "PARTIAL" : "UNAVAILABLE";
+const posted = (ls: ReportLine[]) => ls.filter(l => l.postingState == null || l.postingState === "POSTED");
+export function reportOpeningLines(accounts: AccountMap, openings: Record<string, string> = {}, thb: Record<string, string> = {}): ReportLine[] {
+    return Object.entries(openings).filter(([id, v]) => accounts[id] && !new Decimal(v).isZero()).map(([id, v]) => ({ accountId: id, currency: accounts[id].currency, side: normalSideOf(accounts[id].type), amount: v, amountThb: thb[id] ?? (accounts[id].currency === "THB" ? v : null) }));
+}
 export interface TrialBalanceRow {
-  accountId: string;
-  code: string;
-  name: string;
-  type: AccountType;
-  currency: string;
-  debit: string;
-  credit: string;
-  /** Signed debit-credit (positive = debit-headed). */
-  balance: string;
-  /** THB-base parallels (from each line's stored amountThb; never re-converted). */
-  debitThb: string;
-  creditThb: string;
-  balanceThb: string;
+    accountId: string;
+    code: string;
+    name: string;
+    type: AccountType;
+    currency: string;
+    debit: string;
+    credit: string;
+    balance: string;
+    debitThb: string | null;
+    creditThb: string | null;
+    balanceThb: string | null;
 }
-
-export interface TrialBalanceCurrencyTotal {
-  currency: string;
-  debit: string;
-  credit: string;
-  debitThb: string;
-  creditThb: string;
-}
-
-export interface TrialBalanceResult {
-  rows: TrialBalanceRow[];
-  totalDebit: string;
-  totalCredit: string;
-  balanced: boolean;
-  /** THB-base totals: the only cross-currency-meaningful sums. */
-  totalDebitThb: string;
-  totalCreditThb: string;
-  balancedThb: boolean;
-  /** Per-currency subtotals (native + THB-base). */
-  totalsByCurrency: TrialBalanceCurrencyTotal[];
-}
-
-/**
- * Group lines into a trial balance. The caller passes lines already scoped to
- * period/account; this only groups, sums (Decimal) and checks the totals.
- *
- * `amountThb` is optional per line (older callers/tests omit it): lines without
- * it contribute only to the native-currency sums, never to the THB-base sums.
- */
-export function trialBalance(
-  lines: (Pick<ValidatedJournalLine, "accountId" | "currency" | "side" | "amount"> &
-    Partial<Pick<ValidatedJournalLine, "amountThb">>)[],
-  accounts: AccountMap
-): TrialBalanceResult {
-  const map = new Map<
-    string,
-    { accountId: string; debit: Decimal; credit: Decimal; debitThb: Decimal; creditThb: Decimal; currency: string }
-  >();
-  for (const l of lines) {
-    const cur = map.get(l.accountId) ?? {
-      accountId: l.accountId,
-      debit: new Decimal(0),
-      credit: new Decimal(0),
-      debitThb: new Decimal(0),
-      creditThb: new Decimal(0),
-      currency: l.currency,
-    };
-    const thb = dec(l.amountThb ?? "") ?? new Decimal(0);
-    if (l.side === "DEBIT") {
-      cur.debit = cur.debit.plus(dec(l.amount) ?? 0);
-      cur.debitThb = cur.debitThb.plus(thb);
-    } else {
-      cur.credit = cur.credit.plus(dec(l.amount) ?? 0);
-      cur.creditThb = cur.creditThb.plus(thb);
+/** Closing account balances, not gross turnover. Openings use the normal side. */
+export function trialBalance(lines: ReportLine[], accounts: AccountMap, openings: Record<string, string> = {}, openingsThb: Record<string, string> = {}) {
+    const groups = new Map<string, ReportLine[]>();
+    for (const l of [...reportOpeningLines(accounts, openings, openingsThb), ...posted(lines)]) {
+        const key = l.accountId + "|" + (l.currency ?? accounts[l.accountId]?.currency);
+        groups.set(key, [...(groups.get(key) ?? []), l]);
     }
-    map.set(l.accountId, cur);
-  }
-
-  let totalDebit = new Decimal(0);
-  let totalCredit = new Decimal(0);
-  let totalDebitThb = new Decimal(0);
-  let totalCreditThb = new Decimal(0);
-  const byCurrency = new Map<string, { debit: Decimal; credit: Decimal; debitThb: Decimal; creditThb: Decimal }>();
-  const rows: TrialBalanceRow[] = [];
-  for (const cur of map.values()) {
-    const acc = accounts[cur.accountId];
-    totalDebit = totalDebit.plus(cur.debit);
-    totalCredit = totalCredit.plus(cur.credit);
-    totalDebitThb = totalDebitThb.plus(cur.debitThb);
-    totalCreditThb = totalCreditThb.plus(cur.creditThb);
-    const bucket = byCurrency.get(cur.currency) ?? {
-      debit: new Decimal(0),
-      credit: new Decimal(0),
-      debitThb: new Decimal(0),
-      creditThb: new Decimal(0),
-    };
-    bucket.debit = bucket.debit.plus(cur.debit);
-    bucket.credit = bucket.credit.plus(cur.credit);
-    bucket.debitThb = bucket.debitThb.plus(cur.debitThb);
-    bucket.creditThb = bucket.creditThb.plus(cur.creditThb);
-    byCurrency.set(cur.currency, bucket);
-    rows.push({
-      accountId: cur.accountId,
-      code: acc?.code ?? cur.accountId,
-      name: acc?.name ?? "(ไม่รู้จักบัญชี)",
-      type: acc?.type ?? "ASSET",
-      currency: cur.currency,
-      debit: fmt(cur.debit),
-      credit: fmt(cur.credit),
-      balance: fmt(cur.debit.minus(cur.credit)),
-      debitThb: fmt(cur.debitThb),
-      creditThb: fmt(cur.creditThb),
-      balanceThb: fmt(cur.debitThb.minus(cur.creditThb)),
+    const split = (v: string | null, dr: boolean) => v == null ? null : fmt(Decimal.max(new Decimal(v).mul(dr ? 1 : -1), 0));
+    const rows: TrialBalanceRow[] = [...groups.values()].map(ls => {
+        const l = ls[0], a = accounts[l.accountId];
+        const balance = fmt(ls.reduce((s, r) => s.plus(new Decimal(r.amount).mul(r.side === "DEBIT" ? 1 : -1)), new Decimal(0)));
+        const thb = sumMoney(ls.map(r => r.amountThb == null ? null : fmt(new Decimal(r.amountThb).mul(r.side === "DEBIT" ? 1 : -1))));
+        return { accountId: l.accountId, code: a?.code ?? l.accountId, name: a?.name ?? "Unknown account", type: a?.type ?? "ASSET", currency: l.currency ?? a.currency,
+            debit: split(balance, true)!, credit: split(balance, false)!, balance, debitThb: split(thb, true), creditThb: split(thb, false), balanceThb: thb };
+    }).sort((a, b) => a.code.localeCompare(b.code));
+    const totalsByCurrency = [...new Set(rows.map(r => r.currency))].sort().map(currency => {
+        const rs = rows.filter(r => r.currency === currency), debit = sumMoney(rs.map(r => r.debit))!, credit = sumMoney(rs.map(r => r.credit))!;
+        return { currency, debit, credit, balanced: debit === credit, debitThb: sumMoney(rs.map(r => r.debitThb)), creditThb: sumMoney(rs.map(r => r.creditThb)) };
     });
-  }
-  rows.sort((a, b) => a.code.localeCompare(b.code));
-
-  const balanced = totalDebit.equals(totalCredit);
-  const totalsByCurrency = Array.from(byCurrency.entries())
-    .map(([currency, b]) => ({
-      currency,
-      debit: fmt(b.debit),
-      credit: fmt(b.credit),
-      debitThb: fmt(b.debitThb),
-      creditThb: fmt(b.creditThb),
-    }))
-    .sort((a, b) => a.currency.localeCompare(b.currency));
-  return {
-    rows,
-    totalDebit: fmt(totalDebit),
-    totalCredit: fmt(totalCredit),
-    balanced,
-    totalDebitThb: fmt(totalDebitThb),
-    totalCreditThb: fmt(totalCreditThb),
-    balancedThb: totalDebitThb.equals(totalCreditThb),
-    totalsByCurrency,
-  };
+    const totalDebitThb = sumMoney(rows.map(r => r.debitThb)), totalCreditThb = sumMoney(rows.map(r => r.creditThb));
+    return { rows, totalsByCurrency, totalDebit: totalsByCurrency.length > 1 ? null : totalsByCurrency[0]?.debit ?? "0.00", totalCredit: totalsByCurrency.length > 1 ? null : totalsByCurrency[0]?.credit ?? "0.00",
+        balanced: totalsByCurrency.every(t => t.balanced), totalDebitThb, totalCreditThb, balancedThb: totalDebitThb != null && totalDebitThb === totalCreditThb, reportingStatus: statusOf(rows.map(r => r.balanceThb)) };
 }
-
-/** Net contribution of an account to its own normal side on the given lines. */
-function accountNet(
-  lines: { accountId: string; side: Side; amount: string }[],
-  type: AccountType,
-  accountId: string
-): Decimal {
-  let debit = new Decimal(0);
-  let credit = new Decimal(0);
-  for (const l of lines) {
-    if (l.accountId !== accountId) continue;
-    if (l.side === "DEBIT") debit = debit.plus(dec(l.amount) ?? 0);
-    else credit = credit.plus(dec(l.amount) ?? 0);
-  }
-  return normalSideOf(type) === "DEBIT" ? debit.minus(credit) : credit.minus(debit);
-}
-
-/** THB-base parallel of accountNet (reads each line's stored amountThb). */
-function accountNetThb(
-  lines: { accountId: string; side: Side; amountThb?: string }[],
-  type: AccountType,
-  accountId: string
-): Decimal {
-  let debit = new Decimal(0);
-  let credit = new Decimal(0);
-  for (const l of lines) {
-    if (l.accountId !== accountId) continue;
-    const thb = dec(l.amountThb ?? "") ?? new Decimal(0);
-    if (l.side === "DEBIT") debit = debit.plus(thb);
-    else credit = credit.plus(thb);
-  }
-  return normalSideOf(type) === "DEBIT" ? debit.minus(credit) : credit.minus(debit);
-}
-
+export type TrialBalanceResult = ReturnType<typeof trialBalance>;
+export type TrialBalanceCurrencyTotal = TrialBalanceResult["totalsByCurrency"][number];
 export interface IncomeStatementLine {
-  accountId: string;
-  code: string;
-  name: string;
-  type: "INCOME" | "EXPENSE";
-  currency: string;
-  /** Positive magnitude on the account's normal side. */
-  amount: string;
-  /** Same magnitude in THB-base (from stored amountThb). */
-  amountThb: string;
+    accountId: string;
+    code: string;
+    name: string;
+    type: "INCOME" | "EXPENSE";
+    currency: string;
+    amount: string;
+    amountThb: string | null;
 }
-
-export interface IncomeStatementCurrencyTotal {
-  currency: string;
-  income: string;
-  expense: string;
-  incomeThb: string;
-  expenseThb: string;
-}
-
-export interface IncomeStatementResult {
-  lines: IncomeStatementLine[];
-  totalIncome: string;
-  totalExpense: string;
-  netIncome: string;
-  /** THB-base totals: the only cross-currency-meaningful sums. */
-  totalIncomeThb: string;
-  totalExpenseThb: string;
-  netIncomeThb: string;
-  totalsByCurrency: IncomeStatementCurrencyTotal[];
-}
-
-/** Income statement from posted lines (period pre-filtered by the caller). */
-export function incomeStatement(
-  lines: { accountId: string; currency: string; side: Side; amount: string; amountThb?: string }[],
-  accounts: AccountMap
-): IncomeStatementResult {
-  const entries = new Map<string, { accountId: string; type: "INCOME" | "EXPENSE"; currency: string }>();
-  const seen = new Set<string>();
-
-  for (const l of lines) {
-    if (seen.has(l.accountId)) continue;
-    seen.add(l.accountId);
-    const acc = accounts[l.accountId];
-    if (!acc) continue;
-    if (acc.type === "INCOME" || acc.type === "EXPENSE") {
-      entries.set(l.accountId, {
-        accountId: l.accountId,
-        type: acc.type,
-        currency: l.currency,
-      });
-    }
-  }
-
-  const report: IncomeStatementLine[] = [];
-  let totalIncome = new Decimal(0);
-  let totalExpense = new Decimal(0);
-  let totalIncomeThb = new Decimal(0);
-  let totalExpenseThb = new Decimal(0);
-  const byCurrency = new Map<string, { income: Decimal; expense: Decimal; incomeThb: Decimal; expenseThb: Decimal }>();
-  for (const entry of entries.values()) {
-    const net = accountNet(lines, entry.type, entry.accountId);
-    const netThb = accountNetThb(lines, entry.type, entry.accountId);
-    const bucket = byCurrency.get(entry.currency) ?? {
-      income: new Decimal(0),
-      expense: new Decimal(0),
-      incomeThb: new Decimal(0),
-      expenseThb: new Decimal(0),
+export function incomeStatement(lines: ReportLine[], accounts: AccountMap) {
+    const tb = trialBalance(posted(lines).filter(l => ["INCOME", "EXPENSE"].includes(accounts[l.accountId]?.type)), accounts);
+    const report: IncomeStatementLine[] = tb.rows.map(r => ({ accountId: r.accountId, code: r.code, name: r.name, type: r.type as "INCOME" | "EXPENSE", currency: r.currency,
+        amount: fmt(new Decimal(r.balance).mul(r.type === "INCOME" ? -1 : 1)), amountThb: r.balanceThb == null ? null : fmt(new Decimal(r.balanceThb).mul(r.type === "INCOME" ? -1 : 1)) }));
+    const totals = (rs: IncomeStatementLine[]) => {
+        const income = sumMoney(rs.filter(r => r.type === "INCOME").map(r => r.amount))!, expense = sumMoney(rs.filter(r => r.type === "EXPENSE").map(r => r.amount))!;
+        const incomeThb = sumMoney(rs.filter(r => r.type === "INCOME").map(r => r.amountThb)), expenseThb = sumMoney(rs.filter(r => r.type === "EXPENSE").map(r => r.amountThb));
+        return { income, expense, netIncome: minusMoney(income, expense)!, incomeThb, expenseThb, netIncomeThb: minusMoney(incomeThb, expenseThb) };
     };
-    if (entry.type === "INCOME") {
-      totalIncome = totalIncome.plus(net);
-      totalIncomeThb = totalIncomeThb.plus(netThb);
-      bucket.income = bucket.income.plus(net);
-      bucket.incomeThb = bucket.incomeThb.plus(netThb);
-    } else {
-      totalExpense = totalExpense.plus(net);
-      totalExpenseThb = totalExpenseThb.plus(netThb);
-      bucket.expense = bucket.expense.plus(net);
-      bucket.expenseThb = bucket.expenseThb.plus(netThb);
-    }
-    byCurrency.set(entry.currency, bucket);
-    const acc = accounts[entry.accountId];
-    report.push({
-      accountId: entry.accountId,
-      code: acc?.code ?? entry.accountId,
-      name: acc?.name ?? "(ไม่รู้จักบัญชี)",
-      type: entry.type,
-      currency: entry.currency,
-      amount: fmt(net),
-      amountThb: fmt(netThb),
-    });
-  }
-  report.sort((a, b) => a.code.localeCompare(b.code));
-
-  const totalsByCurrency = Array.from(byCurrency.entries())
-    .map(([currency, b]) => ({
-      currency,
-      income: fmt(b.income),
-      expense: fmt(b.expense),
-      incomeThb: fmt(b.incomeThb),
-      expenseThb: fmt(b.expenseThb),
-    }))
-    .sort((a, b) => a.currency.localeCompare(b.currency));
-
-  return {
-    lines: report,
-    totalIncome: fmt(totalIncome),
-    totalExpense: fmt(totalExpense),
-    netIncome: fmt(totalIncome.minus(totalExpense)),
-    totalIncomeThb: fmt(totalIncomeThb),
-    totalExpenseThb: fmt(totalExpenseThb),
-    netIncomeThb: fmt(totalIncomeThb.minus(totalExpenseThb)),
-    totalsByCurrency,
-  };
+    const totalsByCurrency = [...new Set(report.map(r => r.currency))].sort().map(currency => ({ currency, ...totals(report.filter(r => r.currency === currency)) }));
+    const native = totalsByCurrency.length <= 1, all = totals(native ? report : []);
+    const totalIncomeThb = sumMoney(totalsByCurrency.map(t => t.incomeThb)), totalExpenseThb = sumMoney(totalsByCurrency.map(t => t.expenseThb));
+    return { lines: report, totalsByCurrency, totalIncome: native ? all.income : null, totalExpense: native ? all.expense : null, netIncome: native ? all.netIncome : null,
+        totalIncomeThb, totalExpenseThb, netIncomeThb: minusMoney(totalIncomeThb, totalExpenseThb), reportingStatus: tb.reportingStatus };
 }
-
+export type IncomeStatementResult = ReturnType<typeof incomeStatement>;
+export type IncomeStatementCurrencyTotal = IncomeStatementResult["totalsByCurrency"][number];
 export interface BalanceSheetRow {
-  accountId: string;
-  code: string;
-  name: string;
-  currency: string;
-  /** Positive magnitude on the account's normal side. */
-  balance: string;
-  /** Same magnitude in THB-base (from stored amountThb + THB openings). */
-  balanceThb: string;
+    accountId: string;
+    code: string;
+    name: string;
+    currency: string;
+    balance: string;
+    balanceThb: string | null;
 }
-
-export interface BalanceSheetCurrencyTotal {
-  currency: string;
-  assets: string;
-  liabilities: string;
-  equity: string;
-  assetsThb: string;
-  liabilitiesThb: string;
-  equityThb: string;
+/** All unclosed earnings through the as-of cutoff are included in equity. */
+export function balanceSheet(lines: ReportLine[], accounts: AccountMap, openings: Record<string, string> = {}, openingsThb: Record<string, string> = {}, periodLines?: ReportLine[]) {
+    const ls = [...reportOpeningLines(accounts, openings, openingsThb), ...posted(lines)], tb = trialBalance(ls, accounts), accumulatedIncome = incomeStatement(ls, accounts), income = periodLines == null ? accumulatedIncome : incomeStatement(periodLines, accounts);
+    const rows = (type: AccountType): BalanceSheetRow[] => tb.rows.filter(r => r.type === type).map(r => ({ accountId: r.accountId, code: r.code, name: r.name, currency: r.currency,
+        balance: fmt(new Decimal(r.balance).mul(type === "ASSET" ? 1 : -1)), balanceThb: r.balanceThb == null ? null : fmt(new Decimal(r.balanceThb).mul(type === "ASSET" ? 1 : -1)) }));
+    const assets = rows("ASSET"), liabilities = rows("LIABILITY"), equity = rows("EQUITY");
+    // Report-only prior unclosed earnings: no journal entry or account is fabricated.
+    if (periodLines != null)
+        for (const prior of accumulatedIncome.totalsByCurrency) {
+            const current = income.totalsByCurrency.find(t => t.currency === prior.currency);
+            const balance = minusMoney(prior.netIncome, current?.netIncome ?? "0.00")!;
+            const balanceThb = minusMoney(prior.netIncomeThb, current ? current.netIncomeThb : "0.00");
+            if (balance !== "0.00" || balanceThb !== "0.00")
+                equity.push({ accountId: "report-prior-earnings-" + prior.currency, code: "", name: "Prior unclosed earnings", currency: prior.currency, balance, balanceThb });
+        }
+    const totalsByCurrency = [...new Set(tb.rows.map(r => r.currency))].sort().map(currency => {
+        const total = (rs: BalanceSheetRow[], thb = false) => sumMoney(rs.filter(r => r.currency === currency).map(r => thb ? r.balanceThb : r.balance));
+        const ni = income.totalsByCurrency.find(t => t.currency === currency), a = total(assets)!, l = total(liabilities)!, e = total(equity)!, n = ni?.netIncome ?? "0.00";
+        return { currency, assets: a, liabilities: l, equity: e, netIncome: n, assetsThb: total(assets, true), liabilitiesThb: total(liabilities, true), equityThb: total(equity, true), netIncomeThb: ni ? ni.netIncomeThb : "0.00", balanced: a === sumMoney([l, e, n]) };
+    });
+    const native = totalsByCurrency.length <= 1, totalAssetsThb = sumMoney(assets.map(r => r.balanceThb)), totalLiabilitiesThb = sumMoney(liabilities.map(r => r.balanceThb)), totalEquityThb = sumMoney(equity.map(r => r.balanceThb));
+    const totalEquityAndLiabilitiesThb = sumMoney([totalLiabilitiesThb, totalEquityThb, income.netIncomeThb]);
+    return { assets, liabilities, equity, totalsByCurrency, netIncome: native ? income.netIncome : null, totalAssets: native ? sumMoney(assets.map(r => r.balance)) : null,
+        totalEquityAndLiabilities: native ? sumMoney([...liabilities, ...equity].map(r => r.balance).concat(income.netIncome ?? "0.00")) : null, balanced: totalsByCurrency.every(t => t.balanced),
+        netIncomeThb: income.netIncomeThb, totalAssetsThb, totalLiabilitiesThb, totalEquityThb, totalEquityAndLiabilitiesThb,
+        balancedThb: totalAssetsThb != null && totalEquityAndLiabilitiesThb != null && totalAssetsThb === totalEquityAndLiabilitiesThb, reportingStatus: tb.reportingStatus };
 }
-
-export interface BalanceSheetResult {
-  assets: BalanceSheetRow[];
-  liabilities: BalanceSheetRow[];
-  equity: BalanceSheetRow[];
-  /** Current-period net income folded into equity. */
-  netIncome: string;
-  totalAssets: string;
-  totalEquityAndLiabilities: string;
-  balanced: boolean;
-  /** THB-base parallels: the only cross-currency-meaningful sums. */
-  netIncomeThb: string;
-  totalAssetsThb: string;
-  totalEquityAndLiabilitiesThb: string;
-  balancedThb: boolean;
-  totalsByCurrency: BalanceSheetCurrencyTotal[];
-}
-
-/**
- * Balance sheet from posted lines + opening balances.
- *
- * `openingBalances` maps accountId -> positive magnitude on the account's
- * NORMAL side (ASSET/EXPENSE debit-headed; LIABILITY/EQUITY credit-headed).
- * `openingBalancesThb` is the THB-base parallel (only THB-denominated openings
- * belong here; foreign openings have no rate at this layer, so they contribute
- * 0 to the THB-base sums rather than a guessed conversion).
- * `accounts` must contain every account referenced in lines or openingBalances.
- */
-export function balanceSheet(
-  lines: { accountId: string; side: Side; amount: string; amountThb?: string }[],
-  accounts: AccountMap,
-  openingBalances: Record<string, string> = {},
-  openingBalancesThb: Record<string, string> = {}
-): BalanceSheetResult {
-  const accountIds = new Set<string>([
-    ...lines.map((l) => l.accountId),
-    ...Object.keys(openingBalances),
-    ...Object.keys(openingBalancesThb),
-  ]);
-
-  const assets: BalanceSheetRow[] = [];
-  const liabilities: BalanceSheetRow[] = [];
-  const equity: BalanceSheetRow[] = [];
-
-  let totalAssets = new Decimal(0);
-  let totalLiabilities = new Decimal(0);
-  let totalEquity = new Decimal(0);
-  let totalAssetsThb = new Decimal(0);
-  let totalLiabilitiesThb = new Decimal(0);
-  let totalEquityThb = new Decimal(0);
-  const byCurrency = new Map<string, { assets: Decimal; liabilities: Decimal; equity: Decimal; assetsThb: Decimal; liabilitiesThb: Decimal; equityThb: Decimal }>();
-
-  const track = (
-    currency: string,
-    type: "ASSET" | "LIABILITY" | "EQUITY",
-    signed: Decimal,
-    signedThb: Decimal
-  ) => {
-    const bucket = byCurrency.get(currency) ?? {
-      assets: new Decimal(0),
-      liabilities: new Decimal(0),
-      equity: new Decimal(0),
-      assetsThb: new Decimal(0),
-      liabilitiesThb: new Decimal(0),
-      equityThb: new Decimal(0),
-    };
-    // Signed amounts are debit-headed; L/E are stored credit-headed magnitudes.
-    const magnitude = type === "ASSET" ? signed : signed.negated();
-    const magnitudeThb = type === "ASSET" ? signedThb : signedThb.negated();
-    if (type === "ASSET") {
-      bucket.assets = bucket.assets.plus(magnitude);
-      bucket.assetsThb = bucket.assetsThb.plus(magnitudeThb);
-    } else if (type === "LIABILITY") {
-      bucket.liabilities = bucket.liabilities.plus(magnitude);
-      bucket.liabilitiesThb = bucket.liabilitiesThb.plus(magnitudeThb);
-    } else {
-      bucket.equity = bucket.equity.plus(magnitude);
-      bucket.equityThb = bucket.equityThb.plus(magnitudeThb);
-    }
-    byCurrency.set(currency, bucket);
-  };
-
-  for (const accountId of accountIds) {
-    const acc = accounts[accountId];
-    if (!acc) continue;
-
-    // Opening balance (positive on normal side) -> signed debit-credit form.
-    const opening = dec(openingBalances[accountId]) ?? new Decimal(0);
-    const openingSigned =
-      normalSideOf(acc.type) === "DEBIT" ? opening : opening.negated();
-    const signed = openingSigned.plus(accountNetAsDebitCredit(lines, accountId));
-    const openingThb = dec(openingBalancesThb[accountId]) ?? new Decimal(0);
-    const openingThbSigned =
-      normalSideOf(acc.type) === "DEBIT" ? openingThb : openingThb.negated();
-    const signedThb = openingThbSigned.plus(accountNetAsDebitCreditThb(lines, accountId));
-
-    const row: BalanceSheetRow = {
-      accountId,
-      code: acc.code,
-      name: acc.name,
-      currency: acc.currency,
-      // Positive magnitude on the normal side (may turn contra-negative).
-      balance: fmt(
-        normalSideOf(acc.type) === "DEBIT" ? signed : signed.negated()
-      ),
-      balanceThb: fmt(
-        normalSideOf(acc.type) === "DEBIT" ? signedThb : signedThb.negated()
-      ),
-    };
-
-    if (acc.type === "ASSET") {
-      totalAssets = totalAssets.plus(signed);
-      totalAssetsThb = totalAssetsThb.plus(signedThb);
-      assets.push(row);
-      track(acc.currency, "ASSET", signed, signedThb);
-    } else if (acc.type === "LIABILITY") {
-      totalLiabilities = totalLiabilities.plus(signed.negated());
-      totalLiabilitiesThb = totalLiabilitiesThb.plus(signedThb.negated());
-      liabilities.push(row);
-      track(acc.currency, "LIABILITY", signed, signedThb);
-    } else if (acc.type === "EQUITY") {
-      totalEquity = totalEquity.plus(signed.negated());
-      totalEquityThb = totalEquityThb.plus(signedThb.negated());
-      equity.push(row);
-      track(acc.currency, "EQUITY", signed, signedThb);
-    }
-  }
-
-  // Current-period net income folds into equity so A = L + E + NI.
-  const netIncomeLines = lines.map((l) => ({ ...l, currency: accounts[l.accountId]?.currency ?? "THB" }));
-  const incomeReport = incomeStatement(netIncomeLines, accounts);
-  const netIncome = dec(incomeReport.netIncome) ?? new Decimal(0);
-  const netIncomeThb = dec(incomeReport.netIncomeThb) ?? new Decimal(0);
-  const totalEquityAndLiabilities = totalLiabilities.plus(totalEquity).plus(netIncome);
-  const totalEquityAndLiabilitiesThb = totalLiabilitiesThb.plus(totalEquityThb).plus(netIncomeThb);
-
-  assets.sort((a, b) => a.code.localeCompare(b.code));
-  liabilities.sort((a, b) => a.code.localeCompare(b.code));
-  equity.sort((a, b) => a.code.localeCompare(b.code));
-
-  const totalsByCurrency = Array.from(byCurrency.entries())
-    .map(([currency, b]) => ({
-      currency,
-      assets: fmt(b.assets),
-      liabilities: fmt(b.liabilities),
-      equity: fmt(b.equity),
-      assetsThb: fmt(b.assetsThb),
-      liabilitiesThb: fmt(b.liabilitiesThb),
-      equityThb: fmt(b.equityThb),
-    }))
-    .sort((a, b) => a.currency.localeCompare(b.currency));
-
-  return {
-    assets,
-    liabilities,
-    equity,
-    netIncome: fmt(netIncome),
-    totalAssets: fmt(totalAssets),
-    totalEquityAndLiabilities: fmt(totalEquityAndLiabilities),
-    balanced: totalAssets.equals(totalEquityAndLiabilities),
-    netIncomeThb: fmt(netIncomeThb),
-    totalAssetsThb: fmt(totalAssetsThb),
-    totalEquityAndLiabilitiesThb: fmt(totalEquityAndLiabilitiesThb),
-    balancedThb: totalAssetsThb.equals(totalEquityAndLiabilitiesThb),
-    totalsByCurrency,
-  };
-}
-
-function accountNetAsDebitCredit(
-  lines: { accountId: string; side: Side; amount: string }[],
-  accountId: string
-): Decimal {
-  let debit = new Decimal(0);
-  let credit = new Decimal(0);
-  for (const l of lines) {
-    if (l.accountId !== accountId) continue;
-    if (l.side === "DEBIT") debit = debit.plus(dec(l.amount) ?? 0);
-    else credit = credit.plus(dec(l.amount) ?? 0);
-  }
-  return debit.minus(credit);
-}
-
-/** THB-base parallel of accountNetAsDebitCredit (stored amountThb). */
-function accountNetAsDebitCreditThb(
-  lines: { accountId: string; side: Side; amountThb?: string }[],
-  accountId: string
-): Decimal {
-  let debit = new Decimal(0);
-  let credit = new Decimal(0);
-  for (const l of lines) {
-    if (l.accountId !== accountId) continue;
-    const thb = dec(l.amountThb ?? "") ?? new Decimal(0);
-    if (l.side === "DEBIT") debit = debit.plus(thb);
-    else credit = credit.plus(thb);
-  }
-  return debit.minus(credit);
-}
+export type BalanceSheetResult = ReturnType<typeof balanceSheet>;
+export type BalanceSheetCurrencyTotal = BalanceSheetResult["totalsByCurrency"][number];
 
 // ---------------------------------------------------------------------------
 // Per-symbol memo summary (e.g. dividends "เงินปันผล" grouped by stock)

@@ -425,62 +425,16 @@ export interface GeneralLedgerJournalEntry {
 }
 
 /** Trial balance result returned by GET /api/v1/reports/trial-balance. */
-export interface GeneralLedgerTrialBalanceRow {
-  accountId: string;
-  code: string;
-  name: string;
-  type: GeneralLedgerAccountType;
-  currency: string;
-  debit: string;
-  credit: string;
-  /** Signed debit-credit (positive = debit-headed). */
-  balance: string;
-  /** THB-base parallels (from stored amountThb). */
-  debitThb: string;
-  creditThb: string;
-  balanceThb: string;
-}
+export type GeneralLedgerTrialBalanceRow = import("./general-ledger").TrialBalanceRow;
 
-export interface GeneralLedgerTrialBalanceCurrencyTotal {
-  currency: string;
-  debit: string;
-  credit: string;
-  debitThb: string;
-  creditThb: string;
-}
+export type GeneralLedgerTrialBalanceCurrencyTotal = import("./general-ledger").TrialBalanceCurrencyTotal;
 
-export interface GeneralLedgerTrialBalance {
-  rows: GeneralLedgerTrialBalanceRow[];
-  totalDebit: string;
-  totalCredit: string;
-  balanced: boolean;
-  /** THB-base totals (the reportable sums). */
-  totalDebitThb: string;
-  totalCreditThb: string;
-  balancedThb: boolean;
-  totalsByCurrency: GeneralLedgerTrialBalanceCurrencyTotal[];
-}
+export type GeneralLedgerTrialBalance = import("./general-ledger").TrialBalanceResult;
 
 /** Income statement result returned by GET /api/v1/reports/income-statement. */
-export interface GeneralLedgerIncomeStatementLine {
-  accountId: string;
-  code: string;
-  name: string;
-  type: "INCOME" | "EXPENSE";
-  currency: string;
-  /** Positive magnitude on the account's normal side. */
-  amount: string;
-  /** Same magnitude in THB-base. */
-  amountThb: string;
-}
+export type GeneralLedgerIncomeStatementLine = import("./general-ledger").IncomeStatementLine;
 
-export interface GeneralLedgerIncomeStatementCurrencyTotal {
-  currency: string;
-  income: string;
-  expense: string;
-  incomeThb: string;
-  expenseThb: string;
-}
+export type GeneralLedgerIncomeStatementCurrencyTotal = import("./general-ledger").IncomeStatementCurrencyTotal;
 
 /** Per-stock dividend breakdown (grouped by the line's memo/ticker label). */
 export interface GeneralLedgerSymbolSummary {
@@ -493,58 +447,14 @@ export interface GeneralLedgerSymbolSummary {
   amountThb: string;
 }
 
-export interface GeneralLedgerIncomeStatement {
-  lines: GeneralLedgerIncomeStatementLine[];
-  totalIncome: string;
-  totalExpense: string;
-  netIncome: string;
-  /** THB-base totals (the reportable sums). */
-  totalIncomeThb: string;
-  totalExpenseThb: string;
-  netIncomeThb: string;
-  totalsByCurrency: GeneralLedgerIncomeStatementCurrencyTotal[];
-  /** Per-stock dividend rows for the period (empty when no dividend postings). */
-  dividendsBySymbol: GeneralLedgerSymbolSummary[];
-}
+export type GeneralLedgerIncomeStatement = import("./general-ledger").IncomeStatementResult & { dividendsBySymbol: GeneralLedgerSymbolSummary[] };
 
 /** Balance sheet row returned by GET /api/v1/reports/balance-sheet. */
-export interface GeneralLedgerBalanceSheetRow {
-  accountId: string;
-  code: string;
-  name: string;
-  currency: string;
-  /** Positive magnitude on the account's normal side. */
-  balance: string;
-  /** Same magnitude in THB-base. */
-  balanceThb: string;
-}
+export type GeneralLedgerBalanceSheetRow = import("./general-ledger").BalanceSheetRow;
 
-export interface GeneralLedgerBalanceSheetCurrencyTotal {
-  currency: string;
-  assets: string;
-  liabilities: string;
-  equity: string;
-  assetsThb: string;
-  liabilitiesThb: string;
-  equityThb: string;
-}
+export type GeneralLedgerBalanceSheetCurrencyTotal = import("./general-ledger").BalanceSheetCurrencyTotal;
 
-export interface GeneralLedgerBalanceSheet {
-  assets: GeneralLedgerBalanceSheetRow[];
-  liabilities: GeneralLedgerBalanceSheetRow[];
-  equity: GeneralLedgerBalanceSheetRow[];
-  /** Current-period net income folded into equity. */
-  netIncome: string;
-  totalAssets: string;
-  totalEquityAndLiabilities: string;
-  balanced: boolean;
-  /** THB-base parallels (the reportable sums). */
-  netIncomeThb: string;
-  totalAssetsThb: string;
-  totalEquityAndLiabilitiesThb: string;
-  balancedThb: boolean;
-  totalsByCurrency: GeneralLedgerBalanceSheetCurrencyTotal[];
-}
+export type GeneralLedgerBalanceSheet = import("./general-ledger").BalanceSheetResult;
 
 /** Per-account ledger result returned by GET /api/v1/ledger/accounts/:id. */
 export interface GeneralLedgerLineView {
@@ -567,6 +477,9 @@ export interface GeneralLedgerLineView {
 }
 
 export interface GeneralLedgerAccountLedger {
+  movement: string;
+  closing: string;
+  normalSide: "DEBIT" | "CREDIT";
   opening: string;
   lines: GeneralLedgerLineView[];
   /** Per-stock (memo) breakdown of this account's period lines. */
@@ -574,60 +487,16 @@ export interface GeneralLedgerAccountLedger {
 }
 
 /** Ledger summary group returned by GET /api/v1/ledger/summary. */
-export interface GeneralLedgerSummaryGroup {
-  code: string;
-  name: string;
-  currency: string;
-  /** Positive magnitude on the account's normal side. */
-  balance: string;
-  /** Same magnitude in THB-base. */
-  balanceThb: string;
-}
+export type GeneralLedgerSummaryGroup = import("./ledger-service").LedgerSummaryGroup;
 
-export interface GeneralLedgerSummaryByType {
-  type: "ASSET" | "LIABILITY" | "EQUITY" | "INCOME" | "EXPENSE";
-  currency: string;
-  /** Signed total across accounts of this type/currency (normal-side positive). */
-  total: string;
-  /** Same total in THB-base. */
-  totalThb: string;
-  accounts: GeneralLedgerSummaryGroup[];
-}
+export type GeneralLedgerSummaryByType = import("./ledger-service").LedgerSummaryByType;
 
-export interface GeneralLedgerTotalsByCurrency {
-  currency: string;
-  assets: string;
-  liabilities: string;
-  equity: string;
-  netIncome: string;
-  /** THB-base parallels of the row above. */
-  assetsThb: string;
-  liabilitiesThb: string;
-  equityThb: string;
-  netIncomeThb: string;
-  balanced: boolean;
-}
+export type GeneralLedgerTotalsByCurrency = GeneralLedgerSummary["totalsByCurrency"][number];
 
-export interface GeneralLedgerTotalsThb {
-  assets: string;
-  liabilities: string;
-  equity: string;
-  netIncome: string;
-  totalAssets: string;
-  totalEquityAndLiabilities: string;
-  balanced: boolean;
-}
+export type GeneralLedgerTotalsThb = GeneralLedgerSummary["totalsThb"];
 
 /** Result of GET /api/v1/ledger/summary (overview numbers, all server-computed). */
-export interface GeneralLedgerSummary {
-  groups: GeneralLedgerSummaryByType[];
-  totalsByCurrency: GeneralLedgerTotalsByCurrency[];
-  /** THB-base grand totals (the reportable sums). */
-  totalsThb: GeneralLedgerTotalsThb;
-  balanced: boolean;
-  totalAssetsNaive: string;
-  totalEquityAndLiabilitiesNaive: string;
-}
+export type GeneralLedgerSummary = import("./ledger-service").LedgerSummary;
 
 /** Single holding returned by GET /api/v1/cost-basis. */
 export interface CostBasisHolding {
