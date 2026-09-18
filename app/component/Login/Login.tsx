@@ -11,22 +11,30 @@ export default function StaxLoginPage() {
   const [remember, setRemember] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
   const { login } = useAuth();
 
   const handleLogin = async () => {
-    const result = await login(email, password);
+    if (isSubmitting) return;
 
-    if (!result.success) {
-      setErrorMessage(result.error || "เข้าสู่ระบบไม่สำเร็จ");
-      return;
+    setIsSubmitting(true);
+    try {
+      const result = await login(email, password);
+
+      if (!result.success) {
+        setErrorMessage(result.error || "เข้าสู่ระบบไม่สำเร็จ");
+        return;
+      }
+
+      setErrorMessage("");
+      // เด้งกลับไป path ที่ผู้ใช้ตั้งใจจะเข้าตั้งแต่แรก (ถ้ามี) ไม่งั้นไป dashboard
+      const from = (location.state as { from?: string } | null)?.from || "/dashboard";
+      navigate(from, { replace: true, state: { email } });
+    } finally {
+      setIsSubmitting(false);
     }
-
-    setErrorMessage("");
-    // เด้งกลับไป path ที่ผู้ใช้ตั้งใจจะเข้าตั้งแต่แรก (ถ้ามี) ไม่งั้นไป dashboard
-    const from = (location.state as { from?: string } | null)?.from || "/dashboard";
-    navigate(from, { replace: true, state: { email } });
   };
 
   return (
@@ -149,9 +157,10 @@ export default function StaxLoginPage() {
             <button
               type="button"
               onClick={handleLogin}
+              disabled={isSubmitting}
               className="w-full bg-blue-900 hover:bg-blue-950 text-white text-sm font-medium py-2.5 rounded-lg flex items-center justify-center gap-2 transition"
             >
-              เข้าสู่ระบบ
+              {isSubmitting ? "กำลังเข้าสู่ระบบ..." : "เข้าสู่ระบบ"}
               <span aria-hidden="true">›</span>
             </button>
 
