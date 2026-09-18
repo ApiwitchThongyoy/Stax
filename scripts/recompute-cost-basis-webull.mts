@@ -36,8 +36,8 @@ import {
   type GainLossBackfillRow,
   type ValidatedCapitalRow,
 } from "../app/lib/statement-pipeline";
-import { buildStatementPostings } from "../app/lib/posting-engine";
-import { insertPostings, reverseJournalEntry } from "../app/lib/ledger-service";
+import { buildStatementJournalEntries } from "../app/lib/posting-engine";
+import { createJournalEntry, reverseJournalEntry } from "../app/lib/ledger-service";
 
 const args = process.argv.slice(2);
 const filterUserId = args.find((a) => !a.startsWith("--")) || undefined;
@@ -50,7 +50,7 @@ interface LedgerRow extends GainLossBackfillRow {
   transactionDate: string;
   fxRateBot: string | null;
   fxRateStatement: string | null;
-  amountThb: string;
+  amountThb: string | null;
   type: string;
   sourceDocumentId: string | null;
   category: string | null;
@@ -59,6 +59,7 @@ interface LedgerRow extends GainLossBackfillRow {
   exchangeFromCurrency: string | null;
   exchangeFromAmount: string | null;
   exchangeRate: string | null;
+  isMonthlyFeeAggregate: boolean | null;
   costBasis: string | null;
   proceeds: string | null;
   realizedGainLoss: string | null;
@@ -90,6 +91,7 @@ const CAPITAL_TX = {
   exchangeFromCurrency: capitalTransactions.exchangeFromCurrency,
   exchangeFromAmount: capitalTransactions.exchangeFromAmount,
   exchangeRate: capitalTransactions.exchangeRate,
+  isMonthlyFeeAggregate: capitalTransactions.isMonthlyFeeAggregate,
   costBasis: capitalTransactions.costBasis,
   proceeds: capitalTransactions.proceeds,
   realizedGainLoss: capitalTransactions.realizedGainLoss,
@@ -177,6 +179,7 @@ function toValidatedRow(r: LedgerRow): ValidatedCapitalRow {
     exchangeFromCurrency: r.exchangeFromCurrency,
     exchangeFromAmount: r.exchangeFromAmount,
     exchangeRate: r.exchangeRate,
+    isMonthlyFeeAggregate: r.isMonthlyFeeAggregate,
   };
 }
 
@@ -198,17 +201,16 @@ async function repostLedgerForRow(row: LedgerRow) {
   let reversed = 0;
   for (const e of entries) {
     const result = await reverseJournalEntry(row.userId, e.id);
-    if (result.ok) reversed++;
+    if (!result.ok) throw new Error("Cannot reverse previous SELL: " + result.errors.join("; "));
+    reversed++;
   }
 
-  const { entries: newEntries, skipped } = buildStatementPostings([
-    toValidatedRow(row),
-  ]);
-  if (newEntries.length === 0) {
-    return { reversed, posted: 0, skipped: skipped.length };
-  }
-  const result = await insertPostings(row.userId, newEntries);
-  return { reversed, posted: result.postedCount, skipped: skipped.length };
+  const [plan] = buildStatementJournalEntries([toValidatedRow(row)]);
+  // Retain non-computable SELLs in journal SSOT, with null gains and no lines.
+  const result = await createJournalEntry(row.userId, plan.entry);
+  if (!result.ok) throw new Error(result.errors.join("; "));
+  return { reversed, posted: plan.postingState === "POSTED" ? 1 : 0,
+    skipped: plan.postingState === "SKIPPED" ? 1 : 0 };
 }
 
 async function processUser(userId: string, includeGl: boolean) {
@@ -220,7 +222,13 @@ async function processUser(userId: string, includeGl: boolean) {
     .execute();
 
   const actions = await loadActions(userId);
-  const { updates, stats } = recomputeAllGainLoss(storedRows, actions);
+  const { updates: computed, stats } = recomputeAllGainLoss(storedRows, actions);
+  const byId = new Map(computed.map(u => [u.transactionId, u.update]));
+  // Match deletion reconciliation: clear stale values when replay cannot support them.
+  const updates = storedRows.filter(r => r.sourceType === "AI_PARSED" && r.side === "SELL")
+    .map(r => ({ transactionId: r.transactionId, update: byId.get(r.transactionId) ?? {
+      costBasis: null, proceeds: r.proceeds, realizedGainLoss: null, realizedGainLossThb: null,
+    } }));
 
   // Only rows whose Webull value differs from what is stored need writing.
   const storedById = new Map(storedRows.map((r) => [r.transactionId, r]));

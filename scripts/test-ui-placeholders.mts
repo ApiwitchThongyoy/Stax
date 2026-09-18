@@ -1433,12 +1433,16 @@ ok(
 );
 ok(
   tradingJournalRoute.includes("const tradeRows = journalRows.filter((r) =>") &&
-    tradingJournalRoute.includes("buildTradingJournalEntries(tradeRows)") &&
+    tradingJournalRoute.includes("buildTradingJournalEntries(tradeRows, corporateActionRows)") &&
     tradingJournalRoute.includes("let scopedEntries = fullEntries;") &&
     tradingJournalRoute.includes("e.date >= from") &&
     tradingJournalRoute.includes("e.date <= to") &&
-    tradingJournalRoute.includes("entrySymbolOf(e) === symbol"),
-  "Trading-journal route replays the average over the full lifetime, then applies date/symbol filters to the built entries (no window drift)"
+    tradingJournalRoute.includes("entrySymbolOf(e) === symbol") &&
+    tradingJournalRoute.includes("buildBehaviorStats(scopeRows, corporateActionRows)") &&
+    tradingJournalRoute.includes("corporateActionRows: CorporateActionInput[] = []") &&
+    tradingJournalRoute.includes("corporateActionsTable.parentFmvPerShare") &&
+    tradingJournalRoute.includes("corporateActionsTable.childFmvPerShare"),
+  "Trading-journal route replays the average over the full lifetime + corporate actions, then applies date/symbol filters to the built entries (no window drift)"
 );
 ok(
   tradingJournalRoute.includes("holdingBySymbol.has(sym)") &&

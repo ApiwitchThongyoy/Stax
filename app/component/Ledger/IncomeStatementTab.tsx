@@ -28,7 +28,7 @@ function MoneyRow({
   name: string;
   currency: string;
   amount: string;
-  amountThb: string;
+  amountThb: string | null;
   colorClass: string;
 }) {
   return (

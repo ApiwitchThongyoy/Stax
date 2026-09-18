@@ -1,8 +1,9 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { Decimal } from "decimal.js";
 import { db } from "~/lib/drizzle-db";
-import { costBasisState, stockPrices } from "~/db/schema";
+import { costBasisState, corporateActions as corporateActionsTable, stockPrices } from "~/db/schema";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
+import type { CorporateActionInput } from "~/lib/corporate-action";
 import {
   listCapitalLedgerRows,
 } from "~/lib/journal-ledger-read";
@@ -107,6 +108,37 @@ export async function loader({ request }: { request: Request }) {
     );
   }
 
+  // Corporate actions that replay the same symbol history (split / reverse
+  // split / rename / spin-off / cash-in-lieu) interleave into the avgCostAtTime
+  // and holding-period replays below, so the journal page agrees with the
+  // action-aware cost_basis_state cache. Optional deployment table (0014) —
+  // degrade to trades-only replay when the table is missing.
+  let corporateActionRows: CorporateActionInput[] = [];
+  try {
+    const actionRows = await db
+      .select({
+        symbol: corporateActionsTable.symbol,
+        actionType: corporateActionsTable.actionType,
+        transactionDate: corporateActionsTable.transactionDate,
+        ratioOld: corporateActionsTable.ratioOld,
+        ratioNew: corporateActionsTable.ratioNew,
+        newSymbol: corporateActionsTable.newSymbol,
+        sharesOut: corporateActionsTable.sharesOut,
+        priceOut: corporateActionsTable.priceOut,
+        parentFmvPerShare: corporateActionsTable.parentFmvPerShare,
+        childFmvPerShare: corporateActionsTable.childFmvPerShare,
+        cashInLieu: corporateActionsTable.cashInLieu,
+        description: corporateActionsTable.description,
+      })
+      .from(corporateActionsTable)
+      .where(eq(corporateActionsTable.userId, auth.userId))
+      .execute();
+    corporateActionRows = actionRows as unknown as CorporateActionInput[];
+  } catch (error) {
+    console.error("TradingJournal GET: failed to query corporate actions", error);
+    corporateActionRows = [];
+  }
+
   // Journal-as-SSOT rows, oldest-first, limited to stock trades only:
   // BUY/SELL trade rows + dividend income rows. Interest, capital-gain summary
   // lines, fees/VAT, equity deposits/withdrawals, FX transfers and GL-manual
@@ -119,7 +151,7 @@ export async function loader({ request }: { request: Request }) {
   const tradeRows = journalRows.filter((r) =>
     isTradeJournalRow(r.side, r.category, r.section)
   );
-  const fullEntries = buildTradingJournalEntries(tradeRows);
+  const fullEntries = buildTradingJournalEntries(tradeRows, corporateActionRows);
 
   const entrySymbolOf = (e: (typeof fullEntries)[number]) =>
     (e.symbol ?? "").trim().toUpperCase();
@@ -415,7 +447,7 @@ export async function loader({ request }: { request: Request }) {
 
   // Portfolio-level behavior statistics over the date/symbol scope (never the
   // side filter) — computable SELLs only, server fields, no invention.
-  const behavior = buildBehaviorStats(scopeRows);
+  const behavior = buildBehaviorStats(scopeRows, corporateActionRows);
 
   return Response.json(
     {

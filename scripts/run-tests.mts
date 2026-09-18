@@ -891,6 +891,178 @@ async function main() {
     }
   }
 
+  // ================= REG: DETERMINISTIC REIMPORT (numeric reproducibility) =================
+  // R17: delete + re-import must converge to EXACTLY the state a clean import of
+  // the same statements produced. The import path runs a FULL deterministic
+  // reconcile (recomputeAllGainLoss + scoped journal re-post + whole-history
+  // recomputeCostBasisMap) instead of an incremental cache-upsert + fill-NULL
+  // backfill. Discriminator: A = BUY X 100@10 (2026-01-05), B = SELL X 50@15
+  // (2026-01-10). Clean -> basis X qty 50; DELETE A -> basis empty + SELL
+  // non-computable; REIMPORT A -> basis X qty 50 again. An incremental path
+  // replays the BUY from an EMPTY cache and would leave qty 100 (the bug).
+  {
+    const { randomUUID } = await import("node:crypto");
+    const detLines = (kind: "a" | "b") =>
+      kind === "a"
+        ? [
+            "TRADE RECORDS",
+            "Currency: USD",
+            "USD/THB = 35.42",
+            "X",
+            "05/01/2026 10:00:00,GMT+07 05/01/2026 BUY 100 10.00 1000.00 1000.00 1.00 0.07 NASDAQ",
+            "PORTFOLIO SUMMARY",
+          ]
+        : [
+            "TRADE RECORDS",
+            "Currency: USD",
+            "USD/THB = 35.42",
+            "X",
+            "10/01/2026 10:00:00,GMT+07 10/01/2026 SELL 50 15.00 750.00 748.50 1.00 0.07 NASDAQ",
+            "PORTFOLIO SUMMARY",
+          ];
+    const detFile = (kind: "a" | "b") =>
+      new File([makePdf(detLines(kind)) as BlobPart], `w2-det-${kind}.pdf`, {
+        type: "application/pdf",
+      });
+    const detUpload = (token: string, file: File) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return uploadRoute.action({
+        request: new Request("http://test.local/api/v1/statements/upload", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        }),
+      } as never);
+    };
+    const basisOfX = () =>
+      client`SELECT quantity, avg_cost, cum_quantity, cum_cost FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol = 'X'`;
+    const sellRowOfX = () =>
+      client`SELECT realized_gain_loss, realized_gain_loss_thb, cost_basis FROM "Capital_Transactions" WHERE user_id = ${userARow.id} AND symbol = 'X' AND side = 'SELL'`;
+    if (tokenA && userARow) {
+      // purge leftovers from a previous run
+      const priorDocs = await client`SELECT id FROM documents WHERE user_id = ${userARow.id} AND original_name IN ('w2-det-a.pdf', 'w2-det-b.pdf')`;
+      for (const d of priorDocs) {
+        await client`DELETE FROM journal_entry_lines WHERE user_id = ${userARow.id} AND journal_entry_id IN (SELECT id FROM journal_entries WHERE user_id = ${userARow.id} AND source_document_id = ${d.id})`;
+        await client`DELETE FROM "Capital_Transactions" WHERE source_document_id = ${d.id} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM journal_entries WHERE source_document_id = ${d.id} AND user_id = ${userARow.id}`;
+        await client`DELETE FROM documents WHERE id = ${d.id} AND user_id = ${userARow.id}`;
+      }
+      await client`DELETE FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol IN ('X', 'Y')`;
+
+      // 1. Clean chain: import A (BUY) then B (SELL) — the reproducibility target.
+      const a1 = await detUpload(tokenA, detFile("a"));
+      const a1Body = (await a1.json()) as { data?: { documentId?: string } };
+      const aDoc = a1Body.data?.documentId;
+      const b1 = await detUpload(tokenA, detFile("b"));
+      const b1Body = (await b1.json()) as { data?: { documentId?: string } };
+      const bDoc = b1Body.data?.documentId;
+      ok(
+        a1.status === 200 && b1.status === 200 && !!aDoc && !!bDoc,
+        "REG-det: both statements import (A BUY 100@10 + B SELL 50@15)"
+      );
+      const cleanBasis = await basisOfX();
+      ok(
+        cleanBasis.length === 1 && parseFloat(cleanBasis[0].quantity ?? "") === 50,
+        "REG-det: clean basis holds X qty 50 after the SELL"
+      );
+      const cleanSell = await sellRowOfX();
+      ok(
+        cleanSell.length === 1 &&
+          parseFloat(cleanSell[0].cost_basis ?? "") === 500 &&
+          parseFloat(cleanSell[0].realized_gain_loss ?? "") === 248.5,
+        "REG-det: clean SELL realized 248.50 = net 748.50 - basis 500.00 (50 shares x avg 10)"
+      );
+
+      // 2. DELETE A -> basis must empty + the remaining SELL become non-computable.
+      const delA = aDoc
+        ? await documentRoute.action({
+            request: authedRequest("DELETE", tokenA),
+            params: { id: aDoc },
+          } as never)
+        : null;
+      ok(delA?.status === 200, "REG-det: statement A deletion succeeds");
+      const basisAfterDelete = await basisOfX();
+      const sellAfterDelete = await sellRowOfX();
+      ok(
+        basisAfterDelete.length === 0,
+        "REG-det: after deleting A the basis is empty (no BUY remains)"
+      );
+      ok(
+        sellAfterDelete.length === 1 && sellAfterDelete[0].realized_gain_loss === null,
+        "REG-det: SELL becomes non-computable (realized NULL) after deleting its supporting BUY"
+      );
+
+      // 3. MANUAL row must survive the later reimport reconcile untouched.
+      const manualId = randomUUID();
+      await client`
+        INSERT INTO "Capital_Transactions"
+          (transaction_id, user_id, amount_foreign, currency, transaction_date, amount_thb, type, source_type, category, symbol, side, quantity, unit_price, gross_amount, fees, net_amount, proceeds, cost_basis, realized_gain_loss, realized_gain_loss_thb, fx_rate_statement, fx_rate_effective)
+        VALUES
+          (${manualId}, ${userARow.id}, '80.00', 'USD', '2026-01-08', '2833.60', 'BUY', 'MANUAL', 'asset', 'Y', 'BUY', '10', '8.00', '80.00', '0.05', '80.00', NULL, NULL, NULL, NULL, '35.42', '35.42')`;
+      await client`DELETE FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol = 'Y'`;
+
+      // 4. REIMPORT A -> the FULL reconcile must reproduce the CLEAN state.
+      const a2 = await detUpload(tokenA, detFile("a"));
+      const a2Body = (await a2.json()) as { data?: { documentId?: string } };
+      const a2Doc = a2Body.data?.documentId;
+      ok(a2.status === 200 && !!a2Doc, "REG-det: re-upload of A after deletion imports");
+      const basisAfterReimport = await basisOfX();
+      ok(
+        basisAfterReimport.length === 1 &&
+          parseFloat(basisAfterReimport[0].quantity ?? "") === 50,
+        "REG-det: reimport A reproduces qty 50 (== clean; the incremental path would leave 100)"
+      );
+      ok(
+        basisAfterReimport.length === 1 &&
+          parseFloat(basisAfterReimport[0].cum_quantity ?? "") === 100 &&
+          parseFloat(basisAfterReimport[0].cum_cost ?? "") === 1000,
+        "REG-det: reimport A reproduces the clean lifetime cum fields (cumQuantity 100, cumCost 1000 — the Webull accumulator is NOT reduced by SELL)"
+      );
+      const sellAfterReimport = await sellRowOfX();
+      ok(
+        sellAfterReimport.length === 1 &&
+          sellAfterReimport[0].realized_gain_loss === cleanSell[0].realized_gain_loss &&
+          sellAfterReimport[0].realized_gain_loss_thb === cleanSell[0].realized_gain_loss_thb,
+        "REG-det: SELL realized gain/loss (native + THB) matches the CLEAN state exactly"
+      );
+      const manualRowAfter = await client`
+        SELECT source_type, realized_gain_loss FROM "Capital_Transactions" WHERE transaction_id = ${manualId} AND user_id = ${userARow.id}`;
+      ok(
+        manualRowAfter.length === 1 &&
+          manualRowAfter[0].source_type === "MANUAL" &&
+          manualRowAfter[0].realized_gain_loss === null,
+        "REG-det: MANUAL row untouched by the reimport reconcile (still MANUAL, realized NULL)"
+      );
+      const manualBasisAfter = await client`
+        SELECT quantity FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol = 'Y'`;
+      ok(
+        manualBasisAfter.length === 1 && parseFloat(manualBasisAfter[0].quantity ?? "") === 10,
+        "REG-det: MANUAL BUY contributes to the rebuilt basis (Y qty 10) and is not clobbered"
+      );
+      const postedEntries = a2Doc && bDoc ? await client`
+        SELECT COUNT(*)::int AS n FROM journal_entries
+        WHERE user_id = ${userARow.id} AND posting_state = 'POSTED' AND side IN ('BUY', 'SELL') AND (source_document_id = ${a2Doc} OR source_document_id = ${bDoc})` : [{ n: -1 }];
+      ok(
+        postedEntries[0]?.n === 2,
+        "REG-det: exactly 2 POSTED trade journal entries across the reimported A and B (BUY + SELL, no duplicates; VAT/fee/summary rows stay SKIPPED)"
+      );
+
+      // cleanup (audit rows are removed globally at the end)
+      for (const d of [a2Doc, bDoc]) {
+        if (d) {
+          await client`DELETE FROM journal_entry_lines WHERE user_id = ${userARow.id} AND journal_entry_id IN (SELECT id FROM journal_entries WHERE user_id = ${userARow.id} AND source_document_id = ${d})`;
+          await client`DELETE FROM "Capital_Transactions" WHERE source_document_id = ${d} AND user_id = ${userARow.id}`;
+          await client`DELETE FROM journal_entries WHERE source_document_id = ${d} AND user_id = ${userARow.id}`;
+          await client`DELETE FROM documents WHERE id = ${d} AND user_id = ${userARow.id}`;
+          await client`DELETE FROM notifications WHERE entity_id = ${d}`;
+        }
+      }
+      await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ${manualId} AND user_id = ${userARow.id}`;
+      await client`DELETE FROM cost_basis_state WHERE user_id = ${userARow.id} AND symbol IN ('X', 'Y')`;
+    }
+  }
+
   // ================= REG: STATEMENT PREVIEW (แสดงรายละเอียดก่อน + OK ค่อยนำเข้า) =================
   // POST /api/v1/statements/preview must return the FULL parsed rows + stats for
   // the "ตรวจสอบเอกสารก่อนนำเข้า" screen WITHOUT persisting anything (no storage
@@ -3478,6 +3650,335 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
     }
   }
 
+  // ================= REG: MONTHLY FEE AGGREGATE PERSISTENCE (migration 0027) =================
+  // The R4 monthly-fee/VAT provenance flag (is_monthly_fee_aggregate) must land
+  // in BOTH Capital_Transactions and journal_entries when a statement import
+  // persists rows, and a REBUILD from the persisted shape (deletion
+  // reconciliation / recompute scripts re-read the DB then re-post) must keep
+  // the monthly rows (TRUE) SKIPPED-by-flag and the legacy/unknown rows (NULL)
+  // SKIPPED-by-unknown-provenance rather than inventing a 5010 expense line,
+  // while a genuine standalone fee (flag false) still POSTs once. Requires the
+  // 0027 migration.
+  {
+    const feeAggCol =
+      await client`SELECT column_name FROM information_schema.columns WHERE lower(table_name) = 'capital_transactions' AND column_name = 'is_monthly_fee_aggregate'`;
+    if (feeAggCol.length === 0) {
+      console.log(
+        "\n  SKIP  REG-monthly-fee-agg: is_monthly_fee_aggregate absent (run the 0027 migration)"
+      );
+    } else {
+      console.log("\n=== REG: MONTHLY FEE AGGREGATE PERSISTENCE ===");
+      const { randomUUID } = await import("node:crypto");
+      const mfaEmail = `mfa-${randomUUID()}@test.local`;
+      const mfaPass = "MfaCheck!234";
+      const mfaReg = await registerAs(mfaEmail, mfaPass);
+      const mfaJson = (await mfaReg.json()) as { data?: { user?: { id?: string } } };
+      const mfaUserId = mfaJson.data?.user?.id;
+      if (!mfaUserId) {
+        ok(false, "REG-mfa: register failed to create the fee-aggregate test user");
+      } else {
+        smokeUserIds.push(mfaUserId);
+        const mfaLogin = await loginAs(mfaEmail, mfaPass);
+        const mfaToken = mfaLogin.data?.accessToken as string | undefined;
+        if (!mfaToken) {
+          ok(false, "REG-mfa: fee-aggregate user could not log in");
+        } else {
+          const mfaLedger = await import("../app/lib/ledger-service");
+          const mfaEngine = await import("../app/lib/posting-engine");
+          const docId = randomUUID();
+          const now = new Date().toISOString();
+          await client`INSERT INTO documents (id, user_id, original_name, file_path, mime_type, file_size, created_at, updated_at)
+                       VALUES (${docId}, ${mfaUserId}, 'mfa.PDF', '/tmp/mfa.pdf', 'application/pdf', 100, ${now}, ${now})`;
+          const baseRow = (over: Record<string, unknown>) =>
+            ({
+              transactionId: randomUUID(),
+              userId: mfaUserId,
+              amountForeign: "11.00",
+              currency: "USD",
+              transactionDate: "2026-01-15",
+              fxRateBot: null,
+              amountThb: "389.50",
+              type: "CASH_IN",
+              sourceType: "AI_PARSED",
+              sourceDocumentId: docId,
+              category: "expense",
+              section: "ค่าธรรมเนียม",
+              symbol: null,
+              side: null,
+              quantity: null,
+              unitPrice: null,
+              grossAmount: null,
+              fees: null,
+              proceeds: null,
+              costBasis: null,
+              realizedGainLoss: null,
+              realizedGainLossThb: null,
+              fxRateStatement: "35.4",
+              fxRateEffective: "35.4",
+              netAmount: null,
+              exchange: null,
+              exchangeFromCurrency: null,
+              exchangeFromAmount: null,
+              exchangeRate: null,
+              isMonthlyFeeAggregate: false,
+              ...over,
+            }) as unknown as Parameters<typeof mfaLedger.insertStatementImport>[1][number];
+          const txMonthly = randomUUID();
+          const txStandalone = randomUUID();
+          const txLegacy = randomUUID();
+          const persistedRows = [
+            baseRow({
+              transactionId: txMonthly,
+              isMonthlyFeeAggregate: true,
+            }),
+            baseRow({
+              transactionId: txStandalone,
+              isMonthlyFeeAggregate: false,
+              amountForeign: "9.00",
+              amountThb: "318.60",
+            }),
+            // Legacy pre-0027 row: the old parser emitted an IDENTICAL persisted
+            // shape for aggregates AND standalone fees, so its provenance is
+            // UNKNOWN. The tri-state contract stores NULL (never a fabricated
+            // false) and the rebuild SKIPS it (no lines) until a delete +
+            // re-import re-runs the parser for a deterministic TRUE/FALSE.
+            baseRow({
+              transactionId: txLegacy,
+              isMonthlyFeeAggregate: null,
+              amountForeign: "2.50",
+              amountThb: "88.50",
+            }),
+          ];
+          const imported = await mfaLedger.insertStatementImport(mfaUserId, persistedRows);
+          ok(
+            imported.insertedCount === 3 &&
+              imported.transactionIds.includes(txMonthly) &&
+              imported.transactionIds.includes(txLegacy),
+            "REG-mfa: statement import persists the monthly + standalone + legacy fee rows"
+          );
+          const capFlag = await client`
+            SELECT is_monthly_fee_aggregate FROM "Capital_Transactions"
+            WHERE transaction_id = ${txMonthly}`;
+          ok(
+            capFlag.length === 1 && capFlag[0].is_monthly_fee_aggregate === true,
+            "REG-mfa: Capital_Transactions row stores is_monthly_fee_aggregate = true"
+          );
+          const capStandalone = await client`
+            SELECT is_monthly_fee_aggregate FROM "Capital_Transactions"
+            WHERE transaction_id = ${txStandalone}`;
+          ok(
+            capStandalone.length === 1 && capStandalone[0].is_monthly_fee_aggregate === false,
+            "REG-mfa: standalone fee row stores is_monthly_fee_aggregate = false"
+          );
+          const capLegacy = await client`
+            SELECT is_monthly_fee_aggregate FROM "Capital_Transactions"
+            WHERE transaction_id = ${txLegacy}`;
+          ok(
+            capLegacy.length === 1 && capLegacy[0].is_monthly_fee_aggregate === null,
+            "REG-mfa: legacy (pre-0027) row stores is_monthly_fee_aggregate = NULL (never coerced to false)"
+          );
+          const jrnFlag = await client`
+            SELECT is_monthly_fee_aggregate, posting_state FROM journal_entries
+            WHERE source_transaction_id = ${txMonthly}`;
+          ok(
+            jrnFlag.length === 1 &&
+              jrnFlag[0].is_monthly_fee_aggregate === true &&
+              jrnFlag[0].posting_state === "SKIPPED",
+            "REG-mfa: journal_entries row stores the flag true AND is SKIPPED (monthly) — independent fields"
+          );
+          const jrnStandalone = await client`
+            SELECT is_monthly_fee_aggregate, posting_state FROM journal_entries
+            WHERE source_transaction_id = ${txStandalone}`;
+          ok(
+            jrnStandalone.length === 1 &&
+              jrnStandalone[0].is_monthly_fee_aggregate === false &&
+              jrnStandalone[0].posting_state === "POSTED",
+            "REG-mfa: standalone fee journal row stores flag false AND is POSTED — independent fields"
+          );
+          const jrnLegacy = await client`
+            SELECT is_monthly_fee_aggregate, posting_state, skip_reason FROM journal_entries
+            WHERE source_transaction_id = ${txLegacy}`;
+          ok(
+            jrnLegacy.length === 1 &&
+              jrnLegacy[0].is_monthly_fee_aggregate === null &&
+              jrnLegacy[0].posting_state === "SKIPPED" &&
+              typeof jrnLegacy[0].skip_reason === "string" &&
+              jrnLegacy[0].skip_reason.includes(
+                "re-import required for deterministic classification"
+              ),
+            "REG-mfa: legacy journal row keeps flag NULL AND is SKIPPED with explicit unknown-provenance reason — independent fields"
+          );
+          // Rebuild from the persisted DB shape (what reconcileStatementDeletion /
+          // recompute scripts do): read the rows back and re-run the pure engine.
+          const capRowsAll = await client`
+            SELECT * FROM "Capital_Transactions"
+            WHERE user_id = ${mfaUserId} AND source_document_id = ${docId}
+            ORDER BY transaction_id`;
+          const toCapitalShape = (r: Record<string, unknown>) => ({
+            transactionId: r.transaction_id as string,
+            userId: r.user_id as string,
+            amountForeign: r.amount_foreign as string,
+            currency: r.currency as string,
+            transactionDate: r.transaction_date as string,
+            fxRateBot: r.fx_rate_bot as string | null,
+            amountThb: r.amount_thb as string | null,
+            type: r.type as string,
+            sourceType: r.source_type as string,
+            sourceDocumentId: r.source_document_id as string | null,
+            category: r.category as string,
+            section: r.section as string | null,
+            symbol: r.symbol as string | null,
+            side: r.side as string | null,
+            quantity: r.quantity as string | null,
+            unitPrice: r.unit_price as string | null,
+            grossAmount: r.gross_amount as string | null,
+            fees: r.fees as string | null,
+            proceeds: r.proceeds as string | null,
+            costBasis: r.cost_basis as string | null,
+            realizedGainLoss: r.realized_gain_loss as string | null,
+            realizedGainLossThb: r.realized_gain_loss_thb as string | null,
+            fxRateStatement: r.fx_rate_statement as string | null,
+            fxRateEffective: r.fx_rate_effective as string | null,
+            netAmount: r.net_amount as string | null,
+            exchange: r.exchange as string | null,
+            exchangeFromCurrency: r.exchange_from_currency as string | null,
+            exchangeFromAmount: r.exchange_from_amount as string | null,
+            exchangeRate: r.exchange_rate as string | null,
+            isMonthlyFeeAggregate:
+              r.is_monthly_fee_aggregate == null
+                ? null
+                : (r.is_monthly_fee_aggregate as boolean) === true,
+          });
+          const rebuiltMonthly = toCapitalShape(
+            capRowsAll.find((r) => r.transaction_id === txMonthly) as Record<string, unknown> | undefined ?? {}
+          );
+          const rebuiltStandalone = toCapitalShape(
+            capRowsAll.find((r) => r.transaction_id === txStandalone) as Record<string, unknown> | undefined ?? {}
+          );
+          const rebuiltLegacy = toCapitalShape(
+            capRowsAll.find((r) => r.transaction_id === txLegacy) as Record<string, unknown> | undefined ?? {}
+          );
+          const rebuiltEntries = mfaEngine.buildStatementJournalEntries([
+            rebuiltMonthly as never,
+            rebuiltStandalone as never,
+            rebuiltLegacy as never,
+          ]);
+          const rebuiltMonthlyEntry = rebuiltEntries.find((e) => e.entry.detail?.section === "ค่าธรรมเนียม" && e.entry.detail?.isMonthlyFeeAggregate === true);
+          const rebuiltStandaloneEntry = rebuiltEntries.find((e) => e.entry.detail?.section === "ค่าธรรมเนียม" && e.entry.detail?.isMonthlyFeeAggregate === false);
+          const rebuiltLegacyEntry = rebuiltEntries.find((e) => e.entry.detail?.section === "ค่าธรรมเนียม" && e.entry.detail?.isMonthlyFeeAggregate == null);
+          ok(
+            rebuiltMonthlyEntry?.postingState === "SKIPPED" &&
+              rebuiltMonthlyEntry?.entry.lines.length === 0,
+            "REG-mfa: rebuild from persisted rows keeps the monthly fee SKIPPED with zero lines"
+          );
+          ok(
+            rebuiltStandaloneEntry?.postingState === "POSTED" &&
+              rebuiltStandaloneEntry?.entry.lines.some(
+                (l) => l.accountId === "5010" && l.debit === "9.00"
+              ),
+            "REG-mfa: rebuild from persisted rows POSTs the standalone fee (Dr 5010 once)"
+          );
+          ok(
+            rebuiltLegacyEntry?.postingState === "SKIPPED" &&
+              rebuiltLegacyEntry?.entry.lines.length === 0 &&
+              rebuiltLegacyEntry?.entry.detail?.isMonthlyFeeAggregate === null &&
+              typeof rebuiltLegacyEntry?.entry.skipReason === "string" &&
+              (rebuiltLegacyEntry.entry.skipReason ?? "").includes(
+                "re-import required for deterministic classification"
+              ),
+            "REG-mfa: rebuild from a legacy NULL row is SKIPPED with zero lines + explicit reason (detail stays null)"
+          );
+          // R2/R5/R8: verify actual persisted headers/lines, not just pure plans.
+          const accountingRows = [
+            baseRow({ category: "asset", side: "SELL", symbol: "R258", amountForeign: "1189.00",
+              costBasis: "1000.00", proceeds: "1189.00", realizedGainLoss: "189.00",
+              realizedGainLossThb: "6694.38", fxRateEffective: "35.42", amountThb: "999" }),
+            baseRow({ category: "asset", side: "SELL", symbol: "R258", amountForeign: "1000.00",
+              costBasis: "1000.00", realizedGainLoss: "0.00", realizedGainLossThb: "0.00" }),
+            baseRow({ category: "asset", side: "SELL", symbol: "R258", amountForeign: "1000.00",
+              costBasis: null, realizedGainLoss: null, realizedGainLossThb: null }),
+          ];
+          await mfaLedger.insertStatementImport(mfaUserId, accountingRows);
+          const accountingIds = accountingRows.map(r => r.transactionId);
+          const persistedAccounting = await client`
+            SELECT e.source_transaction_id, e.posting_state, e.skip_reason,
+              e.cost_basis, e.realized_gain_loss, e.realized_gain_loss_thb, e.amount_thb,
+              count(l.id)::int AS line_count,
+              coalesce(sum(l.debit_amount),0) = coalesce(sum(l.credit_amount),0) AS native_balanced,
+              coalesce(sum(CASE WHEN l.debit_amount IS NOT NULL THEN l.amount_thb ELSE 0 END),0) =
+              coalesce(sum(CASE WHEN l.credit_amount IS NOT NULL THEN l.amount_thb ELSE 0 END),0) AS thb_balanced
+            FROM journal_entries e LEFT JOIN journal_entry_lines l ON l.journal_entry_id = e.id
+            WHERE e.source_transaction_id = ANY(${accountingIds}::text[])
+            GROUP BY e.id`;
+          const gainEntry = persistedAccounting.find(e => e.source_transaction_id === accountingIds[0]);
+          const zeroEntry = persistedAccounting.find(e => e.source_transaction_id === accountingIds[1]);
+          const missingEntry = persistedAccounting.find(e => e.source_transaction_id === accountingIds[2]);
+          ok(gainEntry?.posting_state === "POSTED" && Number(gainEntry.realized_gain_loss) === 189 &&
+            Number(gainEntry.realized_gain_loss_thb) === 6694.38 && Number(gainEntry.amount_thb) === 42114.38,
+            "REG-R258: gain 189 / THB 6694.38 persisted; conflicting header THB replaced");
+          ok(zeroEntry?.posting_state === "POSTED" && zeroEntry.line_count === 2,
+            "REG-R258: zero-gain SELL persists two positive lines");
+          ok(missingEntry?.posting_state === "SKIPPED" && missingEntry.line_count === 0 &&
+            missingEntry.cost_basis === null && missingEntry.realized_gain_loss === null &&
+            missingEntry.realized_gain_loss_thb === null && !!missingEntry.skip_reason,
+            "REG-R258: no-basis SELL persists null gains and zero lines with reason");
+          ok(persistedAccounting.every(e => e.native_balanced && e.thb_balanced),
+            "REG-R258: persisted native and THB debit/credit totals match");
+          const manual = await mfaLedger.createJournalEntry(mfaUserId, {
+            entryDate: "2026-01-15", description: "R5 conflicting line THB",
+            lines: [
+              { accountId: "1020", currency: "USD", debit: "10.005", fxRateEffective: "35.42", amountThb: "999" },
+              { accountId: "3010", currency: "USD", credit: "10.005", fxRateEffective: "35.42", amountThb: "888" },
+            ],
+          });
+          const manualLines = manual.ok ? await client`
+            SELECT debit_amount, credit_amount, amount_thb FROM journal_entry_lines
+            WHERE journal_entry_id = ${manual.entryId}` : [];
+          ok(manualLines.length === 2 && manualLines.every(l =>
+            Number(l.debit_amount ?? l.credit_amount) === 10.01 && Number(l.amount_thb) === 354.55),
+            "REG-R258: conflicting caller line THB cannot persist (10.01 -> 354.55)");
+          const edge = await mfaLedger.createJournalEntry(mfaUserId, {
+            entryDate: "2026-01-15", description: "R5 rounding rejection",
+            lines: [
+              { accountId: "1020", currency: "USD", debit: "0.005", fxRateEffective: "35" },
+              { accountId: "1020", currency: "USD", debit: "0.005", fxRateEffective: "35" },
+              { accountId: "3010", currency: "USD", credit: "0.010", fxRateEffective: "35" },
+            ],
+          });
+          ok(!edge.ok && edge.errors.some(e => e.includes("does not balance")),
+            "REG-R258: raw-balanced but rounded-unbalanced write is rejected");
+          // Execute the real recompute command: these SELLs have no supporting BUY.
+          execFileSync(process.execPath, ["./node_modules/tsx/dist/cli.mjs",
+            "./scripts/recompute-cost-basis-webull.mts", mfaUserId], { stdio: "pipe" });
+          const recomputedSells = await client`SELECT e.posting_state, e.cost_basis,
+            e.realized_gain_loss, e.realized_gain_loss_thb,
+            (SELECT count(*)::int FROM journal_entry_lines l WHERE l.journal_entry_id=e.id) AS line_count
+            FROM journal_entries e WHERE e.source_transaction_id = ANY(${accountingIds}::text[])
+              AND e.status='POSTED' AND e.source_type='STATEMENT'`;
+          ok(recomputedSells.length === 3 && recomputedSells.every(e =>
+            e.posting_state === "SKIPPED" && e.cost_basis === null && e.realized_gain_loss === null &&
+            e.realized_gain_loss_thb === null && e.line_count === 0),
+            "REG-R258: actual recompute clears unsupported basis/gains and retains line-less SELLs");
+          await client`DELETE FROM journal_entry_lines WHERE journal_entry_id IN
+            (SELECT id FROM journal_entries WHERE source_transaction_id = ANY(${accountingIds}::text[]))`;
+          await client`DELETE FROM journal_entries WHERE source_transaction_id = ANY(${accountingIds}::text[])`;
+          await client`DELETE FROM "Capital_Transactions" WHERE transaction_id = ANY(${accountingIds}::text[])`;
+          // Self-cleaning (shared CLEANUP also removes this user's linked rows).
+          await client`
+            DELETE FROM journal_entry_lines
+            WHERE journal_entry_id IN (
+              SELECT id FROM journal_entries WHERE source_transaction_id IN (${txMonthly}, ${txStandalone}, ${txLegacy})
+            )`;
+          await client`
+            DELETE FROM journal_entries WHERE source_transaction_id IN (${txMonthly}, ${txStandalone}, ${txLegacy})`;
+          await client`
+            DELETE FROM "Capital_Transactions" WHERE transaction_id IN (${txMonthly}, ${txStandalone}, ${txLegacy})`;
+          await client`DELETE FROM documents WHERE id = ${docId} AND user_id = ${mfaUserId}`;
+        }
+      }
+    }
+  }
+
   // ================= REG: DATA INTEGRITY CHECKS (migration 0025) =================
   // Proves the 14 CHECK constraints that remained after the upgrade-safety
   // review are present and enforce the closed sets + magnitude guards at the
@@ -3770,6 +4271,8 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
   // ================= CLEANUP =================
   const { runStatementDeleteTests } = await import("./statement-delete-db.mjs");
   await runStatementDeleteTests(client, ok, makePdf);
+  const { runCurrencyExchangeTests } = await import("./r6-r7-db.mjs");
+  await runCurrencyExchangeTests(client, ok);
 
   console.log("\n=== CLEANUP ===");
   const cleanIds: string[] = [];

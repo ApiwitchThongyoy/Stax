@@ -49,6 +49,11 @@ export interface CapitalJournalRecord {
   exchangeFromCurrency: string | null;
   exchangeFromAmount: string | null;
   exchangeRate: string | null;
+  // R4: monthly-fee-aggregate provenance, tri-state (true = parser monthly
+  // aggregate -> SKIPPED, false = confirmed standalone, null = legacy/unknown
+  // pre-0027 provenance). Persisted onto both the capital row and the journal
+  // entry (migration 0027) so every reader/reconciler keeps it faithful.
+  isMonthlyFeeAggregate: boolean | null;
   postingState: string | null;
   skipReason: string | null;
   type: string | null;
@@ -71,7 +76,7 @@ export function journalEntryToCapitalRow(e: CapitalJournalRecord) {
     transactionDate: e.entryDate,
     fxRateBot: null,
     amountThb: e.amountThb,
-    type: e.type,
+    type: e.isFxConversion ? null : e.type,
     sourceType: e.sourceType === "MANUAL" ? "MANUAL" : "AI_PARSED",
     sourceDocumentId: e.sourceDocumentId,
     category: e.category,
@@ -93,6 +98,7 @@ export function journalEntryToCapitalRow(e: CapitalJournalRecord) {
     exchangeFromCurrency: e.exchangeFromCurrency,
     exchangeFromAmount: e.exchangeFromAmount,
     exchangeRate: e.exchangeRate,
+    isMonthlyFeeAggregate: e.isMonthlyFeeAggregate,
   };
 }
 
@@ -125,6 +131,7 @@ const CAPITAL_JOURNAL_COLUMNS = {
   exchangeFromCurrency: journalEntries.exchangeFromCurrency,
   exchangeFromAmount: journalEntries.exchangeFromAmount,
   exchangeRate: journalEntries.exchangeRate,
+  isMonthlyFeeAggregate: journalEntries.isMonthlyFeeAggregate,
   postingState: journalEntries.postingState,
   skipReason: journalEntries.skipReason,
   type: journalEntries.type,
@@ -239,7 +246,7 @@ export async function listCashSummaryRows(
 /**
  * Currency-exchange rows for a user, read from the journal (SSOT). These are
  * STATEMENT rows the parser tagged category 'asset' with no side
- * (is_fx_conversion), recorded in the journal as SKIPPED entries but carrying
+ * (is_fx_conversion), recorded as POSTED or explicitly SKIPPED entries carrying
  * the full exchange detail — the cash page shows them in their own section,
  * never mixed into the equity money-movement totals. Ordered chronologically.
  */

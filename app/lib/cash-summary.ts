@@ -7,6 +7,16 @@ import {
 
 Decimal.set({ precision: 40 });
 
+function decimalAmount(raw: string | null): Decimal | null {
+  if (raw == null || raw.trim() === "") return null;
+  try {
+    const value = new Decimal(raw);
+    return value.isFinite() ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 /** One month of cash flow (equity money movements only). */
 export interface CashSummaryMonth {
   /** ISO year-month "YYYY-MM" derived from transaction_date. */
@@ -154,6 +164,7 @@ export function buildCashSummary(
   };
 
   for (const r of rows) {
+    if (r.category === "asset") continue; // FX transfers are never external capital.
     if (r.sourceType !== "MANUAL" && r.category !== "equity") continue;
     if (r.type !== "CASH_IN" && r.type !== "CASH_OUT") continue;
     const month = r.transactionDate.slice(0, 7);
@@ -256,8 +267,8 @@ export function buildExchangeDirectionTotals(
   for (const r of rows) {
     if (opts.month && r.transactionDate.slice(0, 7) !== opts.month) continue;
     if (opts.asOf && r.transactionDate > opts.asOf) continue;
-    const amount = r.amountThb !== null && r.amountThb.trim() !== "" ? Number(r.amountThb) : NaN;
-    if (!Number.isFinite(amount) || amount <= 0) continue;
+    const amount = decimalAmount(r.amountThb);
+    if (!amount || !amount.gt(0)) continue;
 
     const toCurrency = (r.currency ?? "").trim().toUpperCase();
     const fromCurrency = (r.exchangeFromCurrency ?? "").trim().toUpperCase();
@@ -329,11 +340,11 @@ export function buildCashExchangeRows(
       amountThb,
     });
     if (toCurrency) {
-      const foreign = toAmount !== null && toAmount.trim() !== "" ? Number(toAmount) : NaN;
-      const thb = amountThb !== null && amountThb.trim() !== "" ? Number(amountThb) : NaN;
+      const foreign = decimalAmount(toAmount);
+      const thb = decimalAmount(amountThb);
       const bucket = byCurrency.get(toCurrency) ?? { foreign: new Decimal(0), thb: new Decimal(0) };
-      if (Number.isFinite(foreign)) bucket.foreign = bucket.foreign.plus(new Decimal(foreign));
-      if (Number.isFinite(thb)) bucket.thb = bucket.thb.plus(new Decimal(thb));
+      if (foreign) bucket.foreign = bucket.foreign.plus(foreign);
+      if (thb) bucket.thb = bucket.thb.plus(thb);
       byCurrency.set(toCurrency, bucket);
     }
   }

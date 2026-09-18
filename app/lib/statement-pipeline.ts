@@ -1,3 +1,4 @@
+import { moneyInThb, realizedAmounts, roundMoney } from "./accounting-amounts";
 import { assertOwnedReferences } from "./resource-ownership";
 import { safeErrorLog } from "./safe-error-log";
 import { randomUUID } from "node:crypto";
@@ -21,7 +22,7 @@ Decimal.set({ precision: 40 });
 export const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"] as const;
 export const VALID_SOURCE_TYPES = ["MANUAL", "AI_PARSED"] as const;
 
-export type ParsedCapitalType = (typeof VALID_TRANSACTION_TYPES)[number];
+export type ParsedCapitalType = (typeof VALID_TRANSACTION_TYPES)[number] | "FX_CONVERSION";
 
 export interface ValidatedCapitalRow {
   transactionId: string;
@@ -30,7 +31,7 @@ export interface ValidatedCapitalRow {
   currency: string;
   transactionDate: string;
   fxRateBot: string | null;
-  amountThb: string;
+  amountThb: string | null;
   type: ParsedCapitalType;
   sourceType: "AI_PARSED";
   sourceDocumentId: string;
@@ -53,6 +54,13 @@ export interface ValidatedCapitalRow {
   exchangeFromCurrency: string | null;
   exchangeFromAmount: string | null;
   exchangeRate: string | null;
+  // Deterministic provenance: true ONLY for the parser's monthly brokerage-fee /
+// VAT aggregate rows; false for confirmed standalone fees; null/absent for
+// legacy pre-0027 rows whose provenance is unknown (never fabricated). The
+// posting engine uses this flag (not a section-name match) to decide a fee row
+// must not be posted — a genuine standalone broker fee (same section label, no
+// flag) still posts.
+  isMonthlyFeeAggregate?: boolean | null;
 }
 
 export interface BuiltStatementTransactions {
@@ -126,21 +134,39 @@ export function mapToCapitalRow(
 
   // FX semantics (see schema notes):
   //  - fx_rate_statement = the rate PROVIDED BY THE SOURCE STATEMENT header.
-  //  - fx_rate_effective  = the rate actually used for THB conversion.
+  //  - fx_rate_effective  = the rate actually used for THB conversion. For a
+  //    non-THB row whose rate is unknown (no statement rate and, later, no
+  //    historical provider rate) this stays NULL. It is NEVER silently set to 1
+  //    for a non-THB currency: a 1:1 rate would fabricate a THB value.
   //  - fx_rate_bot        = legacy column (kept for data compatibility; manual
   //    ledger entries may store user-entered rates). The importer NEVER writes
   //    statement FX or provider rates into it.
+  //  - amount_thb = amountForeign * fxRateEffective, or NULL when the effective
+  //    rate is unknown. null means "not computable in THB" - never 0, never the
+  //    foreign amount treated as if it were THB.
   const parsedRate = parseRate(t.rate);
   const fxRateStatement = currency === "THB" ? 1 : parsedRate;
-  const fxRateEffective = currency === "THB" ? 1 : (parsedRate ?? 1);
-  const amountForeign = Math.abs(t.amount);
-  const amountThb = amountForeign * fxRateEffective;
+  const fxRateEffective = currency === "THB" ? 1 : parsedRate;
+  // R4 negative-fee/rebate handling. The parser reports "expense" rows (WHT,
+  // broker fees, VAT) with a POSITIVE amount when the fee is a payment out of
+  // the account, but a NEGATIVE amount when the broker credits a rebate back
+  // (money returned to the account). Expense rows therefore PRESERVE the sign
+  // so the posting engine can post a rebate as its contra-expense
+  // (Dr cash / Cr fee) instead of a phoney extra fee. Non-expense rows keep the
+  // historical positive-magnitude convention (equity deposit/withdrawal sign
+  // is captured by `type`, only the magnitude is persisted).
+  const amountForeign =
+    t.category === "expense" ? t.amount : Math.abs(t.amount);
+  const amountThb =
+    fxRateEffective !== null ? moneyInThb(amountForeign, fxRateEffective) : null;
 
-  // Determine cash direction deterministically. The parser reports "expense"
-  // rows (WHT, broker fees, VAT) with a positive amount even though it is money
-  // leaving the account, so direction is category-aware, not sign-only.
-  const isMoneyOut = t.category === "expense" || t.amount < 0;
-  const type = isMoneyOut ? "CASH_OUT" : "CASH_IN";
+  // Determine cash direction deterministically. For an "expense" row the sign of
+  // the amount IS the direction (positive = fee paid out; negative = rebate
+  // received), so it is category-aware, not sign-only. Every other category
+  // keeps sign-only direction (negative amount = money out).
+  const isMoneyOut = t.category === "expense" ? t.amount > 0 : t.amount < 0;
+  const type = t.category === "asset" && t.side == null
+    ? "FX_CONVERSION" : isMoneyOut ? "CASH_OUT" : "CASH_IN";
 
   // Deterministic realized gain/loss (Decimal arithmetic). Only a SELL row with
   // a computable cost basis carries a value; anything else stays null (honest
@@ -149,16 +175,10 @@ export function mapToCapitalRow(
   // to 2dp first and gainThb is derived from that ROUNDED gain, so the pair is
   // always consistent (gainThb === round2(round2(gain) × fx)). See
   // realizedUpdateFor below for the canonical statement of this invariant.
-  let realizedGainLossThb: string | null = null;
-  if (
-    t.side === "SELL" &&
-    t.realizedGainLoss !== undefined &&
-    Number.isFinite(t.realizedGainLoss)
-  ) {
-    const gain = new Decimal(decimalString(t.realizedGainLoss));
-    const eff = new Decimal(String(fxRateEffective));
-    realizedGainLossThb = gain.mul(eff).toFixed(2);
-  }
+  const net = t.netAmount ?? t.proceeds;
+  const realized = t.side === "SELL" && t.costBasis != null && Number.isFinite(t.costBasis)
+    && t.costBasis >= 0 && net != null && Number.isFinite(net)
+    ? realizedAmounts(net, t.costBasis, fxRateEffective) : null;
 
   // Symbol/ticker. Trade rows carry `t.symbol` directly (preserved verbatim);
   // dividend income rows embed the ticker in the section label
@@ -179,11 +199,11 @@ export function mapToCapitalRow(
     row: {
       transactionId: randomUUID(),
       userId,
-      amountForeign: amountForeign.toFixed(2),
+      amountForeign: roundMoney(amountForeign),
       currency,
       transactionDate,
       fxRateBot: null,
-      amountThb: amountThb.toFixed(2),
+      amountThb,
       type,
       sourceType: "AI_PARSED",
       sourceDocumentId,
@@ -195,22 +215,16 @@ export function mapToCapitalRow(
       unitPrice: t.unitPrice !== undefined ? decimalString(t.unitPrice) : null,
       grossAmount: t.grossAmount !== undefined ? decimalString(t.grossAmount) : null,
       fees: t.fees !== undefined && t.fees !== 0 ? decimalString(t.fees) : null,
-      proceeds:
-        t.proceeds !== undefined && Number.isFinite(t.proceeds)
+      proceeds: realized?.proceeds ??
+        (t.proceeds !== undefined && Number.isFinite(t.proceeds)
           ? decimalString(t.proceeds)
-          : null,
-      costBasis:
-        t.costBasis !== undefined && Number.isFinite(t.costBasis)
-          ? decimalString(t.costBasis)
-          : null,
-      realizedGainLoss:
-        t.realizedGainLoss !== undefined && Number.isFinite(t.realizedGainLoss)
-          ? decimalString(t.realizedGainLoss)
-          : null,
-      realizedGainLossThb,
+          : null),
+      costBasis: realized?.costBasis ?? null,
+      realizedGainLoss: realized?.realizedGainLoss ?? null,
+      realizedGainLossThb: realized?.realizedGainLossThb ?? null,
       fxRateStatement:
         fxRateStatement !== null ? String(fxRateStatement) : null,
-      fxRateEffective: String(fxRateEffective),
+      fxRateEffective: fxRateEffective !== null ? String(fxRateEffective) : null,
       netAmount:
         t.netAmount !== undefined && Number.isFinite(t.netAmount)
           ? decimalString(t.netAmount)
@@ -227,6 +241,10 @@ export function mapToCapitalRow(
         typeof t.exchangeRate === "number" && Number.isFinite(t.exchangeRate)
           ? decimalString(t.exchangeRate)
           : null,
+      // In-memory provenance only (not persisted): the posting engine needs to
+      // know whether an expense row is the parser's monthly fee/VAT aggregate
+      // (skip) vs a real standalone fee (post once).
+      isMonthlyFeeAggregate: t.isMonthlyFeeAggregate === true,
     },
   };
 }
@@ -284,7 +302,12 @@ export interface FxFallback {
  * Apply the external historical FX fallback to built rows, with this priority:
  *   A. Statement-provided FX (fx_rate_statement) — always wins, never overridden.
  *   B. Historical FX provider fallback — only for non-THB rows WITHOUT a rate.
- *   C. THB = 1 / existing base fallback — untouched when no external rate exists.
+ *   C. Unknown - when neither a statement rate nor an external rate exists the
+ *      row keeps fxRateEffective = null and amountThb = null (and
+ *      realizedGainLossThb = null). It is NEVER defaulted to a 1:1 rate: a
+ *      non-THB amount must not be represented as if it were THB. Such a row is
+ *      still recorded (foreign amount/currency preserved) but carries no THB
+ *      value and is not double-entry posted.
  *
  * When an external rate is applied it becomes fx_rate_effective, and the derived
  * THB amounts (amountThb + realizedGainLossThb on computable SELL rows) are
@@ -318,15 +341,15 @@ export async function applyFxRateFallback(
     }
 
     const eff = new Decimal(String(resolved.rate));
-    const nextThb = new Decimal(row.amountForeign).mul(eff);
+    const nextThb = moneyInThb(row.amountForeign, eff);
     let nextGainThb: string | null = null;
     if (row.realizedGainLoss != null && row.realizedGainLoss.trim() !== "") {
-      nextGainThb = new Decimal(row.realizedGainLoss).mul(eff).toFixed(2);
+      nextGainThb = moneyInThb(row.realizedGainLoss, eff);
     }
 
     out[i] = {
       ...row,
-      amountThb: nextThb.toFixed(2),
+      amountThb: nextThb,
       fxRateEffective: String(resolved.rate),
       realizedGainLossThb: nextGainThb,
     };
@@ -454,6 +477,8 @@ export async function insertStatementTransactions(
           exchangeFromCurrency: row.exchangeFromCurrency,
           exchangeFromAmount: row.exchangeFromAmount,
           exchangeRate: row.exchangeRate,
+          isMonthlyFeeAggregate:
+        row.isMonthlyFeeAggregate == null ? null : row.isMonthlyFeeAggregate === true,
         })
         .execute();
       insertedIds.push(row.transactionId);
@@ -848,19 +873,8 @@ function realizedUpdateFor(
   }
   if (!eff.isFinite() || eff.lte(0)) return null;
 
-  const costBasis = new Decimal(String(avgCost)).mul(qty);
-  // Mirror the parser's THB conversion (parseTrade conclusion path): the THB
-  // gain is derived from the ROUNDED gain, so the stored pair is always
-  // consistent (realizedGainLossThb === round2(round2(gain) × fx)).
-  const roundedGain = net.minus(costBasis).toFixed(2);
-  const gainThb = new Decimal(roundedGain).mul(eff).toFixed(2);
-
-  return {
-    costBasis: new Decimal(String(avgCost)).mul(qty).toFixed(2),
-    proceeds: net.toFixed(2),
-    realizedGainLoss: roundedGain,
-    realizedGainLossThb: gainThb,
-  };
+  const result = realizedAmounts(net, new Decimal(String(avgCost)).mul(qty), eff);
+  return { ...result, realizedGainLossThb: result.realizedGainLossThb! };
 }
 
 export interface FullGainLossRecomputeStats {

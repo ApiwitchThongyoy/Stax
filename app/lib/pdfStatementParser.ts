@@ -1,3 +1,5 @@
+import Decimal from "decimal.js";
+import { realizedAmounts } from "./accounting-amounts";
 // หมายเหตุสำคัญ: ห้าม import "pdfjs-dist" แบบ static ที่ด้านบนไฟล์
 // เพราะโปรเจกต์นี้ใช้ SSR (React Router v7) — ถ้า import แบบ static ตอน server
 // จะพยายามรันโค้ดของ pdf.js ไปด้วย แล้วไปเจอ DOMMatrix ซึ่งมีแค่ในเบราว์เซอร์เท่านั้น
@@ -49,6 +51,11 @@ export interface ExtractedTransaction {
   exchangeFromCurrency?: string;
   exchangeFromAmount?: number;
   exchangeRate?: number;
+  // Deterministic provenance: set TRUE only on the parser-generated monthly
+  // brokerage-fee / VAT aggregate rows (Pass 3). Accounting code skips these on
+  // THIS flag — never on a section-name match — so a genuine standalone broker
+  // fee row (same section label, this flag absent) still posts once.
+  isMonthlyFeeAggregate?: boolean;
 }
 
 // ---------- ต้นทุนเฉลี่ยสะสม (Webull Average Cost) ต่อสัญลักษณ์หุ้น ----------
@@ -579,10 +586,12 @@ export function parseStatementRows(
   // Pass 1: เก็บรายการซื้อขายดิบทั้งหมดไว้ก่อน (ตามลำดับที่เจอในเอกสาร ซึ่งปกติจะเรียงล่าสุด → เก่าสุด)
   const tradeBlock = sectionSlice("TRADE RECORDS", ["PORTFOLIO SUMMARY"]);
   const tradeEvents: RawTradeEvent[] = [];
-  let feeTotal = 0;
-  let vatTotal = 0;
+  // ค่าธรรมเนียม/VAT สะสมต่อสกุลเงิน (Record<CCY, sum>) — ต้องไม่รวมข้ามสกุลเงิน
+  // USD fee 1 + THB fee 10 ต้องเป็น 2 บรรทัด (fee USD 1 + fee THB 10) ห้ามเป็น "11"
+  // ในสกุลเดียว เพราะมิเช่นนั้นยอด native/label จะเพี้ยน (ไปบวก USD กับ THB เข้าด้วยกัน).
+  const feeTotals: Record<string, number> = {};
+  const vatTotals: Record<string, number> = {};
   let lastTradeDate = "";
-  let tradeCurrency = "USD";
 
   if (tradeBlock) {
     const lines = tradeBlock.split("\n");
@@ -648,10 +657,9 @@ export function parseStatementRows(
       const vat = toNumber(vatStr);
       const tradeFees = comm + vat;
 
-      feeTotal += comm;
-      vatTotal += vat;
+      feeTotals[currentCurrency] = (feeTotals[currentCurrency] ?? 0) + comm;
+      vatTotals[currentCurrency] = (vatTotals[currentCurrency] ?? 0) + vat;
       lastTradeDate = date;
-      tradeCurrency = currentCurrency;
 
       const gross = toNumber(priceStr) * toNumber(qtyStr);
 
@@ -707,12 +715,12 @@ export function parseStatementRows(
     if (ev.side === "SELL" && sellBasis !== null) {
       // ใช้ "Net Amount" ที่โบรกเกอร์ระบุ (หักค่าธรรมเนียมแล้ว) เป็นยอดขายสุทธิ (authoritative)
       // แทนการสร้างยอดใหม่เอง: realized  = netProceeds - avgCost*qty
-      // ตั้งใจไม่ปัดทศนิยมที่นี่ — การปัด 2dp (2-stage: gain ก่อน แล้วค่อย ×fx)
-      // เกิดที่ statement-pipeline (mapToCapitalRow / realizedUpdateFor) เท่านั้น
-      pnlAmount = ev.net - sellBasis * ev.qty;
+      // Shared decimal calculation; the pipeline converts rounded gain to THB.
+      const calculated = realizedAmounts(ev.net, new Decimal(sellBasis).mul(ev.qty), null);
+      pnlAmount = Number(calculated.realizedGainLoss);
       realizedMeta = {
         proceeds: ev.net,
-        costBasis: sellBasis * ev.qty,
+        costBasis: new Decimal(sellBasis).mul(ev.qty).toNumber(),
         realizedGainLoss: pnlAmount,
       };
     } else if (ev.side === "SELL") {
@@ -799,34 +807,40 @@ export function parseStatementRows(
   }
 
   // รวมค่าธรรมเนียมนายหน้าและ VAT ของทั้งเดือนเป็นรายการค่าใช้จ่าย 2 บรรทัด (แทนที่จะแยกทีละรายการซื้อขาย เพื่อไม่ให้สมุดบัญชีรกเกินไป)
-  if (feeTotal !== 0) {
+  // ต่อสกุลเงิน: ห้ามรวมค่าธรรมเนียมข้ามสกุลเงิน (USD fee 1 + THB fee 10 ต้องเป็น 2 รายการ ห้ามเป็น "11")
+  // สกุลเงินเดียวกันทั้งคู่ → บรรทัดเดียวต่อสกุล (ไปรวมกันอีกทีในบัญชี cash/ค่าใช้จ่าย)
+  for (const [ccy, total] of Object.entries(feeTotals)) {
+    if (Math.abs(total) < 0.000001) continue;
     results.push({
       id: nextId(),
       date: lastTradeDate,
-      description: "ค่าธรรมเนียมนายหน้า (รวมทั้งเดือน)",
+      description: `ค่าธรรมเนียมนายหน้า (รวมทั้งเดือน) ${ccy}`,
       subLabel: "ค่าธรรมเนียมซื้อขาย",
-      currency: tradeCurrency,
-      amount: feeTotal,
+      currency: ccy,
+      amount: total,
       category: "expense",
-      pnlAmount: feeTotal,
-      rate: baseRates[tradeCurrency] ?? "-",
+      pnlAmount: total,
+      rate: baseRates[ccy] ?? "-",
       section: "ค่าธรรมเนียม",
       included: true,
+      isMonthlyFeeAggregate: true,
     });
   }
-  if (vatTotal !== 0) {
+  for (const [ccy, total] of Object.entries(vatTotals)) {
+    if (Math.abs(total) < 0.000001) continue;
     results.push({
       id: nextId(),
       date: lastTradeDate,
-      description: "ภาษีมูลค่าเพิ่ม VAT (รวมทั้งเดือน)",
+      description: `ภาษีมูลค่าเพิ่ม VAT (รวมทั้งเดือน) ${ccy}`,
       subLabel: "VAT จากค่าธรรมเนียม",
-      currency: tradeCurrency,
-      amount: vatTotal,
+      currency: ccy,
+      amount: total,
       category: "expense",
-      pnlAmount: vatTotal,
-      rate: baseRates[tradeCurrency] ?? "-",
+      pnlAmount: total,
+      rate: baseRates[ccy] ?? "-",
       section: "VAT",
       included: true,
+      isMonthlyFeeAggregate: true,
     });
   }
 

@@ -1,3 +1,4 @@
+import { runReportRegressions } from "./report-regressions.mjs";
 // Double-entry general-ledger pure engine tests (DB-free).
 //
 // Covers the invariants that must NEVER regress:
@@ -29,6 +30,8 @@ import {
   sellRowDescription,
 } from "../app/lib/posting-engine";
 import type { ValidatedCapitalRow } from "../app/lib/statement-pipeline";
+import { mapToCapitalRow } from "../app/lib/statement-pipeline";
+import { parseStatementRows } from "../app/lib/pdfStatementParser";
 import {
   journalEntryToCapitalRow,
   type CapitalJournalRecord,
@@ -218,10 +221,10 @@ async function main() {
   ];
   const tb = trialBalance(tbLines, ACCOUNTS);
   ok(tb.balanced, "trial balance balanced");
-  ok(tb.totalDebit === "1400.00" && tb.totalCredit === "1400.00", "total debit == total credit (1400)");
+  ok(tb.totalDebit === "1000.00" && tb.totalCredit === "1000.00", "closing debit == closing credit (1000)");
   ok(tb.rows.length === 3, "three accounts in trial balance");
   const cashRow = tb.rows.find((r) => r.accountId === CASH);
-  ok(cashRow !== undefined && cashRow.debit === "1000.00" && cashRow.credit === "400.00", "cash account grouped (1000 dr / 400 cr)");
+  ok(cashRow !== undefined && cashRow.debit === "600.00" && cashRow.credit === "0.00", "cash closing balance (600 dr / 0 cr)");
 
   console.log("=== INCOME STATEMENT ===");
 
@@ -356,8 +359,121 @@ async function main() {
     exchangeFromCurrency: null,
     exchangeFromAmount: null,
     exchangeRate: null,
+    // Confirmed standalone (post-0027 parser provenance). Fresh imports always
+    // carry a deterministic true/false; only a legacy pre-0027 persisted row
+    // carries null (unknown), which the engine SKIPS.
+    isMonthlyFeeAggregate: false,
     ...overrides,
   });
+
+  // R2/R8: zero gain is computable; an absent basis never becomes proceeds.
+  const zeroSell = baseRow({ category: "asset", side: "SELL", amountForeign: "1000.00",
+    costBasis: "1000.00", realizedGainLoss: "0.00", realizedGainLossThb: "0.00" });
+  const zeroPlan = buildStatementJournalEntries([zeroSell])[0];
+  ok(zeroPlan.postingState === "POSTED" && zeroPlan.entry.lines.length === 2 &&
+    zeroPlan.entry.lines.some(l => l.accountId === "1020" && l.debit === "1000.00") &&
+    zeroPlan.entry.lines.some(l => l.accountId === "1110" && l.credit === "1000.00"),
+    "R2: zero-gain SELL posts cash/investment only, no zero gain leg");
+  const missingPlan = buildStatementJournalEntries([{ ...zeroSell, costBasis: null }])[0];
+  ok(missingPlan.postingState === "SKIPPED" && missingPlan.entry.lines.length === 0 &&
+    missingPlan.entry.detail?.costBasis === null && missingPlan.entry.detail?.realizedGainLoss === null &&
+    missingPlan.entry.detail?.realizedGainLossThb === null && !!missingPlan.reason?.includes("NON_COMPUTABLE"),
+    "R8: missing basis stays visible with null gains, zero lines and explicit reason");
+
+  const conflicting = validateJournalEntry({
+    entryDate: "2026-01-15", description: "R5 conflicting THB",
+    detail: { currency: "USD", amount: "10.005", fxRateEffective: "35.42", amountThb: "999" },
+    lines: [
+      { accountId: "1020", currency: "USD", debit: "10.005", fxRateEffective: "35.42", amountThb: "999" },
+      { accountId: "3010", currency: "USD", credit: "10.005", fxRateEffective: "35.42", amountThb: "888" },
+    ],
+  });
+  ok(conflicting.ok && conflicting.entry.lines.every(l => l.amount === "10.01" && l.amountThb === "354.55") &&
+    conflicting.entry.detail.amountThb === "354.55",
+    "R5: server derives header and line THB from native cents, overriding conflicting input");
+  const roundingEdge = validateJournalEntry({
+    entryDate: "2026-01-15", description: "R5 raw balance is insufficient",
+    lines: [
+      { accountId: "1020", currency: "THB", debit: "0.005" },
+      { accountId: "1020", currency: "THB", debit: "0.005" },
+      { accountId: "3010", currency: "THB", credit: "0.010" },
+    ],
+  });
+  ok(!roundingEdge.ok && roundingEdge.errors.some(e => e.includes("does not balance")),
+    "R5: raw .005 + .005 = .010 rejected because persisted .01 + .01 != .01");
+  const thbEdge = validateJournalEntry({
+    entryDate: "2026-01-15", description: "R5 converted cents must balance",
+    lines: [
+      { accountId: "1020", currency: "USD", debit: "0.01", fxRateEffective: "35.42" },
+      { accountId: "1020", currency: "USD", debit: "0.01", fxRateEffective: "35.42" },
+      { accountId: "3010", currency: "USD", credit: "0.02", fxRateEffective: "35.42" },
+    ],
+  });
+  ok(!thbEdge.ok && thbEdge.errors.some(e => e.includes("THB does not balance")),
+    "R5: native-balanced entry rejected when THB .35 + .35 != .71");
+
+  // R6/R7: only genuine marked exchanges use reporting-currency balance.
+  const parsedExchange = parseStatementRows([
+    "CURRENCY EXCHANGE RECORDS",
+    "01/01/2026 10:00:00,GMT+07 THB 35,000.00 USD 1,000.00 35.0000",
+    "DIVIDENDS",
+  ]).transactions.find(t => t.exchangeFromCurrency === "THB");
+  const mappedExchange = parsedExchange ? mapToCapitalRow(parsedExchange, "user-1", "doc-1") : null;
+  ok(mappedExchange?.ok === true && mappedExchange.row.type === "FX_CONVERSION" &&
+    buildStatementJournalEntries([mappedExchange.row])[0].postingState === "POSTED",
+    "R6: real parser -> pipeline -> posting recognizes THB-to-USD transfer");
+  const fxRow = baseRow({ category: "asset", side: null, type: "FX_CONVERSION",
+    amountForeign: "1000.00", exchangeFromCurrency: "THB", exchangeFromAmount: "35000.00",
+    exchangeRate: "35", fxRateEffective: "35" });
+  const fxPlan = buildStatementJournalEntries([fxRow])[0];
+  const fxValidated = validateJournalEntry(fxPlan.entry);
+  ok(fxPlan.postingState === "POSTED" && fxValidated.ok &&
+    fxValidated.entry.lines.some(l => l.accountId === "1020" && l.currency === "USD" &&
+      l.side === "DEBIT" && l.amount === "1000.00" && l.amountThb === "35000.00") &&
+    fxValidated.entry.lines.some(l => l.accountId === "1010" && l.currency === "THB" &&
+      l.side === "CREDIT" && l.amount === "35000.00" && l.amountThb === "35000.00"),
+    "R6: THB 35000 -> USD 1000 posts distinct native amounts and equal THB totals");
+  const badFx = buildStatementJournalEntries([{ ...fxRow, fxRateEffective: "34.50" }])[0];
+  ok(badFx.postingState === "SKIPPED" && badFx.entry.lines.length === 0 &&
+    !!badFx.reason?.includes("THB does not balance"),
+    "R6: reporting FX 34.50 cannot balance THB 34500 against 35000");
+  ok(!validateJournalEntry({ ...fxPlan.entry, detail: { isFxConversion: false } }).ok,
+    "R6: unmarked cross-currency entries retain native balance checks");
+  ok(!validateJournalEntry({ entryDate: "2026-01-01", description: "normal native mismatch",
+    lines: [{ accountId: "1020", currency: "USD", debit: "100", fxRateEffective: "35" },
+      { accountId: "3010", currency: "USD", credit: "50", fxRateEffective: "70" }] }).ok,
+    "R5/R6: ordinary USD entry must balance natively even if THB totals match");
+  ok(!validateJournalEntry({ ...fxPlan.entry, detail: { ...fxPlan.entry.detail, amount: "999" } }).ok,
+    "R6: flag alone cannot bypass mismatched exchange details");
+  const currencyMap = new Map(DEFAULT_CHART_OF_ACCOUNTS.map(a => [a.code, a.currency]));
+  ok(!validateJournalEntry({ entryDate: "2026-01-01", description: "bad THB",
+    lines: [{ accountId: "1020", currency: "THB", debit: "100" },
+      { accountId: "3010", currency: "THB", credit: "100" }] }, currencyMap).ok,
+    "R7: validator rejects THB in USD accounts");
+  ok(!validateJournalEntry({ entryDate: "2026-01-01", description: "bad USD",
+    lines: [{ accountId: "1010", currency: "USD", debit: "100", fxRateEffective: "35" },
+      { accountId: "3010", currency: "USD", credit: "100", fxRateEffective: "35" }] }, currencyMap).ok,
+    "R7: validator rejects USD in THB cash account");
+  if (fxValidated.ok) {
+    const reverse = buildReversal(fxValidated.entry);
+    const reversed = validateJournalEntry({ ...reverse,
+      lines: reverse.lines.map(l => ({ accountId: l.accountId, currency: l.currency,
+        debit: l.side === "DEBIT" ? l.amount : null, credit: l.side === "CREDIT" ? l.amount : null,
+        fxRateEffective: l.fxRateEffective })) }, currencyMap);
+    ok(reversed.ok && reversed.entry.detail.isFxConversion &&
+      reversed.entry.detail.currency === "THB" && reversed.entry.lines.length === 2,
+      "R6/R7: reversal swaps exchange details and keeps compatible currencies");
+  }
+  for (const row of [
+    baseRow({ category: "equity", currency: "THB", fxRateEffective: "1" }),
+    baseRow({ category: "asset", side: "BUY", currency: "THB", fxRateEffective: "1", quantity: "1", unitPrice: "100" }),
+    baseRow({ category: "expense", currency: "THB", fxRateEffective: "1" }),
+    baseRow({ category: "income", currency: "THB", fxRateEffective: "1" }),
+  ]) {
+    const plan = buildStatementJournalEntries([row])[0];
+    ok(plan.postingState === "SKIPPED" && plan.entry.lines.length === 0 && !!plan.reason?.includes("compatible"),
+      `R7: unsupported THB ${row.category}/${row.side ?? ""} remains SKIPPED with no incompatible lines`);
+  }
 
   // Dividend income (no symbol) -> dividend account, memo carries the ticker.
   const div = postCapitalRow(baseRow({}));
@@ -450,7 +566,7 @@ async function main() {
       realizedGainLoss: null,
     })
   );
-  ok(sellNoBasis.ok && sellNoBasis.entry.description === "ขาย EOSE 3 @ 10.4 USD", "non-computable SELL keeps the bare ขาย … wording");
+  ok(!sellNoBasis.ok && sellNoBasis.reason.includes("NON_COMPUTABLE"), "non-computable SELL is explicitly skipped without a fake basis");
 
   // ---- Per-stock memo summary (dividend "เงินปันผล" by ticker) ------------
   const summarized = summarizeLinesBySymbol([
@@ -567,7 +683,7 @@ async function main() {
         d.netAmount === "363.70" &&
         d.currency === "USD" &&
         d.amount === "363.80" &&
-        d.amountThb === "3500.00",
+        d.amountThb === "12733.00",
       "POSTED detail carries grossAmount/fees/netAmount/currency/amount/amountThb"
     );
     ok(
@@ -605,6 +721,730 @@ async function main() {
     "buildStatementPostings entries carry trade detail"
   );
 
+  // ---- R4 FEES: principal/fee split, no double count, rebate, liquidation. ----
+  console.log("=== R4 FEES (principal + fee split, no double count) ===");
+
+  // A) BUY with fee: 3 legs — principal to asset, fee to expense, net to cash.
+  const buyWithFee = postCapitalRow(
+    baseRow({
+      transactionId: "tx-buy-fee",
+      category: "asset",
+      side: "BUY",
+      symbol: "NVDA",
+      quantity: "10",
+      unitPrice: "100",
+      grossAmount: "1000",
+      fees: "11",
+      amountForeign: "1011.00",
+      netAmount: "1011.00",
+    })
+  );
+  ok(buyWithFee.ok && buyWithFee.entry.lines.length === 3, "R4-A: BUY with fee posts 3 legs");
+  if (buyWithFee.ok) {
+    const investLeg = buyWithFee.entry.lines.find((l) => l.accountId === "1110");
+    const feeLeg = buyWithFee.entry.lines.find((l) => l.accountId === "5010");
+    const cashLeg = buyWithFee.entry.lines.find((l) => l.accountId === "1020");
+    ok(
+      !!investLeg && investLeg.debit === "1000.00" && investLeg.credit == null,
+      "R4-A: investment debited by PRINCIPAL (1000, fees excluded)"
+    );
+    ok(
+      !!feeLeg && feeLeg.debit === "11.00" && feeLeg.credit == null,
+      "R4-A: fee expensed once (Dr 5010 11.00)"
+    );
+    ok(
+      !!cashLeg && cashLeg.credit === "1011.00" && cashLeg.debit == null,
+      "R4-A: broker cash credited by NET (1011)"
+    );
+    ok(
+      buyWithFee.entry.lines.every((l) => l.currency === "USD"),
+      "R4-A: all legs in the trade currency (per-currency rule)"
+    );
+  }
+
+  // B) BUY zero fee: 2 legs (no fee leg emitted).
+  const buyNoFee = postCapitalRow(
+    baseRow({
+      transactionId: "tx-buy-nofee",
+      category: "asset",
+      side: "BUY",
+      symbol: "AAPL",
+      quantity: "10",
+      unitPrice: "100",
+      grossAmount: "1000",
+      fees: "0",
+      amountForeign: "1000.00",
+      netAmount: "1000.00",
+    })
+  );
+  ok(buyNoFee.ok && buyNoFee.entry.lines.length === 2, "R4-B: BUY without fees posts 2 legs (no 5010)");
+  if (buyNoFee.ok) {
+    ok(
+      buyNoFee.entry.lines.some((l) => l.accountId === "1110" && l.debit === "1000.00"),
+      "R4-B: investment = principal = net when no fee"
+    );
+    ok(
+      buyNoFee.entry.lines.some((l) => l.accountId === "1020" && l.credit === "1000.00"),
+      "R4-B: cash = net when no fee"
+    );
+    ok(
+      buyNoFee.entry.lines.every((l) => l.accountId !== "5010"),
+      "R4-B: fee account 5010 absent when fee is zero"
+    );
+  }
+
+  // C) BUY with rebate (negative fee → credit to 5010, not a debit).
+  const buyRebate = postCapitalRow(
+    baseRow({
+      transactionId: "tx-buy-rebate",
+      category: "asset",
+      side: "BUY",
+      symbol: "VOO",
+      quantity: "10",
+      unitPrice: "100",
+      grossAmount: "1000",
+      fees: "-5",
+      amountForeign: "995.00",
+      netAmount: "995.00",
+    })
+  );
+  ok(buyRebate.ok && buyRebate.entry.lines.length === 3, "R4-C: BUY with rebate posts 3 legs");
+  if (buyRebate.ok) {
+    const investLeg = buyRebate.entry.lines.find((l) => l.accountId === "1110");
+    const feeLeg = buyRebate.entry.lines.find((l) => l.accountId === "5010");
+    const cashLeg = buyRebate.entry.lines.find((l) => l.accountId === "1020");
+    ok(
+      !!investLeg && investLeg.debit === "1000.00",
+      "R4-C: investment debited by principal (1000), not by net (995)"
+    );
+    ok(
+      !!feeLeg && feeLeg.debit == null && feeLeg.credit === "5.00",
+      "R4-C: rebate is a CREDIT to 5010 (contra-expense), sign preserved"
+    );
+    ok(
+      !!cashLeg && cashLeg.credit === "995.00",
+      "R4-C: cash = net = principal minus rebate"
+    );
+  }
+
+  // D) Monthly fee/VAT summary rows (parser aggregate flag set): SKIPPED unconditionally.
+  const monthlyFee = postCapitalRow(
+    baseRow({
+      transactionId: "tx-fee-monthly",
+      category: "expense",
+      section: "ค่าธรรมเนียม",
+      amountForeign: "11.00",
+      isMonthlyFeeAggregate: true,
+    })
+  );
+  ok(
+    !monthlyFee.ok && monthlyFee.reason.includes("already in the trade postings"),
+    "R4-D: monthly brokerage-fee summary row not posted (fees already in trade postings)"
+  );
+  const monthlyVat = postCapitalRow(
+    baseRow({
+      transactionId: "tx-vat-monthly",
+      category: "expense",
+      section: "VAT",
+      amountForeign: "0.70",
+      isMonthlyFeeAggregate: true,
+    })
+  );
+  ok(
+    !monthlyVat.ok && monthlyVat.reason.includes("already in the trade postings"),
+    "R4-D: monthly VAT summary row not posted (fees already in trade postings)"
+  );
+
+  // E) WHT rows (different section from fee/VAT): still posted normally.
+  const whtRow = postCapitalRow(
+    baseRow({
+      transactionId: "tx-wht",
+      category: "expense",
+      section: "ภาษีหัก ณ ที่จ่าย (ปันผล)",
+      amountForeign: "15.00",
+    })
+  );
+  ok(
+    whtRow.ok &&
+      whtRow.entry.lines.some((l) => l.accountId === "5110" && l.debit === "15.00"),
+    "R4-E: WHT row still posts (Dr 5110, section not matched)"
+  );
+
+  // F) buildStatementJournalEntries: BUY + monthly rows → 3 journal entries
+  //    (BUY POSTED with 3 lines, fee-row SKIPPED with 0 lines, WHT POSTED).
+  const r4JournalRows = [
+    baseRow({
+      transactionId: "tx-r4-buy",
+      category: "asset",
+      side: "BUY",
+      symbol: "TSLA",
+      quantity: "20",
+      unitPrice: "50",
+      grossAmount: "1000",
+      fees: "22",
+      amountForeign: "1022.00",
+      netAmount: "1022.00",
+    }),
+    baseRow({
+      transactionId: "tx-r4-fee",
+      category: "expense",
+      section: "ค่าธรรมเนียม",
+      amountForeign: "22.00",
+      isMonthlyFeeAggregate: true,
+    }),
+    baseRow({
+      transactionId: "tx-r4-wht",
+      category: "expense",
+      section: "ภาษีหัก ณ ที่จ่าย (ปันผล)",
+      amountForeign: "8.00",
+    }),
+  ] as ValidatedCapitalRow[];
+  const r4Entries = buildStatementJournalEntries(r4JournalRows);
+  ok(r4Entries.length === 3, "R4-F: one journal entry per row (BUY + fee summary + WHT)");
+  const r4BuyEntry = r4Entries.find((e) => e.transactionId === "tx-r4-buy");
+  ok(
+    !!r4BuyEntry && r4BuyEntry.postingState === "POSTED" && r4BuyEntry.entry.lines.length === 3,
+    "R4-F: BUY entry POSTED with 3 lines"
+  );
+  const r4FeeEntry = r4Entries.find((e) => e.transactionId === "tx-r4-fee");
+  ok(
+    !!r4FeeEntry &&
+      r4FeeEntry.postingState === "SKIPPED" &&
+      r4FeeEntry.entry.lines.length === 0,
+    "R4-F: monthly fee row SKIPPED (no GL lines)"
+  );
+  const r4WhtEntry = r4Entries.find((e) => e.transactionId === "tx-r4-wht");
+  ok(
+    !!r4WhtEntry &&
+      r4WhtEntry.postingState === "POSTED" &&
+      r4WhtEntry.entry.lines.length === 2,
+    "R4-F: WHT row still POSTED (2 legs)"
+  );
+
+  // Fb) A negative standalone expense (rebate) survives the FULL journal-build
+  //     path: buildStatementJournalEntries accepts it (validateJournalEntry
+  //     passes, legs positive) and the contra-expense legs come out right.
+  const r4RebateEntries = buildStatementJournalEntries([
+    baseRow({
+      transactionId: "tx-r4-rebate",
+      category: "expense",
+      section: "ค่าธรรมเนียม",
+      amountForeign: "-3.50",
+      type: "CASH_OUT",
+    }),
+  ]);
+  const r4RebateEntry = r4RebateEntries.find((e) => e.transactionId === "tx-r4-rebate");
+  ok(
+    !!r4RebateEntry &&
+      r4RebateEntry.postingState === "POSTED" &&
+      r4RebateEntry.entry.lines.length === 2 &&
+      r4RebateEntry.entry.lines.some((l) => l.accountId === "1020" && l.debit === "3.50") &&
+      r4RebateEntry.entry.lines.some((l) => l.accountId === "5010" && l.credit === "3.50"),
+    "R4-Fb: standalone rebate -3.50 is journal-built and POSTED (Dr 1020 3.50 / Cr 5010 3.50, validateJournalEntry-safe)"
+  );
+
+  // G) Liquidation lifecycle: BUY 10@100 (fee 11) → full SELL 10@120 (fee 11).
+  //    Investment dr 1000 / cr 1000 → zero; cash net +178; fee expensed once.
+  const lifeBuy = buildStatementJournalEntries([
+    baseRow({
+      transactionId: "tx-life-buy",
+      category: "asset",
+      side: "BUY",
+      symbol: "ABC",
+      quantity: "10",
+      unitPrice: "100",
+      grossAmount: "1000",
+      fees: "11",
+      amountForeign: "1011.00",
+      netAmount: "1011.00",
+    }),
+  ]);
+  const lifeSell = buildStatementJournalEntries([
+    baseRow({
+      transactionId: "tx-life-sell",
+      category: "asset",
+      side: "SELL",
+      symbol: "ABC",
+      quantity: "10",
+      unitPrice: "120",
+      grossAmount: "1200",
+      fees: "11",
+      amountForeign: "1189.00",
+      netAmount: "1189.00",
+      proceeds: "1189.00",
+      costBasis: "1000.00",
+      realizedGainLoss: "189.00",
+      realizedGainLossThb: "5670.00",
+    }),
+  ]);
+  ok(lifeBuy.length === 1 && lifeSell.length === 1, "R4-G: lifecycle BUY + SELL each produce one entry");
+  if (lifeBuy.length === 1 && lifeSell.length === 1) {
+    ok(lifeBuy[0].postingState === "POSTED" && lifeSell[0].postingState === "POSTED", "R4-G: both lifecycle entries POSTED");
+    const bLines = lifeBuy[0].entry.lines;
+    const sLines = lifeSell[0].entry.lines;
+    // Investment: Dr 1000 (BUY) / Cr 1000 (SELL) → net 0 (fully liquidated).
+    const investDr = bLines
+      .filter((l) => l.accountId === "1110" && l.debit != null)
+      .reduce((s, l) => s + Number(l.debit), 0);
+    const investCr = sLines
+      .filter((l) => l.accountId === "1110" && l.credit != null)
+      .reduce((s, l) => s + Number(l.credit), 0);
+    ok(investDr === 1000 && investCr === 1000, "R4-G: full liquidation drains investment to zero (1000 dr / 1000 cr)");
+    // Fee expense: only the BUY fee (11); SELL fees are netted in proceeds.
+    const feeDrTotal = bLines
+      .filter((l) => l.accountId === "5010" && l.debit != null)
+      .reduce((s, l) => s + Number(l.debit), 0);
+    const feeCrInSell = sLines
+      .filter((l) => l.accountId === "5010" && l.credit != null)
+      .reduce((s, l) => s + Number(l.credit), 0);
+    ok(feeDrTotal === 11 && feeCrInSell === 0, "R4-G: fee expense total = 11 (BUY fee only, SELL fees netted)");
+    // Cash: -1011 (paid) / +1189 (received) → net +178.
+    const cashCr = bLines
+      .filter((l) => l.accountId === "1020" && l.credit != null)
+      .reduce((s, l) => s + Number(l.credit), 0);
+    const cashDr = sLines
+      .filter((l) => l.accountId === "1020" && l.debit != null)
+      .reduce((s, l) => s + Number(l.debit), 0);
+    ok(cashDr - cashCr === 178, "R4-G: cash net +178 (1189 received − 1011 paid)");
+    // Gain: Cr 189 = net proceeds (1189) − basis (1000), SELL fee NOT subtracted again.
+    const gainCr = sLines
+      .filter((l) => l.accountId === "4020" && l.credit != null)
+      .reduce((s, l) => s + Number(l.credit), 0);
+    ok(gainCr === 189, "R4-G: realized gain 189 = net proceeds 1189 − basis 1000 (SELL fee already in net)");
+  }
+
+  // H) THB trade: asserted at PARSER/PIPELINE currency separation, NOT posting.
+  //    A THB BUY maps to a THB-denominated row (fx pinned to 1) and the THB
+  //    POSTING path is explicitly pending R7 — the chart of accounts defines
+  //    1110/5010 as USD accounts, so a THB BUY must not be "validly posted"
+  //    through them. R4 stops at the currency separation instead of locking any
+  //    THB leg geometry.
+  const thbText = [
+    "TRADE RECORDS",
+    "Currency: THB",
+    "AAA",
+    "05/01/2026 10:00:00,GMT+07 05/01/2026 BUY 100 10.00 1000.00 1011.00 11.00 0.00 SET",
+    "PORTFOLIO SUMMARY",
+  ];
+  const parsedThb = parseStatementRows(thbText, {});
+  const thbRows: ValidatedCapitalRow[] = [];
+  for (const t of parsedThb.transactions) {
+    const mapped = mapToCapitalRow(t, "user-1", "doc-thb");
+    if (mapped.ok) thbRows.push(mapped.row);
+  }
+  const thbBuy = thbRows.find((r) => r.category === "asset" && r.side === "BUY" && r.currency === "THB");
+  ok(
+    thbBuy !== undefined &&
+      thbBuy.quantity === "100" &&
+      thbBuy.unitPrice === "10" &&
+      thbBuy.grossAmount === "1000" &&
+      thbBuy.fees === "11" &&
+      thbBuy.netAmount === "1011" &&
+      thbBuy.amountForeign === "1011.00" &&
+      thbBuy.currency === "THB" &&
+      thbBuy.fxRateEffective === "1",
+    "R4-H: real parser separates THB BUY (qty 100 @ 10, fee 11, net 1011, currency THB, fx pinned 1)"
+  );
+  ok(
+    thbBuy !== undefined && thbBuy.amountThb === "1011.00",
+    "R4-H: THB row amount_thb === amount_foreign (THB = 1, no invented conversion)"
+  );
+
+  // ---- R4 GAP-1: BUY without a parseable principal is SKIPPED (never capitalized). ----
+  const buyMissingPrincipal = postCapitalRow(
+    baseRow({
+      transactionId: "tx-buy-noprincipal",
+      category: "asset",
+      side: "BUY",
+      symbol: "MSFT",
+      quantity: null,
+      unitPrice: null,
+      grossAmount: "1200.00",
+      amountForeign: "1211.00",
+      netAmount: "1211.00",
+    })
+  );
+  ok(
+    !buyMissingPrincipal.ok &&
+      buyMissingPrincipal.reason.includes("quantity x unitPrice"),
+    "R4-G1: BUY without qty x unitPrice is SKIPPED (net NOT capitalized as asset)"
+  );
+
+  // ---- R4 GAP-2: provenace flag drives the monthly-row skip; the same section
+  //      label WITHOUT the flag is a REAL standalone fee and must POST once. ----
+  const standaloneFee = postCapitalRow(
+    baseRow({
+      transactionId: "tx-standalone-fee",
+      category: "expense",
+      section: "ค่าธรรมเนียม",
+      amountForeign: "9.00",
+    })
+  );
+  ok(
+    standaloneFee.ok &&
+      standaloneFee.entry.lines.some((l) => l.accountId === "5010" && l.debit === "9.00"),
+    "R4-G2: standalone broker fee (section=ค่าธรรมเนียม, no aggregate flag) POSTS Dr 5010 once"
+  );
+
+  // ---- R4 GAP-2b: a NEGATIVE standalone expense is a REBATE (money RETURNED to
+  //      the account). The pipeline preserves the parser sign on expense rows, so
+  //      the posting engine must post the contra-expense — Dr cash / Cr fee —
+  //      NOT a fee debit (an expense debit for money received would be wrong).
+  //      Leg amounts stay POSITIVE (validateJournalEntry + the journal_entry_lines
+  //      debit/credit CHECKs forbid non-positive line amounts). ----
+  const standaloneRebate = postCapitalRow(
+    baseRow({
+      transactionId: "tx-standalone-rebate",
+      category: "expense",
+      section: "ค่าธรรมเนียม",
+      amountForeign: "-2.00",
+      type: "CASH_OUT",
+    })
+  );
+  ok(
+    standaloneRebate.ok &&
+      standaloneRebate.note === "expense rebate (contra-expense)" &&
+      standaloneRebate.entry.lines.some((l) => l.accountId === "1020" && l.debit === "2.00") &&
+      standaloneRebate.entry.lines.some((l) => l.accountId === "5010" && l.credit === "2.00"),
+    "R4-G2b: negative standalone expense (rebate -2) posts contra-expense Dr cash 1020 / Cr fee 5010"
+  );
+  if (standaloneRebate.ok) {
+    ok(
+      !standaloneRebate.entry.lines.some((l) => l.accountId === "5010" && l.debit != null) &&
+        !standaloneRebate.entry.lines.some((l) => l.accountId === "1020" && l.credit != null),
+      "R4-G2b: rebate never debits the fee account nor credits cash (no phoney expense)"
+    );
+    ok(
+      standaloneRebate.entry.lines.every((l) =>
+        [l.debit, l.credit].every((v) => v == null || Number(v) > 0)
+      ),
+      "R4-G2b: rebate leg amounts are positive (line CHECK-safe)"
+    );
+  }
+
+  // ---- R4 GAP-2c: mapToCapitalRow PRESERVES the parser's negative sign on
+  //      expense rows (amountForeign "-2.00", direction CASH_IN since money came
+  //      back), while non-expense rows keep the historical positive-magnitude
+  //      convention (direction in `type`). ----
+  const rebateRow = mapToCapitalRow(
+    {
+      id: "txn-rebate",
+      date: "15/01/2026",
+      currency: "USD",
+      amount: -2,
+      category: "expense",
+      description: "ค่าธรรมเนียม (คืนเงิน)",
+      pnlAmount: 0,
+      rate: "35",
+      section: "ค่าธรรมเนียม",
+      included: true,
+    },
+    "user-1",
+    "doc-1"
+  );
+  ok(
+    rebateRow.ok &&
+      rebateRow.row.amountForeign === "-2.00" &&
+      rebateRow.row.amountThb === "-70.00" &&
+      rebateRow.row.type === "CASH_IN",
+    "R4-G2c: expense rebate maps with signed amountForeign -2.00 (THB -70.00) and CASH_IN direction"
+  );
+
+  const feeRow = mapToCapitalRow(
+    {
+      id: "txn-fee",
+      date: "15/01/2026",
+      currency: "USD",
+      amount: 9,
+      category: "expense",
+      description: "ค่าธรรมเนียม",
+      pnlAmount: 0,
+      rate: "35",
+      section: "ค่าธรรมเนียม",
+      included: true,
+    },
+    "user-1",
+    "doc-1"
+  );
+  ok(
+    feeRow.ok &&
+      feeRow.row.amountForeign === "9.00" &&
+      feeRow.row.amountThb === "315.00" &&
+      feeRow.row.type === "CASH_OUT",
+    "R4-G2c: positive standalone fee keeps +9.00 / THB 315.00 and CASH_OUT direction"
+  );
+
+  const nonExpense = mapToCapitalRow(
+    {
+      id: "txn-deposit",
+      date: "15/01/2026",
+      currency: "USD",
+      amount: 1000,
+      category: "equity",
+      description: "เงินฝาก",
+      pnlAmount: 0,
+      rate: "35",
+      section: "เงินฝาก",
+      included: true,
+    },
+    "user-1",
+    "doc-1"
+  );
+  ok(
+    nonExpense.ok &&
+      nonExpense.row.amountForeign === "1000.00" &&
+      nonExpense.row.type === "CASH_IN",
+    "R4-G2c: non-expense rows still use positive magnitude (1000.00, direction in type)"
+  );
+
+  // ---- R4 GAP-3 + GAP-5: REAL parser -> pipeline -> posting regression.
+  //      A statement mixing USD + THB trades must emit ONE fee row + ONE VAT row
+  //      PER CURRENCY (never a cross-currency sum), and the posting engine must
+  //      derive the BUY principal from qty x unitPrice and skip the monthly rows. ----
+  const mixedText = [
+    "TRADE RECORDS",
+    "Currency: USD",
+    "USD/THB = 35.42",
+    "AAA",
+    "02/01/2026 10:00:00,GMT+07 02/01/2026 BUY 100 10.00 1000.00 1001.00 1.00 0.00 NASDAQ",
+    "Currency: THB",
+    "BBB",
+    "03/01/2026 10:00:00,GMT+07 03/01/2026 BUY 10 100.00 1000.00 1010.00 10.00 0.00 SET",
+    "PORTFOLIO SUMMARY",
+  ];
+  const parsedMixed = parseStatementRows(mixedText, {});
+  const mRows: ValidatedCapitalRow[] = [];
+  for (const t of parsedMixed.transactions) {
+    const mapped = mapToCapitalRow(t, "user-1", "doc-mixed");
+    if (mapped.ok) mRows.push(mapped.row);
+  }
+  const mBuyUsd = mRows.find((r) => r.category === "asset" && r.side === "BUY" && r.currency === "USD");
+  const mBuyThb = mRows.find((r) => r.category === "asset" && r.side === "BUY" && r.currency === "THB");
+  const mFeeRows = mRows.filter((r) => r.isMonthlyFeeAggregate === true && r.section === "ค่าธรรมเนียม");
+  ok(
+    mBuyUsd !== undefined &&
+      mBuyUsd.quantity === "100" &&
+      mBuyUsd.unitPrice === "10" &&
+      mBuyUsd.grossAmount === "1000" &&
+      mBuyUsd.fees === "1" &&
+      mBuyUsd.netAmount === "1001",
+    "R4-G3: real parser maps USD BUY (qty 100 @ 10, fee 1, net 1001)"
+  );
+  ok(
+    mBuyThb !== undefined &&
+      mBuyThb.quantity === "10" &&
+      mBuyThb.unitPrice === "100" &&
+      mBuyThb.fees === "10" &&
+      mBuyThb.netAmount === "1010" &&
+      mBuyThb.currency === "THB" &&
+      mBuyThb.fxRateEffective === "1",
+    "R4-G3: real parser maps THB BUY (qty 10 @ 100, fee 10, net 1010, fx pinned to 1)"
+  );
+  ok(
+    mFeeRows.length === 2 &&
+      mFeeRows.some((r) => r.currency === "USD" && r.amountForeign === "1.00") &&
+      mFeeRows.some((r) => r.currency === "THB" && r.amountForeign === "10.00"),
+    "R4-G3: monthly fees aggregated PER CURRENCY (USD 1 + THB 10, never one '11')"
+  );
+  const mMixedEntries = buildStatementJournalEntries(mRows);
+  const mBuyUsdEntry = mMixedEntries.find((e) => e.transactionId === mBuyUsd?.transactionId);
+  const mBuyThbEntry = mMixedEntries.find((e) => e.transactionId === mBuyThb?.transactionId);
+  ok(
+    mBuyUsdEntry?.postingState === "POSTED" &&
+      mBuyUsdEntry.entry.lines.length === 3 &&
+      mBuyUsdEntry.entry.lines.find((l) => l.accountId === "1110" && l.debit === "1000.00") !== undefined &&
+      mBuyUsdEntry.entry.lines.find((l) => l.accountId === "5010" && l.debit === "1.00") !== undefined &&
+      mBuyUsdEntry.entry.lines.find((l) => l.accountId === "1020" && l.credit === "1001.00") !== undefined,
+    "R4-G3: USD BUY posts principal 1000 / fee 1 / cash 1001 (principal = qty x price)"
+  );
+  ok(
+    mBuyThbEntry !== undefined,
+    // THB posting geometry is NOT asserted here: the chart of accounts defines
+    // 1110/5010 as USD accounts, so a THB BUY must not be "validly posted"
+    // through them. The THB posting path is explicitly pending R7; R4 only
+    // guarantees the row reached the journal as a record (SSOT completeness).
+    "R4-G3: THB BUY row is journaled (SSOT record completeness; posting geometry pending R7, not asserted)"
+  );
+  const mFeeEntries = mMixedEntries.filter((e) => mFeeRows.some((r) => r.transactionId === e.transactionId));
+  ok(
+    mFeeEntries.length === 2 &&
+      mFeeEntries.every((e) => e.postingState === "SKIPPED" && e.entry.lines.length === 0),
+    "R4-G3: both monthly fee rows SKIPPED (no GL lines, one per currency)"
+  );
+
+  // ---- R4 GAP-4: SELL fee policy — gain = net proceeds − basis; the SELL fee is
+  //      already inside the net, never subtracted again, never a 5010 line. ----
+  const sellFeePolicy = postCapitalRow(
+    baseRow({
+      transactionId: "tx-sell-fee-policy",
+      category: "asset",
+      side: "SELL",
+      symbol: "ABC",
+      quantity: "10",
+      unitPrice: "120",
+      grossAmount: "1200",
+      fees: "11",
+      amountForeign: "1189.00",
+      netAmount: "1189.00",
+      proceeds: "1189.00",
+      costBasis: "1000.00",
+      realizedGainLoss: "189.00",
+      realizedGainLossThb: "5670.00",
+    })
+  );
+  ok(
+    sellFeePolicy.ok &&
+      sellFeePolicy.entry.lines.some((l) => l.accountId === "1020" && l.debit === "1189.00") &&
+      sellFeePolicy.entry.lines.some((l) => l.accountId === "1110" && l.credit === "1000.00") &&
+      sellFeePolicy.entry.lines.some((l) => l.accountId === "4020" && l.credit === "189.00") &&
+      sellFeePolicy.entry.lines.every((l) => l.accountId !== "5010"),
+    "R4-G4: SELL gain 189 = net proceeds 1189 − basis 1000; SELL fee NOT expensed (no 5010 leg)"
+  );
+
+  // ---- R4 GAP-5 end-to-end: real parser -> mapToCapitalRow -> posting for a SELL
+  //      whose gain IS computable (net − basis, fee already netted). ----
+  const sellText = [
+    "TRADE RECORDS",
+    "Currency: USD",
+    "USD/THB = 35.42",
+    "ZZZ",
+    "04/01/2026 10:00:00,GMT+07 04/01/2026 SELL 10 120.00 1200.00 1189.00 11.00 0.00 NASDAQ",
+    "PORTFOLIO SUMMARY",
+    "ZZZ",
+    "10 1 100.00 1000.00 120.00 1189.00 USD NASDAQ",
+  ];
+  const parsedSell = parseStatementRows(sellText, {});
+  const sRows: ValidatedCapitalRow[] = [];
+  for (const t of parsedSell.transactions) {
+    const mapped = mapToCapitalRow(t, "user-1", "doc-sell");
+    if (mapped.ok) sRows.push(mapped.row);
+  }
+  const sSell = sRows.find((r) => r.category === "asset" && r.side === "SELL");
+  ok(
+    sSell !== undefined &&
+      sSell.netAmount === "1189" &&
+      sSell.costBasis === "1000.00" &&
+      sSell.realizedGainLoss === "189.00" &&
+      sSell.amountForeign === "1189.00",
+    "R4-G5: real parser computes SELL net 1189 / basis 1000 / gain 189 (fee already netted)"
+  );
+  const sEntries = buildStatementJournalEntries(sRows.filter((r) => r.transactionId === sSell?.transactionId));
+  ok(
+    sEntries.length === 1 &&
+      sEntries[0].postingState === "POSTED" &&
+      sEntries[0].entry.lines.some((l) => l.accountId === "4020" && l.credit === "189.00") &&
+      sEntries[0].entry.lines.every((l) => l.accountId !== "5010"),
+    "R4-G5: real-parser SELL posts gain 189 with NO second fee subtraction (no 5010)"
+  );
+
+  // ---- R4 PERSISTENCE (migration 0027): the monthly-fee-aggregate flag must
+  //      survive the persisted Capital_Transactions shape, the journal detail,
+  //      validateJournalEntry's round-trip, and the journal-as-SSOT mapper — so a
+  //      rebuild from persisted rows (deletion reconciliation, recompute scripts)
+  //      still SKIPS the monthly rows instead of inventing an expense line. ----
+  const persistedMonthly = baseRow({
+    transactionId: "tx-persist-monthly",
+    category: "expense",
+    section: "ค่าธรรมเนียม",
+    amountForeign: "11.00",
+    isMonthlyFeeAggregate: true,
+  });
+  ok(
+    journalDetailOf(persistedMonthly).isMonthlyFeeAggregate === true,
+    "R4-P1: journalDetailOf carries the persisted isMonthlyFeeAggregate flag"
+  );
+  const validatedMonthly = validateJournalEntry({
+    entryDate: "2026-01-15",
+    description: "ค่าธรรมเนียม",
+    sourceType: "STATEMENT",
+    lines: [],
+    postingState: "SKIPPED",
+    detail: journalDetailOf(persistedMonthly),
+  });
+  ok(
+    validatedMonthly.ok && validatedMonthly.entry.detail.isMonthlyFeeAggregate === true,
+    "R4-P1: validateJournalEntry round-trips the persisted flag into the entry detail"
+  );
+  const persistedRebuild = buildStatementJournalEntries([persistedMonthly]);
+  ok(
+    persistedRebuild.length === 1 &&
+      persistedRebuild[0].postingState === "SKIPPED" &&
+      persistedRebuild[0].entry.lines.length === 0,
+    "R4-P1: rebuild FROM the persisted shape stays SKIPPED with zero lines"
+  );
+  const persistedStandalone = baseRow({
+    transactionId: "tx-persist-standalone",
+    category: "expense",
+    section: "ค่าธรรมเนียม",
+    amountForeign: "9.00",
+    isMonthlyFeeAggregate: false,
+  });
+  const standaloneRebuild = buildStatementJournalEntries([persistedStandalone]);
+  ok(
+    standaloneRebuild.length === 1 &&
+      standaloneRebuild[0].postingState === "POSTED" &&
+      standaloneRebuild[0].entry.lines.some((l) => l.accountId === "5010" && l.debit === "9.00"),
+    "R4-P2: rebuild FROM the persisted shape of a REAL standalone fee still POSTS Dr 5010 once"
+  );
+
+  // ---- TRI-STATE FINAL (migration 0027 nullable): a legacy pre-0027 row whose
+  //      provenance is UNKNOWN keeps its NULL through journalDetailOf,
+  //      validateJournalEntry, and a full rebuild — but a NULL MUST NOT be
+  //      treated as a confirmed standalone fee (posting it risks double-counting
+  //      the fee), so the rebuild SKIPS it with zero lines + an explicit reason.
+  //      The flag is NEVER fabricated into a confirmed false, so reads can
+  //      still tell it apart from a deterministic FALSE. TRUE stays SKIPPED,
+  //      FALSE stays POSTED.
+  const persistedLegacy = baseRow({
+    transactionId: "tx-persist-legacy",
+    category: "expense",
+    section: "ค่าธรรมเนียม",
+    amountForeign: "2.50",
+    isMonthlyFeeAggregate: null,
+  });
+  ok(
+    journalDetailOf(persistedLegacy).isMonthlyFeeAggregate === null,
+    "R4-P5: journalDetailOf PRESERVES null for a legacy unknown-provenance row (never fabricated false)"
+  );
+  const validatedLegacy = validateJournalEntry({
+    entryDate: "2026-01-15",
+    description: "ค่าธรรมเนียม",
+    sourceType: "STATEMENT",
+    lines: [],
+    postingState: "SKIPPED",
+    detail: journalDetailOf(persistedLegacy),
+  });
+  ok(
+    validatedLegacy.ok && validatedLegacy.entry.detail.isMonthlyFeeAggregate === null,
+    "R4-P5: validateJournalEntry round-trips NULL (not coerce to false) in the entry detail"
+  );
+  const legacyRebuild = buildStatementJournalEntries([persistedLegacy]);
+  ok(
+    legacyRebuild.length === 1 &&
+      legacyRebuild[0].postingState === "SKIPPED" &&
+      legacyRebuild[0].entry.lines.length === 0 &&
+      legacyRebuild[0].entry.detail?.isMonthlyFeeAggregate === null &&
+      (legacyRebuild[0].entry.skipReason ?? "").includes(
+        "re-import required for deterministic classification"
+      ),
+    "R4-P5: rebuild FROM a legacy NULL row is SKIPPED with zero lines + explicit reason (flag STILL null)"
+  );
+  const triStateMix = buildStatementJournalEntries([
+    persistedLegacy,
+    persistedMonthly,
+    persistedStandalone,
+  ]);
+  ok(
+    triStateMix.length === 3 &&
+      triStateMix.find((e) => e.entry.detail?.isMonthlyFeeAggregate === true)
+        ?.postingState === "SKIPPED" &&
+      triStateMix.find((e) => e.entry.detail?.isMonthlyFeeAggregate == null)
+        ?.postingState === "SKIPPED" &&
+      triStateMix.find((e) => e.entry.detail?.isMonthlyFeeAggregate === false)
+        ?.postingState === "POSTED",
+    "R4-P5: TRUE -> SKIPPED, NULL -> SKIPPED (never treated as standalone), FALSE -> POSTED"
+  );
+
   // ---- Phase 2: journal-as-SSOT read mapper (pure, DB-free). ----
   const rec = (over: Partial<CapitalJournalRecord>): CapitalJournalRecord => ({
     sourceTransactionId: "tx-1",
@@ -635,12 +1475,24 @@ async function main() {
     exchangeFromCurrency: null,
     exchangeFromAmount: null,
     exchangeRate: null,
+    isMonthlyFeeAggregate: false,
     postingState: "POSTED",
     skipReason: null,
     type: "CASH_IN",
     note: null,
     ...over,
   });
+
+  ok(
+    journalEntryToCapitalRow(rec({ category: "expense", section: "ค่าธรรมเนียม", isMonthlyFeeAggregate: true }))
+      .isMonthlyFeeAggregate === true,
+    "R4-P3: journal-as-SSOT mapper reproduces the flag from the persisted journal"
+  );
+  ok(
+    journalEntryToCapitalRow(rec({ category: "expense", section: "ค่าธรรมเนียม", isMonthlyFeeAggregate: null }))
+      .isMonthlyFeeAggregate === null,
+    "R4-P5: journal-as-SSOT mapper passes NULL through verbatim (never coerces to false)"
+  );
 
   const manualRow = journalEntryToCapitalRow(rec({}));
   ok(
@@ -706,6 +1558,7 @@ async function main() {
     "mapper: SELL keeps null type + preserved basis"
   );
 
+  runReportRegressions(ok);
   console.log("================ SUMMARY ================");
   console.log(`PASS: ${passed}   FAIL: ${failed}`);
   if (failed > 0) {

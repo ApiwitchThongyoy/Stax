@@ -1,3 +1,4 @@
+import { roundMoney, moneyInThb } from "./accounting-amounts";
 // General-ledger database service.
 //
 // Persists accounts/journal entries/lines and builds the pure-engine reports
@@ -25,6 +26,7 @@ import {
   incomeStatement,
   summarizeLinesBySymbol,
   trialBalance,
+  normalSideOf,
   validateJournalEntry,
   type AccountMap,
   type BalanceSheetRow,
@@ -178,6 +180,7 @@ export interface PersistedJournalEntry {
     fxRateEffective: string | null;
     fxRateStatement: string | null;
     isFxConversion: boolean;
+    isMonthlyFeeAggregate: boolean | null;
   };
   lines: PersistedJournalLine[];
 }
@@ -190,6 +193,7 @@ interface ResolvedAccount {
   id: string;
   code: string;
   currency: string;
+  type: string;
 }
 
 /**
@@ -202,7 +206,7 @@ async function loadAccountLookup(userId: string): Promise<Map<string, ResolvedAc
   const rows = await getActiveAccounts(userId);
   const map = new Map<string, ResolvedAccount>();
   for (const r of rows) {
-    const resolved = { id: r.id, code: r.code, currency: r.currency };
+    const resolved = { id: r.id, code: r.code, currency: r.currency, type: r.type };
     map.set(r.id, resolved);
     map.set(r.code, resolved);
   }
@@ -225,6 +229,13 @@ function resolveEntryAccountIds(
     if (!account) {
       errors.push(`line[${i}]: unknown account ${JSON.stringify(ref)}`);
       return line;
+    }
+    if (account.currency !== line.currency.trim().toUpperCase()) {
+      errors.push(`line[${i}]: account ${account.code} is ${account.currency}-denominated but the line is ${line.currency}`);
+    }
+    if (input.detail?.isFxConversion === true &&
+      (account.type !== "ASSET" || !["1010", "1020"].includes(account.code))) {
+      errors.push(`line[${i}]: currency exchange requires a compatible cash asset account`);
     }
     return { ...line, accountId: account.id };
   });
@@ -332,6 +343,7 @@ export async function createJournalEntry(
           exchangeFromCurrency: entry.detail.exchangeFromCurrency,
           exchangeFromAmount: entry.detail.exchangeFromAmount,
           exchangeRate: entry.detail.exchangeRate,
+          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
           createdAt: now,
@@ -422,7 +434,7 @@ function manualCashLines(
   input: { type: "CASH_IN" | "CASH_OUT"; amountForeign: string; currency: string; fxRateEffective: string }
 ): JournalLineInput[] {
   const cash = input.currency === "THB" ? MANUAL_CASH_THB : MANUAL_CASH_USD;
-  const fx = input.fxRateEffective || "1";
+  const fx = input.currency === "THB" ? "1" : input.fxRateEffective;
   const line = (accountId: string, side: "debit" | "credit"): JournalLineInput => {
     const base: JournalLineInput = {
       accountId,
@@ -462,14 +474,17 @@ function manualCashDetail(
     realizedGainLossThb: null,
     averageCost: null,
     currency: input.currency,
-    amount: input.amountForeign,
-    amountThb: input.amountThb,
-    fxRateEffective: input.fxRateEffective || "1",
+    amount: roundMoney(input.amountForeign),
+    amountThb: input.currency === "THB" ? roundMoney(input.amountForeign)
+      : input.fxRateEffective && new Decimal(input.fxRateEffective).isFinite() && new Decimal(input.fxRateEffective).gt(0)
+        ? moneyInThb(input.amountForeign, input.fxRateEffective) : null,
+    fxRateEffective: input.currency === "THB" ? "1" : input.fxRateEffective || null,
     fxRateStatement: null,
     isFxConversion: false,
     exchangeFromCurrency: null,
     exchangeFromAmount: null,
     exchangeRate: null,
+    isMonthlyFeeAggregate: false,
   };
 }
 
@@ -502,7 +517,12 @@ export async function insertManualCashJournal(
   };
   const resolved = resolveEntryAccountIds(entryInput, lookup);
   if (!resolved.ok) {
-    return { ok: false, errors: resolved.errors };
+    return insertBackfilledJournalEntry(userId, {
+      ...entryInput, sourceType: "MANUAL", sourceDocumentId: null,
+      sourceTransactionId: input.transactionId, type: input.type,
+      postingState: "SKIPPED", skipReason: resolved.errors.join("; "),
+      detail: manualCashDetail(input),
+    });
   }
   const validated = validateJournalEntry({
     ...entryInput,
@@ -555,9 +575,10 @@ export async function insertManualCashJournal(
           exchangeFromCurrency: entry.detail.exchangeFromCurrency,
           exchangeFromAmount: entry.detail.exchangeFromAmount,
           exchangeRate: entry.detail.exchangeRate,
+          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
-          type: input.type,
+          type: entry.detail.isFxConversion ? null : input.type,
           createdAt: now,
           updatedAt: now,
         })
@@ -678,9 +699,10 @@ export async function insertBackfilledJournalEntry(
           exchangeFromCurrency: entry.detail.exchangeFromCurrency,
           exchangeFromAmount: entry.detail.exchangeFromAmount,
           exchangeRate: entry.detail.exchangeRate,
+          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
-          type: input.type,
+          type: entry.detail.isFxConversion ? null : input.type,
           createdAt: now,
           updatedAt: now,
         })
@@ -703,9 +725,9 @@ export async function insertBackfilledJournalEntry(
  * Sync the linked journal entry when a capital-ledger row is edited (PUT).
  * Updates the money/date/currency/type header fields so every journal-based
  * read stays fresh, and rebuilds the two-line equity entry (cash + owner
- * equity) so the manual rows and the cash summary stay correct. Statement
- * multi-leg entries keep their original posting lines untouched (the GL remains
- * balanced; only the header detail is refreshed). Best-effort: never throws.
+ * equity) so the manual rows and cash summary stay correct. Resolve currencies
+ * and account UUIDs before replacing anything; unsupported accounts produce a
+ * SKIPPED record. Statement entries are untouched. Best-effort: never throws.
  */
 export async function syncCapitalLedgerJournal(
   userId: string,
@@ -727,88 +749,43 @@ export async function syncCapitalLedgerJournal(
     if (entries.length === 0) return;
 
     const { id: entryId } = entries[0];
-    const detail = manualCashDetail(current);
-    await db
-      .update(journalEntries)
-      .set({
-        entryDate: current.transactionDate,
-        description:
-          current.type === "CASH_IN" ? "ฝากเงินเข้าบัญชี" : "ถอนเงินจากบัญชี",
-        currency: current.currency,
-        amount: current.amountForeign,
-        amountThb: current.amountThb,
-        fxRateEffective: current.fxRateEffective || "1",
-        type: current.type,
-        category: detail.category,
-        section: detail.section,
-        symbol: detail.symbol,
-        side: detail.side,
-        exchange: detail.exchange,
-        quantity: detail.quantity,
-        unitPrice: detail.unitPrice,
-        grossAmount: detail.grossAmount,
-        fees: detail.fees,
-        netAmount: detail.netAmount,
-        proceeds: detail.proceeds,
-        costBasis: detail.costBasis,
-        realizedGainLoss: detail.realizedGainLoss,
-        realizedGainLossThb: detail.realizedGainLossThb,
-        averageCost: detail.averageCost,
-        isFxConversion: detail.isFxConversion,
+    const lookup = await loadAccountLookup(userId);
+    const candidate: JournalEntryInput = {
+      entryDate: current.transactionDate,
+      description: current.type === "CASH_IN" ? "ฝากเงินเข้าบัญชี" : "ถอนเงินจากบัญชี",
+      sourceType: "MANUAL", sourceTransactionId: transactionId,
+      lines: manualCashLines(current), detail: manualCashDetail(current),
+    };
+    const resolved = resolveEntryAccountIds(candidate, lookup);
+    const validated = resolved.ok
+      ? validateJournalEntry({ ...candidate, lines: resolved.lines })
+      : validateJournalEntry({ ...candidate, lines: [], postingState: "SKIPPED",
+          skipReason: resolved.errors.join("; ") });
+    if (!validated.ok) return;
+    const entry = validated.entry;
+    // Resolve/validate first, then atomically replace headers and UUID-backed lines.
+    await db.transaction(async tx => {
+      const [owned] = await tx.select({ id: journalEntries.id }).from(journalEntries)
+        .where(and(eq(journalEntries.id, entryId), eq(journalEntries.userId, userId),
+          eq(journalEntries.sourceType, "MANUAL"))).for("update");
+      if (!owned) return;
+      await tx.update(journalEntries).set({
+        ...entry.detail, entryDate: entry.entryDate, description: entry.description,
+        type: current.type, postingState: entry.postingState, skipReason: entry.skipReason,
         updatedAt: new Date().toISOString(),
-      })
-      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
-      .execute();
-
-    // Two-line equity entries (manual cash rows) get their legs rebuilt to the
-    // new amount/fx. Multi-leg statement entries keep the balanced lines.
-    const lineCount = (
-      await db
-        .select({
-          c: sql`COUNT(*)`.as<number>("c"),
-        })
-        .from(journalEntryLines)
-        .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.userId, userId)))
-        .execute()
-    )[0]?.c ?? 0;
-    if (lineCount === 2) {
-      await db
-        .delete(journalEntryLines)
-        .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.userId, userId)))
-        .execute();
-      const entry = validateJournalEntry({
-        entryDate: current.transactionDate,
-        description:
-          current.type === "CASH_IN" ? "ฝากเงินเข้าบัญชี" : "ถอนเงินจากบัญชี",
-        sourceType: "MANUAL",
-        sourceTransactionId: current.transactionId,
-        lines: manualCashLines(current),
-        postingState: "POSTED",
-        skipReason: null,
-        detail,
-      });
-      if (entry.ok) {
-        for (const line of entry.entry.lines) {
-          await db
-            .insert(journalEntryLines)
-            .values({
-              id: randomUUID(),
-              journalEntryId: entryId,
-              userId,
-              accountId: line.accountId,
-              currency: line.currency,
-              debitAmount: line.side === "DEBIT" ? line.amount : null,
-              creditAmount: line.side === "CREDIT" ? line.amount : null,
-              amountThb: line.amountThb,
-              fxRateEffective: line.fxRateEffective,
-              fxRateStatement: line.fxRateStatement,
-              fxRateProvider: line.fxRateProvider,
-              memo: line.memo,
-            })
-            .execute();
-        }
+      }).where(and(eq(journalEntries.id, entryId), eq(journalEntries.userId, userId)));
+      await tx.delete(journalEntryLines)
+        .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.userId, userId)));
+      for (const line of entry.lines) {
+        await tx.insert(journalEntryLines).values({
+          id: randomUUID(), journalEntryId: entryId, userId, accountId: line.accountId,
+          currency: line.currency, debitAmount: line.side === "DEBIT" ? line.amount : null,
+          creditAmount: line.side === "CREDIT" ? line.amount : null, amountThb: line.amountThb,
+          fxRateEffective: line.fxRateEffective, fxRateStatement: line.fxRateStatement,
+          fxRateProvider: line.fxRateProvider, memo: line.memo,
+        });
       }
-    }
+    });
   } catch (error) {
     console.error("syncCapitalLedgerJournal: failed to sync entry", safeErrorLog(error));
   }
@@ -1039,6 +1016,8 @@ export async function insertStatementImport(
           exchangeFromCurrency: row.exchangeFromCurrency,
           exchangeFromAmount: row.exchangeFromAmount,
           exchangeRate: row.exchangeRate,
+          isMonthlyFeeAggregate:
+            row.isMonthlyFeeAggregate == null ? null : row.isMonthlyFeeAggregate === true,
         })
         .execute();
       transactionIds.push(row.transactionId);
@@ -1085,9 +1064,10 @@ export async function insertStatementImport(
           exchangeFromCurrency: entry.detail.exchangeFromCurrency,
           exchangeFromAmount: entry.detail.exchangeFromAmount,
           exchangeRate: entry.detail.exchangeRate,
+          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
-          type: plan.row.type,
+          type: entry.detail.isFxConversion ? null : plan.row.type,
           createdAt: now,
           updatedAt: now,
         })
@@ -1128,12 +1108,41 @@ export async function insertStatementImport(
 }
 
 // ---------------------------------------------------------------------------
-// Reconcile statement-derived state inside the caller's deletion transaction.
-// Reuse the parser's replay and posting engines; failures roll back deletion.
+// Reconcile statement-derived state (SELL gains, journal postings, cost-basis
+// cache) from the FINAL authoritative ledger rows + corporate actions. A pure
+// function of the row set, so the outcome never depends on import/delete order:
+//   - reconcileStatementDeletion — runs INSIDE the caller's deletion
+//     transaction, AFTER the deleted rows/entries are gone (failures roll back
+//     the whole delete).
+//   - reconcileStatementImport   — runs inside its OWN transaction AFTER an
+//     import committed, so deleting a statement and re-importing it converges
+//     to the SAME state as a clean (never-deleted) import of the same set.
+//
+// Recomputed deterministically (never a fill-NULL-only backfill): the affected
+// AI_PARSED SELL rows, their linked journal entries (accounts resolved, entries
+// validated, lines rewritten) and the rebuilt cost-basis cache.
 export async function reconcileStatementDeletion(
   tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
   userId: string,
   affectedSymbols: Set<string>,
+): Promise<void> {
+  await reconcileStatementState(userId, affectedSymbols, tx);
+}
+
+/** Reconcile in a fresh transaction after a committed statement import. */
+export async function reconcileStatementImport(
+  userId: string,
+  affectedSymbols: Set<string>,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    await reconcileStatementState(userId, affectedSymbols, tx);
+  });
+}
+
+async function reconcileStatementState(
+  userId: string,
+  affectedSymbols: Set<string>,
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
 ): Promise<void> {
   const rows = await tx.select().from(capitalTransactions)
     .where(eq(capitalTransactions.userId, userId))
@@ -1250,6 +1259,7 @@ interface RawLineWithEntry {
     fxRateEffective: string | null;
     fxRateStatement: string | null;
     isFxConversion: boolean;
+    isMonthlyFeeAggregate: boolean | null;
   };
 }
 
@@ -1301,12 +1311,15 @@ async function selectRawLines(conditions: (SQL | undefined)[]) {
         fxRateEffective: journalEntries.fxRateEffective,
         fxRateStatement: journalEntries.fxRateStatement,
         isFxConversion: journalEntries.isFxConversion,
+        isMonthlyFeeAggregate: journalEntries.isMonthlyFeeAggregate,
       },
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, and(eq(journalEntryLines.journalEntryId, journalEntries.id), eq(journalEntries.userId, journalEntryLines.userId)))
     .innerJoin(accounts, and(eq(accounts.id, journalEntryLines.accountId), eq(accounts.userId, journalEntryLines.userId)))
-    .where(and(...conditions))
+    // REVERSED originals remain posted economic events: their reversing entry offsets them.
+    // Excluding the original would count only the inverse and corrupt every report.
+    .where(and(...conditions, eq(journalEntries.postingState, "POSTED")))
     .orderBy(asc(journalEntries.entryDate), asc(journalEntries.entryNo), asc(journalEntryLines.id))
     .execute();
   return rows as unknown as RawLineWithEntry[];
@@ -1359,6 +1372,7 @@ function toPersistedEntry(
         fxRateEffective: entry.fxRateEffective,
         fxRateStatement: entry.fxRateStatement,
         isFxConversion: entry.isFxConversion,
+        isMonthlyFeeAggregate: entry.isMonthlyFeeAggregate,
       },
       lines: lines.map((l) => {
         const acc = accountMap[l.accountId];
@@ -1469,6 +1483,7 @@ async function fetchJournalHeaders(
       fxRateEffective: journalEntries.fxRateEffective,
       fxRateStatement: journalEntries.fxRateStatement,
       isFxConversion: journalEntries.isFxConversion,
+      isMonthlyFeeAggregate: journalEntries.isMonthlyFeeAggregate,
     })
     .from(journalEntries)
     .where(and(...conditions))
@@ -1505,7 +1520,7 @@ function toSymbolSummaryLine(r: RawLineWithEntry) {
 }
 
 /**
- * Account ledger with a running balance (signed debit-credit). `opening` is the
+ * Account ledger with a running balance (positive on the account normal side). `opening` is the
  * balance accumulated before `from` (account opening balance + prior postings).
  * `symbolSummary` groups the period's lines by their memo label (per-stock, for
  * a dividend account) — empty when no memo'd lines.
@@ -1517,28 +1532,33 @@ export async function getAccountLedger(
   to?: string
 ): Promise<{
   opening: string;
+  movement: string;
+  closing: string;
+  normalSide: Side;
   lines: LedgerLineView[];
   symbolSummary: LedgerSymbolSummary[];
 } | null> {
   const [account, raw] = await Promise.all([
     db
-      .select({ openingBalance: accounts.openingBalance })
+      .select({ openingBalance: accounts.openingBalance, type: accounts.type })
       .from(accounts)
       .where(and(eq(accounts.userId, userId), eq(accounts.id, accountId)))
       .limit(1)
       .execute(),
-    fetchRawLinesForAccount(userId, accountId, from, to),
+    fetchRawLinesForAccount(userId, accountId, undefined, to),
   ]);
 
   if (!account.length) return null;
 
-  const openingDec = new Decimal(account[0]?.openingBalance ?? "0");
+  const normalSide = normalSideOf(account[0].type as AccountMap[string]["type"]);
+  let openingDec = new Decimal(account[0]?.openingBalance ?? "0");
+  const movementOf = (r: RawLineWithEntry) => new Decimal(r.line.debitAmount ?? r.line.creditAmount ?? "0").mul((r.line.debitAmount != null ? "DEBIT" : "CREDIT") === normalSide ? 1 : -1);
+  for (const r of raw) if (from && r.entry.entryDate < from) openingDec = openingDec.plus(movementOf(r));
+  const period = raw.filter(r => !from || r.entry.entryDate >= from);
   let running = openingDec;
   const lines: LedgerLineView[] = [];
-  for (const r of raw) {
-    const amount = new Decimal(r.line.debitAmount ?? r.line.creditAmount ?? "0");
-    if (r.line.debitAmount != null) running = running.plus(amount);
-    else running = running.minus(amount);
+  for (const r of period) {
+    running = running.plus(movementOf(r));
     lines.push({
       lineId: r.line.id,
       journalEntryId: r.entry.id,
@@ -1558,8 +1578,11 @@ export async function getAccountLedger(
   }
   return {
     opening: openingDec.toFixed(2),
+    movement: running.minus(openingDec).toFixed(2),
+    closing: running.toFixed(2),
+    normalSide,
     lines,
-    symbolSummary: summarizeLinesBySymbol(raw.map(toSymbolSummaryLine)),
+    symbolSummary: summarizeLinesBySymbol(period.map(toSymbolSummaryLine)),
   };
 }
 
@@ -1578,9 +1601,9 @@ export async function fetchRawLinesForAccount(
   return selectRawLines(conditions);
 }
 
-/** Trial balance for a date range. */
+/** Actual balances through to; from is retained for API compatibility, not a lower cutoff. */
 export async function getTrialBalance(userId: string, from?: string, to?: string) {
-  const [accountRows, raw] = await Promise.all([getAccounts(userId), fetchRawLines(userId, from, to)]);
+  const [accountRows, raw] = await Promise.all([getAccounts(userId), fetchRawLines(userId, undefined, to)]);
   const accountMap = toAccountMap(accountRows);
   const lines = raw.map((r) => ({
     accountId: r.line.accountId,
@@ -1589,7 +1612,7 @@ export async function getTrialBalance(userId: string, from?: string, to?: string
     amountThb: r.line.amountThb,
     currency: r.line.currency,
   }));
-  return trialBalance(lines, accountMap);
+  return trialBalance(lines, accountMap, Object.fromEntries(accountRows.filter(a => a.openingBalance != null).map(a => [a.id, a.openingBalance!])));
 }
 
 /** Sorted for stable UI rendering, oldest entry first. */
@@ -1634,6 +1657,7 @@ export async function getIncomeStatement(userId: string, from?: string, to?: str
 
 /** Balance sheet as of `to` (postings on or before the date + opening balances). */
 export async function getBalanceSheet(userId: string, to?: string) {
+  const periodFrom = (to ?? new Date().toISOString().slice(0,10)).slice(0,4) + "-01-01";
   const [accountRows, raw] = await Promise.all([
     getAccounts(userId),
     fetchRawLines(userId, undefined, to),
@@ -1645,7 +1669,7 @@ export async function getBalanceSheet(userId: string, to?: string) {
     if (acc.openingBalance != null) {
       openingBalances[acc.id] = acc.openingBalance;
       // Only THB-denominated openings convert 1:1; foreign openings have no
-      // rate at this layer, so they contribute 0 to the THB-base sums.
+      // rate at this layer, so nonzero foreign openings make THB totals unavailable.
       if (acc.currency === "THB") openingBalancesThb[acc.id] = acc.openingBalance;
     }
   }
@@ -1655,192 +1679,32 @@ export async function getBalanceSheet(userId: string, to?: string) {
     amount: r.line.debitAmount ?? r.line.creditAmount ?? "0",
     amountThb: r.line.amountThb,
   }));
-  return balanceSheet(lines, accountMap, openingBalances, openingBalancesThb);
+  return { ...balanceSheet(lines, accountMap, openingBalances, openingBalancesThb, lines.filter((_, i) => raw[i].entry.entryDate >= periodFrom)), periodFrom };
 }
 
 // ---------------------------------------------------------------------------
 // Ledger summary (overview)
 // ---------------------------------------------------------------------------
 
-export interface LedgerSummaryGroup {
-  code: string;
-  name: string;
-  currency: string;
-  /** Positive magnitude on the account's normal side. */
-  balance: string;
-  /** Same magnitude in THB-base. */
-  balanceThb: string;
+export async function getLedgerSummary(userId: string) {
+  const sheet = await getBalanceSheet(userId);
+  const groups = (["ASSET", "LIABILITY", "EQUITY"] as const).flatMap(type => {
+    const rows = type === "ASSET" ? sheet.assets : type === "LIABILITY" ? sheet.liabilities : sheet.equity;
+    return [...new Set(rows.map(r => r.currency))].map(currency => {
+      const accounts = rows.filter(r => r.currency === currency);
+      return { type, currency, accounts,
+        total: accounts.reduce((s,r) => s.plus(r.balance),new Decimal(0)).toFixed(2),
+        totalThb: accounts.some(r => r.balanceThb == null) ? null : accounts.reduce((s,r) => s.plus(r.balanceThb!),new Decimal(0)).toFixed(2) };
+    });
+  });
+  return { groups, totalsByCurrency: sheet.totalsByCurrency,
+    totalsThb: { assets: sheet.totalAssetsThb, liabilities: sheet.totalLiabilitiesThb, equity: sheet.totalEquityThb,
+      netIncome: sheet.netIncomeThb, totalAssets: sheet.totalAssetsThb, totalEquityAndLiabilities: sheet.totalEquityAndLiabilitiesThb, balanced: sheet.balancedThb },
+    reportingStatus: sheet.reportingStatus, balanced: sheet.balanced, totalAssetsNaive: sheet.totalAssets, totalEquityAndLiabilitiesNaive: sheet.totalEquityAndLiabilities };
 }
-
-export interface LedgerSummaryByType {
-  type: "ASSET" | "LIABILITY" | "EQUITY" | "INCOME" | "EXPENSE";
-  currency: string;
-  /** Signed total across accounts of this type/currency (normal-side positive). */
-  total: string;
-  /** Same total in THB-base. */
-  totalThb: string;
-  accounts: LedgerSummaryGroup[];
-}
-
-export interface LedgerSummary {
-  /** Cash accounts (1010/1020/… whatever presents as cash) by currency. */
-  groups: LedgerSummaryByType[];
-  /** Balance-sheet totals per currency (A / L / E). */
-  totalsByCurrency: {
-    currency: string;
-    assets: string;
-    liabilities: string;
-    equity: string;
-    netIncome: string;
-    /** THB-base parallels of the row above. */
-    assetsThb: string;
-    liabilitiesThb: string;
-    equityThb: string;
-    netIncomeThb: string;
-    balanced: boolean;
-  }[];
-  /** THB-base grand totals across all currencies (the reportable sums). */
-  totalsThb: {
-    assets: string;
-    liabilities: string;
-    equity: string;
-    netIncome: string;
-    totalAssets: string;
-    totalEquityAndLiabilities: string;
-    balanced: boolean;
-  };
-  /** Raw balance-sheet flags (cross-currency naive totals, informational). */
-  balanced: boolean;
-  totalAssetsNaive: string;
-  totalEquityAndLiabilitiesNaive: string;
-}
-
-/** Group the user's balance-sheet rows by (type, currency) for the overview. */
-export function getLedgerSummary(userId: string): Promise<LedgerSummary> {
-  return (async () => {
-    const sheet = await getBalanceSheet(userId);
-
-    const groups: LedgerSummaryByType[] = [];
-    // Totals are accumulated per CURRENCY so one "งบดุล (USD)" card shows the
-    // combined A / L / E for that currency (2030 asset + 2080 equity both USD
-    // land in the same row). Grouped rows stay split by (type, currency).
-    const totalsMap = new Map<
-      string,
-      {
-        assets: Decimal;
-        liabilities: Decimal;
-        equity: Decimal;
-        assetsThb: Decimal;
-        liabilitiesThb: Decimal;
-        equityThb: Decimal;
-      }
-    >();
-
-    const pushGroup = (
-      type: "ASSET" | "LIABILITY" | "EQUITY",
-      rows: BalanceSheetRow[]
-    ) => {
-      const byCurrency = new Map<string, BalanceSheetRow[]>();
-      for (const r of rows) {
-        const arr = byCurrency.get(r.currency) ?? [];
-        arr.push(r);
-        byCurrency.set(r.currency, arr);
-      }
-      for (const [currency, rows2] of byCurrency) {
-        let total = new Decimal(0);
-        let totalThb = new Decimal(0);
-        for (const acc of rows2) {
-          total = total.plus(new Decimal(acc.balance));
-          totalThb = totalThb.plus(new Decimal(acc.balanceThb));
-        }
-        const entry = totalsMap.get(currency) ?? {
-          assets: new Decimal(0),
-          liabilities: new Decimal(0),
-          equity: new Decimal(0),
-          assetsThb: new Decimal(0),
-          liabilitiesThb: new Decimal(0),
-          equityThb: new Decimal(0),
-        };
-        if (type === "ASSET") {
-          entry.assets = entry.assets.plus(total);
-          entry.assetsThb = entry.assetsThb.plus(totalThb);
-        }
-        if (type === "LIABILITY") {
-          entry.liabilities = entry.liabilities.plus(total);
-          entry.liabilitiesThb = entry.liabilitiesThb.plus(totalThb);
-        }
-        if (type === "EQUITY") {
-          entry.equity = entry.equity.plus(total);
-          entry.equityThb = entry.equityThb.plus(totalThb);
-        }
-        totalsMap.set(currency, entry);
-        groups.push({
-          type,
-          currency,
-          total: total.toFixed(2),
-          totalThb: totalThb.toFixed(2),
-          accounts: rows2.map((a) => ({
-            code: a.code,
-            name: a.name,
-            currency: a.currency,
-            balance: a.balance,
-            balanceThb: a.balanceThb,
-          })),
-        });
-      }
-    };
-
-    pushGroup("ASSET", sheet.assets);
-    pushGroup("LIABILITY", sheet.liabilities);
-    pushGroup("EQUITY", sheet.equity);
-
-    const totalsByCurrency = Array.from(totalsMap.entries()).map(
-      ([currency, val]) => {
-        return {
-          currency,
-          assets: val.assets.toFixed(2),
-          liabilities: val.liabilities.toFixed(2),
-          equity: val.equity.toFixed(2),
-          // Net income is folded into equity by the pure engine; it is not
-          // broken out per foreign currency, so per-currency NI stays 0.00
-          // while the THB-base NI below carries the reportable figure.
-          netIncome: "0.00",
-          assetsThb: val.assetsThb.toFixed(2),
-          liabilitiesThb: val.liabilitiesThb.toFixed(2),
-          equityThb: val.equityThb.toFixed(2),
-          netIncomeThb: sheet.netIncomeThb,
-          balanced: val.assets.equals(val.liabilities.plus(val.equity)),
-        };
-      }
-    );
-
-    return {
-      groups,
-      totalsByCurrency,
-      totalsThb: {
-        assets: sheet.totalsByCurrency.reduce(
-          (s, t) => s.plus(new Decimal(t.assetsThb)),
-          new Decimal(0)
-        ).toFixed(2),
-        liabilities: sheet.totalsByCurrency.reduce(
-          (s, t) => s.plus(new Decimal(t.liabilitiesThb)),
-          new Decimal(0)
-        ).toFixed(2),
-        equity: sheet.totalsByCurrency.reduce(
-          (s, t) => s.plus(new Decimal(t.equityThb)),
-          new Decimal(0)
-        ).toFixed(2),
-        netIncome: sheet.netIncomeThb,
-        totalAssets: sheet.totalAssetsThb,
-        totalEquityAndLiabilities: sheet.totalEquityAndLiabilitiesThb,
-        balanced: sheet.balancedThb,
-      },
-      balanced: sheet.balanced,
-      totalAssetsNaive: sheet.totalAssets,
-      totalEquityAndLiabilitiesNaive: sheet.totalEquityAndLiabilities,
-    };
-  })();
-}
+export type LedgerSummary = Awaited<ReturnType<typeof getLedgerSummary>>;
+export type LedgerSummaryByType = LedgerSummary["groups"][number];
+export type LedgerSummaryGroup = LedgerSummaryByType["accounts"][number];
 
 // ---------------------------------------------------------------------------
 // Reversal
@@ -1887,7 +1751,9 @@ export async function reverseJournalEntry(
     sourceTransactionId: header.sourceTransactionId,
     postingState: "POSTED",
     skipReason: null,
-    detail: emptyTradeDetail(),
+    detail: { ...emptyTradeDetail(), isFxConversion: header.isFxConversion,
+      category: header.category, currency: header.currency, amount: header.amount,
+      exchangeFromCurrency: header.exchangeFromCurrency, exchangeFromAmount: header.exchangeFromAmount },
     lines: lineRows.map((l) => ({
       accountId: l.accountId,
       currency: l.currency,
@@ -1907,6 +1773,7 @@ export async function reverseJournalEntry(
     description: candidate.description,
     sourceType: "MANUAL",
     sourceTransactionId: candidate.sourceTransactionId,
+    detail: candidate.detail,
     lines: candidate.lines.map((l) => ({
       accountId: l.accountId,
       currency: l.currency,

@@ -8,17 +8,18 @@
 //   - applyFxRateFallback: external HISTORICAL FX fallback fires ONLY when a
 //     non-THB row has no statement rate (statement FX always wins); applied
 //     rate lands in fx_rate_effective and recomputes amountThb + realized
-//     gain/loss THB; provider-unavailable stays graceful (base fallback kept,
-//     no fabricated rate).
+//     gain/loss THB; provider-unavailable leaves fxRateEffective/amountThb NULL
+//     (never a fabricated 1:1 rate, never 0).
 //   - capitalRowToTransaction: effective-first FX rate fallback.
-//   - 2-stage gain rounding is INTENTIONAL: realizedGainLoss = round2(net -
-//     basis), then realizedGainLossThb = round2(roundedGain x fx), so the pair
-//     is always mutually consistent (never "simplify" to a single stage).
+//   - Persist proceeds and basis at 2dp before subtracting them for gain;
+//     realizedGainLossThb = round2(gain x fx). All persisted values reconcile.
 //
 // The imported modules instantiate a postgres client at load time but this
 // suite performs ZERO queries (pure functions only). Run:
 //   npx tsx scripts/test-statement-tax-recon.mts
 import "./_load-env.mjs";
+import { validateJournalEntry } from "../app/lib/general-ledger";
+import { realizedAmounts } from "../app/lib/accounting-amounts";
 
 import {
   mapToCapitalRow,
@@ -33,9 +34,13 @@ import {
   capitalRowToTransaction,
   type CapitalLedgerRow,
 } from "../app/lib/server-api";
+import {
+  postCapitalRow,
+  buildStatementJournalEntries,
+} from "../app/lib/posting-engine";
 import { applyCorporateAction } from "../app/lib/corporate-action";
-import type { CostBasisMap } from "../app/lib/cost-basis-engine";
-import type { ExtractedTransaction } from "../app/lib/pdfStatementParser";
+import { applyAverageCostTrade, type CostBasisMap } from "../app/lib/cost-basis-engine";
+import { parseStatementRows, type ExtractedTransaction } from "../app/lib/pdfStatementParser";
 
 let passed = 0;
 let failed = 0;
@@ -109,7 +114,7 @@ async function main() {
       rate: "35.42",
     })
   );
-  ok(usdSell.realizedGainLoss === "93.7", "realized gain/loss carried on computable SELL");
+  ok(usdSell.realizedGainLoss === "93.70", "realized gain/loss carried on computable SELL");
   // 93.7 * 35.42 = 3318.854 -> 3318.85
   ok(usdSell.realizedGainLossThb === "3318.85", "realized gain/loss converted to THB with effective rate");
   ok(usdSell.type === "CASH_IN", "SELL maps to CASH_IN (money in)");
@@ -330,8 +335,87 @@ async function main() {
     { resolve: async () => null }
   );
   ok(
-    usdNoProvider[0].fxRateEffective === "1" && usdNoProvider[0].amountThb === "250.00",
-    "provider unavailable -> graceful: base fallback kept, no fabricated rate, import still succeeds"
+    usdNoProvider[0].fxRateEffective === null && usdNoProvider[0].amountThb === null,
+    "provider unavailable -> fxRateEffective/amountThb stay NULL (no 1:1 rate, no fabricated 250 THB)"
+  );
+
+  // ---- R3: unknown-FX rows are honest (statement -> provider -> NULL) ----
+  // (A) statement rate wins: USD 100 @ 35.42 -> 3542 THB.
+  const r3a = map(txn({ currency: "USD", amount: 100, rate: "35.42" }));
+  ok(
+    r3a.fxRateStatement === "35.42" &&
+      r3a.fxRateEffective === "35.42" &&
+      r3a.amountThb === "3542.00",
+    "R3 (A) statement FX 35.42 -> amountThb 3542.00"
+  );
+
+  // (B) no statement rate, provider resolves 34.50 -> 3450 THB.
+  const r3bBase = map(txn({ currency: "USD", amount: 100, rate: undefined }));
+  ok(
+    r3bBase.fxRateStatement === null &&
+      r3bBase.fxRateEffective === null &&
+      r3bBase.amountThb === null,
+    "R3 (B) no statement rate -> base row has NULL FX/THB (no silent 1:1)"
+  );
+  const r3b = (
+    await applyFxRateFallback([r3bBase], {
+      resolve: async () => ({ rate: 34.5, source: "historical-fx-provider" }),
+    })
+  )[0];
+  ok(
+    r3b.fxRateEffective === "34.5" && r3b.amountThb === "3450.00",
+    "R3 (B) provider FX 34.50 -> amountThb 3450.00"
+  );
+
+  // (C) no statement rate, provider unavailable -> NULL, never 1:1 / 100 THB.
+  const r3c = (
+    await applyFxRateFallback(
+      [map(txn({ currency: "USD", amount: 100, rate: undefined }))],
+      { resolve: async () => null }
+    )
+  )[0];
+  ok(
+    r3c.fxRateEffective === null &&
+      r3c.amountThb === null &&
+      r3c.amountThb !== "100.00" &&
+      r3c.fxRateEffective !== "1",
+    "R3 (C) provider unavailable -> NULL FX/THB (never 1:1, never 100 THB)"
+  );
+
+  // (D) THB rows stay pinned to 1 with amountThb = amountForeign.
+  const r3d = map(txn({ currency: "THB", amount: 100, rate: undefined }));
+  ok(
+    r3d.fxRateEffective === "1" &&
+      r3d.fxRateStatement === "1" &&
+      r3d.amountThb === "100.00",
+    "R3 (D) THB 100 -> FX 1, amountThb 100.00"
+  );
+
+  // (E) Journal posting: a non-THB row with unknown FX must NOT post.
+  const r3eUnknown = map(txn({ category: "income", currency: "USD", amount: 100, rate: undefined }));
+  ok(
+    postCapitalRow(r3eUnknown).ok === false,
+    "R3 (E) postCapitalRow refuses a non-THB row with unknown FX"
+  );
+  const r3eEntry = buildStatementJournalEntries([r3eUnknown])[0];
+  ok(
+    r3eEntry.postingState === "SKIPPED" &&
+      r3eEntry.entry.lines.length === 0,
+    "R3 (E) unknown-FX row becomes a SKIPPED journal entry with ZERO lines (never a fabricated 1:1 posting)"
+  );
+  ok(
+    !r3eEntry.entry.lines.some((l) => l.fxRateEffective === "1" || l.fxRateEffective === 1),
+    "R3 (E) no posted line ever carries an invented rate of 1 for the unknown-FX row"
+  );
+  // R3 still pins THB to 1; R7 separately refuses the USD-only income account.
+  const r3eThb = map(txn({ category: "income", currency: "THB", amount: 100 }));
+  ok(
+    r3eThb.fxRateEffective === "1" &&
+      validateJournalEntry({ entryDate: r3eThb.transactionDate, description: "THB control",
+        lines: [{ accountId: "thb-cash", currency: "THB", debit: "100" },
+          { accountId: "thb-income", currency: "THB", credit: "100" }] }).ok &&
+      buildStatementJournalEntries([r3eThb])[0].postingState === "SKIPPED",
+    "R3 (E): THB needs no foreign FX; R7 rejects the USD-only income account"
   );
 
   // ---- Gain/loss backfill: heal FROZEN SELL rows (out-of-order imports) ----
@@ -531,9 +615,68 @@ async function main() {
     }),
   ]);
   const penny = bfPenny.updates.find((u) => u.transactionId === "sPenny");
+  const parsedPenny = parseStatementRows([
+    "TRADE RECORDS", "Currency: USD", "USD/THB = 35.42", "PPP",
+    "01/01/2026 10:00:00,GMT+07 01/01/2026 BUY 1 99.995 100.00 100.00 0.00 0.00 NASDAQ",
+    "PPP",
+    "02/01/2026 10:00:00,GMT+07 02/01/2026 SELL 1 110.00 110.00 110.00 0.00 0.00 NASDAQ",
+  ]);
+  const parsedRows = parsedPenny.transactions.filter(t => t.category === "asset").map(map);
+  const parsedGain = parsedRows.find(r => r.side === "SELL");
+  const parsedReplay = recomputeAllGainLoss(parsedRows).updates[0]?.update;
+  const parsedBackfill = computeGainLossBackfill(parsedRows.map(r => ({ ...r, realizedGainLossThb: null }))).updates[0]?.update;
+  ok(parsedGain?.realizedGainLoss === "10.00" && parsedGain.realizedGainLossThb === "354.20" &&
+    parsedReplay?.realizedGainLoss === parsedGain.realizedGainLoss &&
+    parsedReplay?.realizedGainLossThb === parsedGain.realizedGainLossThb &&
+    parsedBackfill?.realizedGainLoss === parsedGain.realizedGainLoss &&
+    parsedBackfill?.realizedGainLossThb === parsedGain.realizedGainLossThb,
+    "R2: parser/import/replay/backfill reconcile proceeds 110.00 minus rounded basis 100.00 = gain 10.00");
+  const persistedCents = realizedAmounts("100.005", "100.004", "35.42");
+  ok(persistedCents.proceeds === "100.01" && persistedCents.costBasis === "100.00" &&
+    persistedCents.realizedGainLoss === "0.01" && persistedCents.realizedGainLossThb === "0.35",
+    "R2: rounded proceeds 100.01 minus rounded basis 100.00 = gain 0.01 / THB 0.35");
+  const centsFresh = map(txn({ category: "asset", side: "SELL", symbol: "CENT",
+    quantity: 1, amount: 100.005, proceeds: 100.005, netAmount: 100.005,
+    costBasis: 100.004, realizedGainLoss: 0.001, rate: "35.42" }));
+  const centsHistory = [
+    bfRow({ transactionId: "cent-buy", symbol: "CENT", side: "BUY",
+      transactionDate: "2026-01-01", quantity: "1", unitPrice: "100.004" }),
+    bfRow({ transactionId: "cent-sell", symbol: "CENT", quantity: "1", netAmount: "100.005" }),
+  ];
+  const centsRecomputed = recomputeAllGainLoss(centsHistory).updates[0]?.update;
+  const centsBackfilled = computeGainLossBackfill(centsHistory).updates[0]?.update;
+  ok([centsFresh, centsRecomputed, centsBackfilled].every(r =>
+    r?.costBasis === persistedCents.costBasis &&
+    r.realizedGainLoss === persistedCents.realizedGainLoss &&
+    r.realizedGainLossThb === persistedCents.realizedGainLossThb),
+    "R2: fresh import, recompute and backfill share persisted-cent gain calculation");
+  ok([centsFresh, centsRecomputed, centsBackfilled].every(r => r?.proceeds === persistedCents.proceeds),
+    "R2: fresh import/recompute/backfill persist the helper's rounded proceeds");
+  const freshPenny = map(txn({ category: "asset", side: "SELL", symbol: "PPP",
+    quantity: 1, amount: 110.005, proceeds: 110.005, netAmount: 110.005,
+    costBasis: 100, realizedGainLoss: 10.005, rate: "35.42" }));
+  const replayPenny = recomputeAllGainLoss([
+    bfRow({ transactionId: "b", side: "BUY", symbol: "PPP", transactionDate: "2026-01-01",
+      quantity: "1", unitPrice: "100" }),
+    bfRow({ transactionId: "s", symbol: "PPP", quantity: "1", netAmount: "110.005" }),
+  ]).updates[0].update;
+  ok(freshPenny.realizedGainLoss === penny?.update.realizedGainLoss &&
+    freshPenny.realizedGainLossThb === penny?.update.realizedGainLossThb &&
+    replayPenny.realizedGainLoss === freshPenny.realizedGainLoss &&
+    replayPenny.realizedGainLossThb === freshPenny.realizedGainLossThb,
+    "R2: fresh import, replay/recompute/deletion and backfill agree on gain 10.01 / THB 354.55");
+  const canonicalSell = map(txn({ category: "asset", side: "SELL", amount: 1189,
+    netAmount: 1189, proceeds: 1189, costBasis: 1000, realizedGainLoss: 999, rate: "35.42" }));
+  ok(canonicalSell.realizedGainLoss === "189.00" && canonicalSell.realizedGainLossThb === "6694.38",
+    "R2: net 1189 minus basis 1000 derives gain 189 / THB 6694.38, ignoring supplied gain");
+  const noBasisSell = map(txn({ category: "asset", side: "SELL", amount: 1000,
+    proceeds: 1000, realizedGainLoss: 0, rate: "35.42" }));
+  ok(noBasisSell.costBasis === null && noBasisSell.realizedGainLoss === null &&
+    noBasisSell.realizedGainLossThb === null,
+    "R8: mapper cannot retain a fabricated zero gain without basis");
   ok(
     penny?.update.realizedGainLoss === "10.01",
-    "stage 1: raw gain 10.005 rounds half-up to stored 10.01"
+    "stage 1: rounded proceeds 110.01 minus rounded basis 100.00 gives gain 10.01"
   );
   ok(
     penny?.update.realizedGainLossThb === "354.55",
@@ -771,6 +914,78 @@ async function main() {
     fmvThrow = e instanceof Error ? e.message : String(e);
   }
   ok(fmvThrow.includes("both-or-neither"), "one-sided FMV spin-off throws (both-or-neither)");
+
+  // ---- SPLIT / REVERSE_SPLIT: cumCost preserved exactly (A / B) ----
+  const splitBase: CostBasisMap = {
+    AAA: { quantity: 100, avgCost: 10, cumQuantity: 100, cumCost: 1000 },
+  };
+  const split1 = applyCorporateAction(splitBase, {
+    symbol: "AAA", actionType: "SPLIT", transactionDate: "2026-02-01",
+    ratioOld: "1", ratioNew: "2",
+  });
+  ok(
+    split1.AAA?.quantity === 200 && split1.AAA?.cumQuantity === 200 &&
+      split1.AAA?.avgCost === 5 && Math.abs((split1.AAA?.cumCost ?? 0) - 1000) < 1e-9,
+    "SPLIT 1:2 scales qty/cumQty by 2, avg halves, cumCost preserved (1000)"
+  );
+  const revSplit = applyCorporateAction(splitBase, {
+    symbol: "AAA", actionType: "REVERSE_SPLIT", transactionDate: "2026-02-01",
+    ratioOld: "10", ratioNew: "1",
+  });
+  ok(
+    revSplit.AAA?.quantity === 10 && revSplit.AAA?.cumQuantity === 10 &&
+      revSplit.AAA?.avgCost === 100 && Math.abs((revSplit.AAA?.cumCost ?? 0) - 1000) < 1e-9,
+    "REVERSE_SPLIT 10:1 scales qty/cumQty by 0.1, avg ×10, cumCost preserved (1000)"
+  );
+
+  // ---- RENAME simple move + deterministic collision merge (C) ----
+  const renameBase: CostBasisMap = {
+    OLD: { quantity: 60, avgCost: 10, cumQuantity: 60, cumCost: 600 },
+  };
+  const renSimple = applyCorporateAction(renameBase, {
+    symbol: "OLD", actionType: "RENAME", transactionDate: "2026-03-01", newSymbol: "NEW",
+  });
+  ok(
+    renSimple["OLD"] === undefined && renSimple["NEW"] !== undefined &&
+      renSimple["NEW"]?.quantity === 60 && renSimple["NEW"]?.cumCost === 600,
+    "RENAME moves position to new key; old key absent"
+  );
+
+  const mergeBase: CostBasisMap = {
+    AAA: { quantity: 100, avgCost: 10, cumQuantity: 100, cumCost: 1000 },
+    BBB: { quantity: 50, avgCost: 20, cumQuantity: 50, cumCost: 1000 },
+  };
+  const merged = applyCorporateAction(mergeBase, {
+    symbol: "AAA", actionType: "RENAME", transactionDate: "2026-03-01", newSymbol: "BBB",
+  });
+  ok(
+    merged["AAA"] === undefined && merged["BBB"] !== undefined,
+    "RENAME collision: old key removed, destination survives"
+  );
+  ok(
+    merged["BBB"]?.quantity === 150 && merged["BBB"]?.cumQuantity === 150 &&
+      Math.abs((merged["BBB"]?.cumCost ?? 0) - 2000) < 1e-9 &&
+      Math.abs((merged["BBB"]?.avgCost ?? 0) - 2000 / 150) < 1e-6,
+    "RENAME collision: basis pooled (qty 150, cumQty 150, cumCost 2000, avg ≈13.333)"
+  );
+
+  // ---- RENAME merge then SELL uses the merged basis ----
+  const mergedBasis = { BBB: merged["BBB"]! } as CostBasisMap;
+  const renAfterSell = applyAverageCostTrade(mergedBasis, "BBB", "SELL", 150, 20);
+  ok(
+    renAfterSell.sellBasis !== null && Math.abs((renAfterSell.sellBasis ?? 0) - 2000 / 150) < 1e-6,
+    "SELL after RENAME-merge reports the merged avgCost as sellBasis"
+  );
+
+  // ---- SPIN_OFF FMV never exceeds parent cumCost (E / F) ----
+  ok(
+    momCost < 5000 && kidCost > 0,
+    "FMV spin-off child basis < parent original cumCost; parent basis stays positive"
+  );
+  ok(
+    spinFmv.MOM?.cumCost !== undefined && spinFmv.MOM?.cumCost > 0,
+    "FMV spin-off parent cumCost remains positive after allocation"
+  );
 
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);

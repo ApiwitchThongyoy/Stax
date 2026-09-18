@@ -72,6 +72,7 @@ interface CapitalRowLike {
   exchangeFromCurrency: string | null;
   exchangeFromAmount: string | null;
   exchangeRate: string | null;
+  isMonthlyFeeAggregate: boolean | null;
 }
 
 function rowToValidated(row: CapitalRowLike): ValidatedCapitalRow {
@@ -109,6 +110,7 @@ function rowToValidated(row: CapitalRowLike): ValidatedCapitalRow {
     exchangeFromCurrency: row.exchangeFromCurrency,
     exchangeFromAmount: row.exchangeFromAmount,
     exchangeRate: row.exchangeRate,
+    isMonthlyFeeAggregate: row.isMonthlyFeeAggregate,
   };
 }
 
@@ -163,6 +165,7 @@ async function backfillUser(
       exchangeFromCurrency: capitalTransactions.exchangeFromCurrency,
       exchangeFromAmount: capitalTransactions.exchangeFromAmount,
       exchangeRate: capitalTransactions.exchangeRate,
+      isMonthlyFeeAggregate: capitalTransactions.isMonthlyFeeAggregate,
     })
     .from(capitalTransactions)
     .where(eq(capitalTransactions.userId, userId))
@@ -227,7 +230,7 @@ async function backfillUser(
           .set({
             sourceTransactionId: row.transactionId,
             sourceDocumentId: row.sourceDocumentId,
-            type: row.type,
+            type: detail.isFxConversion ? null : row.type,
             category: detail.category,
             section: detail.section,
             symbol: detail.symbol,
@@ -261,6 +264,7 @@ async function backfillUser(
 
     const isManualCash =
       row.sourceType === "MANUAL" &&
+      !journalDetailOf(validated).isFxConversion &&
       (row.type === "CASH_IN" || row.type === "CASH_OUT");
 
     if (candidates.length > 1) {

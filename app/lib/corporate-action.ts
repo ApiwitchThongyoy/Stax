@@ -9,7 +9,10 @@
 //     cost ÷ the same factor. Total cost is preserved exactly, regardless of
 //     any `cashInLieu` fractional-share payout (which is recorded
 //     informationally and left out of the basis math).
-//   RENAME — the position simply moves to the new symbol key.
+//   RENAME — the position moves to the new symbol key; if the destination
+//     already holds shares the two are merged deterministically (live quantity,
+//     lifetime cum fields and total cost pooled, avgCost = cumCost / cumQuantity)
+//     so a rename can never silently destroy pre-existing cost basis.
 //   SPIN_OFF — a NEW position is created (or merged into an existing one).
 //     Two modes (never mixed):
 //     (a) Legacy (no FMV pair): the received shares are valued at `priceOut`
@@ -100,11 +103,31 @@ export function applyCorporateAction(
       throw new Error("RENAME requires newSymbol");
     }
     const newSymbol = action.newSymbol.trim().toUpperCase();
+    if (newSymbol === symbol) return out;
     const pos = positionOf(out, symbol);
-    if (pos) {
-      delete out[symbol];
+    const existing = positionOf(out, newSymbol);
+    delete out[symbol];
+    if (!pos) return out;
+    if (!existing) {
       out[newSymbol] = pos;
+      return out;
     }
+    // Deterministic merge, never a silent overwrite: renaming onto a symbol
+    // with its own cost basis must preserve BOTH positions' basis. Pool the
+    // live quantity, the lifetime cum fields and the total cost; the combined
+    // average is cumCost / cumQuantity (exactly the sum of its parts).
+    const quantity = new Decimal(pos.quantity).plus(new Decimal(existing.quantity));
+    const cumQuantity = new Decimal(pos.cumQuantity).plus(new Decimal(existing.cumQuantity));
+    const cumCost = new Decimal(pos.cumCost).plus(new Decimal(existing.cumCost));
+    const avgCost = cumQuantity.gt(0)
+      ? cumCost.div(cumQuantity)
+      : new Decimal(existing.avgCost);
+    out[newSymbol] = {
+      quantity: toNumber(quantity),
+      avgCost: toNumber(avgCost),
+      cumQuantity: toNumber(cumQuantity),
+      cumCost: toNumber(cumCost),
+    };
     return out;
   }
 
