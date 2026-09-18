@@ -66,6 +66,7 @@ const CASH_THB = "1010";
 const CASH_USD = "1020";
 const INVEST_STOCKS = "1110";
 const EQUITY_CAPITAL = "3010";
+const EQUITY_CAPITAL_THB = "3020";
 const GAIN_INCOME = "4020";
 const DIVIDEND_INCOME = "4010";
 const INTEREST_INCOME = "4030";
@@ -79,6 +80,15 @@ export type CapitalPostingResult =
 
 function cashAccountFor(currency: string): string {
   return currency === "THB" ? CASH_THB : CASH_USD;
+}
+
+/** Owner-capital account matched to the row's currency (THB deposits need a
+ * THB equity account so the cash leg and the capital leg share a currency —
+ * there is no way to post 1010/3010 as a balanced pair). Falls back to the USD
+ * capital account for anything non-THB; the caller's compatibility check then
+ * SKIPPs unsupported currencies instead of inventing a conversion. */
+function equityCapitalAccountFor(currency: string): string {
+  return currency === "THB" ? EQUITY_CAPITAL_THB : EQUITY_CAPITAL;
 }
 
 function leg(
@@ -278,6 +288,7 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
 
   if (category === "equity") {
     const cash = cashAccountFor(row.currency);
+    const capital = equityCapitalAccountFor(row.currency);
     if (row.type === "CASH_IN") {
       return {
         ok: true,
@@ -290,7 +301,7 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
           sourceTransactionId: row.transactionId,
           lines: [
             leg(cash, "debit", amount, row),
-            leg(EQUITY_CAPITAL, "credit", amount, row),
+            leg(capital, "credit", amount, row),
           ],
         },
       };
@@ -305,7 +316,7 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
         sourceDocumentId: row.sourceDocumentId,
         sourceTransactionId: row.transactionId,
         lines: [
-          leg(EQUITY_CAPITAL, "debit", amount, row),
+          leg(capital, "debit", amount, row),
           leg(cash, "credit", amount, row),
         ],
       },

@@ -465,7 +465,6 @@ async function main() {
       "R6/R7: reversal swaps exchange details and keeps compatible currencies");
   }
   for (const row of [
-    baseRow({ category: "equity", currency: "THB", fxRateEffective: "1" }),
     baseRow({ category: "asset", side: "BUY", currency: "THB", fxRateEffective: "1", quantity: "1", unitPrice: "100" }),
     baseRow({ category: "expense", currency: "THB", fxRateEffective: "1" }),
     baseRow({ category: "income", currency: "THB", fxRateEffective: "1" }),
@@ -474,6 +473,36 @@ async function main() {
     ok(plan.postingState === "SKIPPED" && plan.entry.lines.length === 0 && !!plan.reason?.includes("compatible"),
       `R7: unsupported THB ${row.category}/${row.side ?? ""} remains SKIPPED with no incompatible lines`);
   }
+
+  // THB owner deposits ARE now supported: the default chart of accounts gained
+  // 3020 (THB owner capital), so a THB equity CASH_IN posts Dr 1010 / Cr 3020
+  // (previously SKIPPED "no compatible THB account for 3010").
+  const thbDeposit = postCapitalRow(baseRow({ category: "equity", currency: "THB", fxRateEffective: "1" }));
+  ok(thbDeposit.ok, "THB equity deposit now posts (3020 owner-capital account exists)");
+  if (thbDeposit.ok) {
+    ok(thbDeposit.entry.lines.some((l) => l.accountId === "1010" && l.debit === "100.00"),
+      "THB deposit debits the THB cash account (1010)");
+    ok(thbDeposit.entry.lines.some((l) => l.accountId === "3020" && l.credit === "100.00"),
+      "THB deposit credits the THB owner-capital account (3020), NOT 3010");
+    ok(thbDeposit.entry.lines.every((l) => l.accountId !== "3010"),
+      "THB equity never touches the USD owner-capital account (3010)");
+  }
+  const thbWithdraw = postCapitalRow(baseRow({
+    category: "equity", currency: "THB", fxRateEffective: "1", type: "CASH_OUT" as const,
+  }));
+  ok(thbWithdraw.ok && thbWithdraw.entry.lines.some((l) => l.accountId === "3020" && l.debit === "100.00") &&
+     thbWithdraw.entry.lines.some((l) => l.accountId === "1010" && l.credit === "100.00"),
+    "THB equity CASH_OUT reverses: Dr 3020 / Cr 1010");
+  // USD equity deposits keep the classic 3010 pair (never 3020).
+  const usdDeposit = postCapitalRow(baseRow({ category: "equity" }));
+  ok(usdDeposit.ok && usdDeposit.entry.lines.some((l) => l.accountId === "3010" && l.credit === "100.00") &&
+     usdDeposit.entry.lines.some((l) => l.accountId === "1020" && l.debit === "100.00"),
+    "USD equity deposit still posts Dr 1020 / Cr 3010 (unchanged)");
+  // Unsupported foreign currency falls back to 3010 (USD) and is then SKIPPED
+  // by the account-currency compatibility check — never invented or mismatched.
+  const eurDeposit = postCapitalRow(baseRow({ category: "equity", currency: "EUR", fxRateEffective: "34.5" }));
+  ok(!eurDeposit.ok && eurDeposit.reason.includes("compatible"),
+    "unsupported-currency equity stays SKIPPED (no fake conversion leg)");
 
   // Dividend income (no symbol) -> dividend account, memo carries the ticker.
   const div = postCapitalRow(baseRow({}));

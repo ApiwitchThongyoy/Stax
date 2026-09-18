@@ -52,6 +52,7 @@ export const DEFAULT_CHART_OF_ACCOUNTS: AccountDef[] = [
   { code: "1120", name: "เงินลงทุน - กองทุน ETF", type: "ASSET", currency: "USD" },
   { code: "2010", name: "หนี้สิน - วงเงิน/ยืม (Margin)", type: "LIABILITY", currency: "USD" },
   { code: "3010", name: "ส่วนทุน - เงินลงทุนเริ่มต้น", type: "EQUITY", currency: "USD" },
+  { code: "3020", name: "ส่วนทุน - เงินลงทุนเริ่มต้น (THB)", type: "EQUITY", currency: "THB" },
   { code: "3200", name: "กำไรสะสม", type: "EQUITY", currency: "THB" },
   { code: "4010", name: "รายได้ - เงินปันผล", type: "INCOME", currency: "USD" },
   { code: "4020", name: "รายได้ - กำไรจากการขายหลักทรัพย์", type: "INCOME", currency: "USD" },
