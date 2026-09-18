@@ -25,10 +25,15 @@ import {
   emptyTradeDetail,
   incomeStatement,
   summarizeLinesBySymbol,
+  summarizeAccountLedgers,
   trialBalance,
   normalSideOf,
   validateJournalEntry,
+  type AccountLedgerSummaryInput,
+  type AccountLedgerSummaryLineInput,
+  type AccountLedgerSummaryResult,
   type AccountMap,
+  type AccountType,
   type BalanceSheetRow,
   type JournalEntryInput,
   type JournalLineInput,
@@ -1956,6 +1961,68 @@ export async function getLedgerSummary(userId: string) {
 export type LedgerSummary = Awaited<ReturnType<typeof getLedgerSummary>>;
 export type LedgerSummaryByType = LedgerSummary["groups"][number];
 export type LedgerSummaryGroup = LedgerSummaryByType["accounts"][number];
+
+// ---------------------------------------------------------------------------
+// Account-category batch summary (one call per category, NO per-account N+1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Batch ledger summary for every account of one account class (ASSET, LIABILITY,
+ * EQUITY, INCOME, EXPENSE). ONE database read fetches all POSTED lines for the
+ * user's accounts of that type (bounded by `to`); the pure engine
+ * `summarizeAccountLedgers` partitions them into opening (postings before `from`)
+ * and period movement with exactly the same semantics as `getAccountLedger`.
+ * SKIPPED entries are excluded by `selectRawLines` (postingState = POSTED), so
+ * they can never move a total or inflate a lineCount.
+ */
+export async function getAccountCategorySummary(
+  userId: string,
+  type: AccountType,
+  from?: string,
+  to?: string
+): Promise<{
+  type: AccountType;
+  from: string | null;
+  to: string | null;
+  summary: AccountLedgerSummaryResult;
+  accounts: (AccountRow & { type: AccountType })[];
+}> {
+  const accountRows = (await getAccounts(userId)).filter((a): a is AccountRow & { type: AccountType } => a.type === type);
+  if (accountRows.length === 0) {
+    return { accounts: accountRows, type, from: from ?? null, to: to ?? null, summary: { rows: [], totalsByCurrency: [] } };
+  }
+  const ids = accountRows.map((a) => a.id);
+  const conditions: (SQL | undefined)[] = [
+    eq(journalEntryLines.userId, userId),
+    inArray(journalEntryLines.accountId, ids),
+  ];
+  if (to) conditions.push(lte(journalEntries.entryDate, to));
+
+  const raw = await selectRawLines(conditions);
+  const lines: AccountLedgerSummaryLineInput[] = raw.map((r) => ({
+    accountId: r.line.accountId,
+    entryDate: r.entry.entryDate,
+    side: r.line.debitAmount != null ? ("DEBIT" as Side) : ("CREDIT" as Side),
+    amount: r.line.debitAmount ?? r.line.creditAmount ?? "0",
+  }));
+  const inputs: AccountLedgerSummaryInput[] = accountRows.map((a) => ({
+    accountId: a.id,
+    code: a.code,
+    name: a.name,
+    type: a.type as AccountType,
+    currency: a.currency,
+    openingBalance: a.openingBalance,
+  }));
+  return {
+    type,
+    from: from ?? null,
+    to: to ?? null,
+    summary: summarizeAccountLedgers(inputs, lines, from),
+    accounts: accountRows,
+  };
+}
+
+export type AccountCategorySummary = Awaited<ReturnType<typeof getAccountCategorySummary>>;
 
 // ---------------------------------------------------------------------------
 // Reversal

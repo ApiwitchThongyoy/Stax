@@ -36,6 +36,7 @@ export default [
   route("api/v1/journal", "routes/api/journal.ts"),
   route("api/v1/journal/:id/reverse", "routes/api/journal.$id.reverse.ts"),
   route("api/v1/ledger/accounts/:accountId", "routes/api/ledger.$accountId.ts"),
+  route("api/v1/ledger/accounts/summary", "routes/api/ledger.accounts.summary.ts"),
   route("api/v1/ledger/summary", "routes/api/ledger.summary.ts"),
   route("api/v1/cost-basis", "routes/api/cost-basis.ts"),
   route("api/v1/portfolio/:symbol", "routes/api/portfolio.$symbol.ts"),

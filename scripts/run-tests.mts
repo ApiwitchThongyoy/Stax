@@ -2447,6 +2447,275 @@ async function main() {
     }
   }
 
+  // ================= REG: ACCOUNT-CATEGORY BATCH SUMMARY =================
+  // The category pages (บัญชีแยกประเภท per class) must show real opening/
+  // movement/closing/lineCount from ONE batch server call, never a per-account
+  // N+1 and never a fake ฿ total. Proves through the REAL route:
+  //   - opening = balance accumulated before `from` (openingBalance + prior
+  //     POSTED lines), the line dated exactly ON `from` counts as period;
+  //   - movement/closing on the account's normal side (ASSET debit-positive);
+  //   - totals stay grouped per native currency (THB never added to USD);
+  //   - a SKIPPED journal header (inserted directly, no lines) never moves any
+  //     total or lineCount (selectRawLines = POSTED lines only);
+  //   - cross-user isolation: user B's postings never appear in user A.
+  {
+    console.log("\n=== REG: ACCOUNT-CATEGORY BATCH SUMMARY ===");
+    const { randomUUID } = await import("node:crypto");
+    const summaryRoute = await import("../app/routes/api/ledger.accounts.summary");
+
+    const catEmail = `cat-${randomUUID()}@test.local`;
+    const catPassword = "CatSum!234";
+    const regRes = await registerAs(catEmail, catPassword);
+    const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
+    const catUserId = regJson.data?.user?.id;
+    if (!catUserId) {
+      ok(false, "REG-CAT: register failed to create the category-summary user");
+    } else {
+      smokeUserIds.push(catUserId);
+      const catLogin = await loginAs(catEmail, catPassword);
+      const catToken = catLogin.data?.accessToken as string | undefined;
+      if (!catToken) {
+        ok(false, "REG-CAT: registered category-summary user could not log in");
+      } else {
+        const callSummary = async (query: string) =>
+          summaryRoute.loader({
+            request: new Request(
+              `http://test.local/api/v1/ledger/accounts/summary${query}`,
+              { headers: { Authorization: `Bearer ${catToken}` } }
+            ),
+          } as never);
+
+        // 1. Post a THB owner deposit (Dr 1010 / Cr 3020) dated BEFORE the
+        //    window and a USD deposit (Dr 1020 / Cr 3010) dated INSIDE it.
+        const thbEntry = await journalRoute.action({
+          request: jsonBody(
+            {
+              entryDate: "2026-01-10",
+              description: "REG-CAT ฝากเงิน THB",
+              lines: [
+                { accountId: "1010", currency: "THB", debit: "5000.00" },
+                { accountId: "3020", currency: "THB", credit: "5000.00" },
+              ],
+            },
+            "POST",
+            catToken
+          ),
+        } as never);
+        ok(thbEntry.status === 201, "REG-CAT: THB deposit entry posted (201)");
+
+        const usdEntry = await journalRoute.action({
+          request: jsonBody(
+            {
+              entryDate: "2026-01-15",
+              description: "REG-CAT ฝากเงิน USD",
+              lines: [
+                { accountId: "1020", currency: "USD", debit: "1000.00", fxRateEffective: "35.0" },
+                { accountId: "3010", currency: "USD", credit: "1000.00", fxRateEffective: "35.0" },
+              ],
+            },
+            "POST",
+            catToken
+          ),
+        } as never);
+        ok(usdEntry.status === 201, "REG-CAT: USD deposit entry posted (201)");
+
+        // 2. ASSET summary, from 2026-01-11: THB opening 5000 (prior line),
+        //    USD movement 1000 (in-window), per-currency totals stay separate.
+        const assetRes = await callSummary(
+          "?type=ASSET&from=2026-01-11&to=2026-01-31"
+        );
+        const assetJson = (await assetRes.json()) as {
+          data?: {
+            type?: string;
+            from?: string | null;
+            to?: string | null;
+            summary?: {
+              rows: {
+                code: string;
+                opening: string;
+                debitMovement: string;
+                creditMovement: string;
+                netMovement: string;
+                closing: string;
+                lineCount: number;
+              }[];
+              totalsByCurrency: { currency: string; opening: string; movement: string; closing: string }[];
+            };
+          };
+        };
+        ok(assetRes.status === 200 && assetJson.data?.type === "ASSET", "REG-CAT: ASSET summary 200 + type echo");
+        const aRows = assetJson.data?.summary?.rows ?? [];
+        const cashThb = aRows.find((r) => r.code === "1010");
+        const cashUsd = aRows.find((r) => r.code === "1020");
+        ok(
+          cashThb?.opening === "5000.00" &&
+            cashThb?.netMovement === "0.00" &&
+            cashThb?.closing === "5000.00" &&
+            cashThb?.lineCount === 0,
+          "REG-CAT: prior-date THB line -> opening 5000 only (no period movement)"
+        );
+        ok(
+          cashUsd?.opening === "0.00" &&
+            cashUsd?.debitMovement === "1000.00" &&
+            cashUsd?.netMovement === "1000.00" &&
+            cashUsd?.closing === "1000.00" &&
+            cashUsd?.lineCount === 1,
+          "REG-CAT: ASSET (debit-normal) line in window -> movement +1000, closing 1000"
+        );
+        const t = assetJson.data?.summary?.totalsByCurrency ?? [];
+        const thbTot = t.find((x) => x.currency === "THB");
+        const usdTot = t.find((x) => x.currency === "USD");
+        ok(
+          thbTot?.closing === "5000.00" && usdTot?.closing === "1000.00",
+          "REG-CAT: totals grouped per currency (THB 5000 and USD 1000, never summed)"
+        );
+        ok(assetJson.data?.from === "2026-01-11" && assetJson.data?.to === "2026-01-31", "REG-CAT: response echoes from/to");
+
+        // 3. ASSET summary with from = the THB entry's OWN date: that line is
+        //    IN the period (ON `from` counts as period), opening empty.
+        const onFrom = await callSummary("?type=ASSET&from=2026-01-10&to=2026-01-31");
+        const onFromJson = (await onFrom.json()) as {
+          data?: { summary?: { rows: { code: string; opening: string; netMovement: string; lineCount: number }[] } };
+        };
+        const onFromThb = onFromJson.data?.summary?.rows.find((r) => r.code === "1010");
+        ok(
+          onFromThb?.opening === "0.00" &&
+            onFromThb?.netMovement === "5000.00" &&
+            onFromThb?.lineCount === 1,
+          "REG-CAT: line dated exactly ON `from` counts as period"
+        );
+
+        // 4. A SKIPPED journal header (no lines) never moves totals/counts.
+        const skippedRes = await client`
+          INSERT INTO journal_entries (id, user_id, entry_no, entry_date, description, source_type, status, created_at, updated_at, posting_state, skip_reason)
+          VALUES (gen_random_uuid(), ${catUserId},
+                  (SELECT COALESCE(MAX(entry_no), 0) + 1 FROM journal_entries WHERE user_id = ${catUserId}),
+                  '2026-01-20', 'REG-CAT SKIPPED header', 'STATEMENT', 'POSTED', now(), now(), 'SKIPPED', 'REG-CAT-unsupported')
+          RETURNING id`;
+        ok(skippedRes.length === 1, "REG-CAT: SKIPPED journal header inserted");
+        const asset2 = await callSummary("?type=ASSET&from=2026-01-11&to=2026-01-31");
+        const asset2Json = (await asset2.json()) as {
+          data?: { summary?: { rows: { code: string; closing: string; lineCount: number }[] } };
+        };
+        const afterSkipped = asset2Json.data?.summary?.rows.find((r) => r.code === "1010");
+        ok(
+          afterSkipped?.closing === "5000.00" && afterSkipped?.lineCount === 0,
+          "REG-CAT: SKIPPED entry (zero lines) has no effect on totals or lineCount"
+        );
+
+        // 5. EQUITY summary: credit-normal signed closing (3010 movement
+        //    positive for the credit-side deposit).
+        const eqRes = await callSummary("?type=EQUITY&from=2026-01-11&to=2026-01-31");
+        const eqJson = (await eqRes.json()) as {
+          data?: { summary?: { rows: { code: string; opening: string; netMovement: string; closing: string }[] } };
+        };
+        const eq3010 = eqJson.data?.summary?.rows.find((r) => r.code === "3010");
+        const eq3020 = eqJson.data?.summary?.rows.find((r) => r.code === "3020");
+        ok(
+          eq3010?.netMovement === "1000.00" && eq3010?.closing === "1000.00",
+          "REG-CAT: EQUITY 3010 credit-normal -> netMovement +1000"
+        );
+        ok(
+          eq3020?.opening === "5000.00" && eq3020?.netMovement === "0.00" && eq3020?.closing === "5000.00",
+          "REG-CAT: EQUITY 3020 prior credit -> opening 5000"
+        );
+
+        // 6. Cross-user isolation: user B's EPA posting never leaks into A.
+        const otherEmail = `catb-${randomUUID()}@test.local`;
+        const otherReg = await registerAs(otherEmail, "CatB!234567");
+        const otherJson = (await otherReg.json()) as { data?: { user?: { id?: string } } };
+        const otherUserId = otherJson.data?.user?.id;
+        if (otherUserId) smokeUserIds.push(otherUserId);
+        const otherLogin = await loginAs(otherEmail, "CatB!234567");
+        const otherToken = otherLogin.data?.accessToken as string | undefined;
+        if (otherToken) {
+          const otherEntry = await journalRoute.action({
+            request: jsonBody(
+              {
+                entryDate: "2026-01-20",
+                description: "REG-CAT อื่น",
+                lines: [
+                  { accountId: "1020", currency: "USD", debit: "2000.00", fxRateEffective: "35.0" },
+                  { accountId: "3010", currency: "USD", credit: "2000.00", fxRateEffective: "35.0" },
+                ],
+              },
+              "POST",
+              otherToken
+            ),
+          } as never);
+          ok(otherEntry.status === 201, "REG-CAT: second user's entry posted (201)");
+
+          const otherAsset = await summaryRoute.loader({
+            request: new Request(
+              "http://test.local/api/v1/ledger/accounts/summary?type=ASSET&from=2026-01-11&to=2026-01-31",
+              { headers: { Authorization: `Bearer ${otherToken}` } }
+            ),
+          } as never);
+          const otherAssetJson = (await otherAsset.json()) as {
+            data?: { summary?: { rows: { code: string; closing: string }[] } };
+          };
+          const otherUsd = otherAssetJson.data?.summary?.rows.find((r) => r.code === "1020");
+          ok(
+            otherUsd?.closing === "2000.00",
+            "REG-CAT: second user sees ONLY their own USD asset (2000)"
+          );
+
+          const mineAfter = await callSummary("?type=ASSET&from=2026-01-11&to=2026-01-31");
+          const mineJson = (await mineAfter.json()) as {
+            data?: { summary?: { rows: { code: string; closing: string }[] } };
+          };
+          const myUsd = mineJson.data?.summary?.rows.find((r) => r.code === "1020");
+          ok(
+            myUsd?.closing === "1000.00",
+            "REG-CAT: user A's summary never includes user B's 2000 (isolation)"
+          );
+        }
+
+        // 7. Invalid type / bad dates -> 400.
+        const badType = await callSummary("?type=REVENUE");
+        ok((badType as Response).status === 400, "REG-CAT: invalid type -> 400");
+        const badDate = await callSummary("?type=ASSET&from=2026-13-01");
+        ok((badDate as Response).status === 400, "REG-CAT: invalid ISO date -> 400");
+        for (const query of ["?type=ASSET&from=2026-02-30", "?type=ASSET&from=", "?type=ASSET&from=2026-02-01&to=2026-01-31"]) {
+          ok((await callSummary(query)).status === 400, "REG-CAT: impossible/empty/reversed date range -> 400");
+        }
+        const unauthenticated = await summaryRoute.loader({ request: new Request("http://test.local/api/v1/ledger/accounts/summary?type=ASSET") } as never);
+        ok(unauthenticated.status === 401, "REG-CAT: summary requires authentication");
+        ok((await summaryRoute.action({} as never)).status === 405, "REG-CAT: summary rejects mutations");
+
+        // Repeated account legs count as lines, not distinct journal entries.
+        for (const entryDate of ["2026-01-31", "2026-02-01"]) {
+          const entry = await journalRoute.action({ request: jsonBody({
+            entryDate, description: "REG-CAT cutoff and repeated legs",
+            lines: [
+              { accountId: "1020", currency: "USD", debit: "10", fxRateEffective: "35" },
+              { accountId: "1020", currency: "USD", debit: "20", fxRateEffective: "35" },
+              { accountId: "1020", currency: "USD", credit: "5", fxRateEffective: "35" },
+              { accountId: "3010", currency: "USD", credit: "25", fxRateEffective: "35" },
+            ],
+          }, "POST", catToken) } as never);
+          ok(entry.status === 201, "REG-CAT: cutoff fixture posted");
+        }
+        await client`UPDATE accounts SET opening_balance = 25 WHERE user_id = ${catUserId} AND code = '1020'`;
+        // Even a legacy SKIPPED header retaining lines must be excluded.
+        await client`
+          INSERT INTO journal_entry_lines (id, journal_entry_id, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective)
+          SELECT gen_random_uuid(), ${skippedRes[0].id}, user_id, account_id, currency, debit_amount, credit_amount, amount_thb, fx_rate_effective
+          FROM journal_entry_lines WHERE user_id = ${catUserId}`;
+        const bounded = await callSummary("?type=ASSET&from=2026-01-11&to=2026-01-31");
+        const boundedJson = await bounded.json() as { data: {
+          accounts: { id: string; userId: string; type: string }[];
+          summary: { rows: { accountId: string; code: string; opening: string; debitMovement: string; creditMovement: string; netMovement: string; closing: string; lineCount: number }[] };
+        } };
+        const boundedUsd = boundedJson.data.summary.rows.find((r) => r.code === "1020");
+        ok(boundedUsd?.opening === "25.00" && boundedUsd.debitMovement === "1030.00" && boundedUsd.creditMovement === "5.00" && boundedUsd.netMovement === "1025.00" && boundedUsd.closing === "1050.00" && boundedUsd.lineCount === 4,
+          "REG-CAT: stored opening, inclusive end, future exclusion, exact repeated-leg count, SKIPPED lines excluded");
+        ok(boundedJson.data.accounts.every((a) => a.userId === catUserId && a.type === "ASSET") && boundedJson.data.accounts.length === boundedJson.data.summary.rows.length,
+          "REG-CAT: one response includes owned category account metadata and all summaries");
+      }
+    }
+  }
+
   // ================= REG: THB EQUITY (3020) + SKIPPED-EQUITY RECONCILE =================
   // THB owner deposits can now be posted: the default chart of accounts includes
   // 3020 (THB owner capital). This proves through the REAL routes + service that

@@ -1992,8 +1992,85 @@ ok(
     accountCategoryView.includes('placeholder="ค้นหารหัส ชื่อ หรือสกุลเงิน…"') &&
     accountCategoryView.includes("พบ {filteredAccounts.length} จาก {accounts.length} บัญชี") &&
     accountCategoryView.includes("ไม่พบรายการที่ค้นหา") &&
-    accountCategoryView.includes("{filteredAccounts.map((row) => ("),
+    accountCategoryView.includes("{filteredAccounts.map((row) => {"),
   "AccountCategoryView account list has the same client-side search"
+);
+ok(
+  routesFile.includes("api/v1/ledger/accounts/summary"),
+  "batch account-category summary route is registered (static segment outranks :accountId)"
+);
+{
+  const summaryRoute = read("app/routes/api/ledger.accounts.summary.ts");
+  ok(
+    summaryRoute.includes("getAccountCategorySummary") &&
+      summaryRoute.includes("ACCOUNT_TYPES") &&
+      summaryRoute.includes('["ASSET", "LIABILITY", "EQUITY", "INCOME", "EXPENSE"]') &&
+      summaryRoute.includes("isValidIsoDate") &&
+      summaryRoute.includes("seedDefaultChartOfAccounts") &&
+      summaryRoute.includes('status: 405') &&
+      summaryRoute.includes("Method not allowed"),
+    "summary route validates type + ISO dates, seeds CoA, GET-only 405"
+  );
+}
+ok(
+  ledgerService.includes("getAccountCategorySummary") &&
+    ledgerService.includes("inArray(journalEntryLines.accountId, ids)") &&
+    ledgerService.includes("summarizeAccountLedgers(inputs, lines, from)"),
+  "ledger-service fetchless batch service: one inArray query + pure engine partition"
+);
+ok(
+  generalLedger.includes("export function summarizeAccountLedgers") &&
+    generalLedger.includes("AccountLedgerSummaryRow") &&
+    generalLedger.includes("AccountLedgerSummaryCurrencyTotal") &&
+    generalLedger.includes("debitMovement") &&
+    generalLedger.includes("creditMovement") &&
+    generalLedger.includes("netMovement") &&
+    generalLedger.includes("lineCount"),
+  "pure engine exports the batch summary (native-currency rows + grouped totals)"
+);
+ok(
+  serverApi.includes("fetchAccountCategorySummary") &&
+    serverApi.includes("GeneralLedgerAccountCategorySummary") &&
+    serverApi.includes("/api/v1/ledger/accounts/summary?") &&
+    serverApi.includes("import(\"./general-ledger\").AccountLedgerSummaryRow"),
+  "server-api client has the batch category-summary fetch + types"
+);
+ok(
+  accountCategoryView.includes("fetchAccountCategorySummary") &&
+    !accountCategoryView.includes("fetchAccounts(") &&
+    accountCategoryView.includes("setAccounts(summary.accounts)") &&
+    accountCategoryView.includes("new Map<string, GeneralLedgerAccountCategoryRow>()") &&
+    accountCategoryView.includes("summaryRows.get(row.id)") &&
+    accountCategoryView.includes("categoryTotals") &&
+    accountCategoryView.includes("ยอดคงเหลือตามสกุล") &&
+    accountCategoryView.includes("ดูรายละเอียด"),
+  "AccountCategoryView: batch summary fetched in loadAccounts, row map, per-currency totals"
+);
+ok(
+  accountCategoryView.includes("<th className=\"px-5 py-3 font-medium text-right\">ยอดยกมา</th>") &&
+    accountCategoryView.includes("<th className=\"px-5 py-3 font-medium text-right\">เคลื่อนไหว</th>") &&
+    accountCategoryView.includes("<th className=\"px-5 py-3 font-medium text-right\">ยอดคงเหลือ</th>") &&
+    accountCategoryView.includes("<th className=\"px-5 py-3 font-medium text-right\">จำนวนรายการ</th>"),
+  "category table headers: ยอดยกมา / เคลื่อนไหว / ยอดคงเหลือ / จำนวนรายการ"
+);
+ok(
+  accountCategoryView.includes("{s ? formatAmount(s.opening) : \"-\"}") &&
+    accountCategoryView.includes("{s ? formatSignedAmount(s.netMovement) : \"-\"}") &&
+    accountCategoryView.includes("{s ? formatSignedAmount(s.closing) : \"-\"}") &&
+    accountCategoryView.includes('{s ? s.lineCount : "-"}'),
+  "category cells render server summary verbatim (opening/movement/closing/count)"
+);
+ok(
+  !accountCategoryView.includes("ยอดยกมารวม") &&
+    !accountCategoryView.includes("formatBaht") &&
+    accountCategoryView.includes("filteredAccounts.map((row) => {"),
+  "no fake ฿ total; list renders from the batch-summary row map"
+);
+ok(
+  accountCategoryView.includes("ยอดคงเหลือตามสกุล") &&
+    accountCategoryView.includes("(ยกมา {formatAmount(t.opening)}") &&
+    accountCategoryView.includes("{formatSignedAmount(t.movement)})"),
+  "per-currency totals card shows opening/movement/close labels"
 );
 ok(
   journalTab.includes("matchesSearch") &&
