@@ -1188,6 +1188,14 @@ export async function verifyStatementImportPersistence(input: {
     .groupBy(journalEntries.sourceTransactionId)
     .execute();
 
+  proof.journalEntries = journalProof.reduce(
+    (sum, row) => sum + row.total,
+    0
+  );
+  proof.duplicateJournalTransactions = journalProof
+    .filter((row) => row.total > 1)
+    .map((row) => row.sourceTransactionId ?? "");
+
   proof.ok =
     proof.missingRows.length === 0 &&
     proof.capitalRows === insertedCount &&
