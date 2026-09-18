@@ -136,7 +136,39 @@ async function loginAs(email: string, password: string) {
   return body;
 }
 
-// Register a user through the REAL route, each call from its OWN random client
+// Deterministic client-IP allocators for the rate-limit integration tests.
+// RANDOM TEST-NET IPs are flaky: a value can be reused for TWO scenarios, in
+// which case the second scenario's evidence lands on the FIRST scenario's
+// rate-limit bucket and the AUTH assertions fail nondeterministically (CI
+// proved it: test:w2 failed twice with different AUTH results — failures moved
+// between spray-reset #8 and repeated-success #9 while auth code was unchanged,
+// and PR #35 passed the same suite). Each allocator issues addresses from its
+// RFC 5737 TEST-NET range exactly once per process via a monotonic counter:
+//   - registerAsIp : 198.51.100.10..254  (one per registerAs setup call)
+//   - rlIp         : 203.0.113.10..254   (one per AUTH scenario)
+// Reusing the SAME stored value inside one scenario (e.g. `const ip = rlIp()`
+// then several requests with `ip`) still shares that bucket on purpose. If a
+// run would need more distinct IPs than the range holds, it throws instead of
+// wrapping around and silently colliding again.
+const TEST_NET_BASE_OCTET = 9; // first allocation yields ...10
+const TEST_NET_MAX_OCTET = 254;
+function createTestNetIpAllocator(prefix: string): () => string {
+  let octet = TEST_NET_BASE_OCTET;
+  return () => {
+    octet += 1;
+    if (octet > TEST_NET_MAX_OCTET) {
+      throw new Error(
+        `test IP allocator exhausted for ${prefix}0/24 (used ${octet - TEST_NET_BASE_OCTET} addresses) — ` +
+          "refusing to wrap/reuse an address; grow the TEST-NET range instead."
+      );
+    }
+    return `${prefix}${octet}`;
+  };
+}
+const rlIp = createTestNetIpAllocator("203.0.113.");
+const registerAsIp = createTestNetIpAllocator("198.51.100.");
+
+// Register a user through the REAL route, each call from its OWN unique client
 // IP. The register rate-limit budget is per-IP (register-ip:<ip>), so harness
 // account-creation must spread across distinct IPs — if every setup call used
 // the same "unknown" bucket, the 10-per-window cap would 429 the suite's own
@@ -144,7 +176,7 @@ async function loginAs(email: string, password: string) {
 // (which pin a shared IP on purpose).
 async function registerAs(email: string, password: string) {
   const registerRoute = await import("../app/routes/api/auth/register");
-  const ip = `198.51.100.${Math.floor(Math.random() * 240) + 10}`;
+  const ip = registerAsIp();
   return await registerRoute.action({
     request: new Request("http://test.local/api/v1/auth/register", {
       method: "POST",
@@ -1502,7 +1534,7 @@ async function main() {
     const { randomUUID } = await import("node:crypto");
     const smokeEmail = `smoke-${randomUUID()}@test.local`;
     const smokePassword = "SmokePass!234";
-    // Per-call random client IP (like registerAs) — the register budget is per-IP.
+    // Per-call unique client IP (like registerAs) — the register budget is per-IP.
     const post = (email: string, password: string) =>
       registerAs(email, password);
 
@@ -1569,7 +1601,6 @@ async function main() {
           body: JSON.stringify({ email, password }),
         }),
       } as never);
-    const rlIp = () => `203.0.113.${Math.floor(Math.random() * 200) + 10}`;
 
     // 1. Concurrent registration of the SAME email resolves atomically:
     //    exactly one 201 and the rest 409 EMAIL_ALREADY_EXISTS (whether via the
