@@ -192,6 +192,7 @@ interface ResolvedAccount {
   id: string;
   code: string;
   currency: string;
+  type: string;
 }
 
 /**
@@ -204,7 +205,7 @@ async function loadAccountLookup(userId: string): Promise<Map<string, ResolvedAc
   const rows = await getActiveAccounts(userId);
   const map = new Map<string, ResolvedAccount>();
   for (const r of rows) {
-    const resolved = { id: r.id, code: r.code, currency: r.currency };
+    const resolved = { id: r.id, code: r.code, currency: r.currency, type: r.type };
     map.set(r.id, resolved);
     map.set(r.code, resolved);
   }
@@ -227,6 +228,13 @@ function resolveEntryAccountIds(
     if (!account) {
       errors.push(`line[${i}]: unknown account ${JSON.stringify(ref)}`);
       return line;
+    }
+    if (account.currency !== line.currency.trim().toUpperCase()) {
+      errors.push(`line[${i}]: account ${account.code} is ${account.currency}-denominated but the line is ${line.currency}`);
+    }
+    if (input.detail?.isFxConversion === true &&
+      (account.type !== "ASSET" || !["1010", "1020"].includes(account.code))) {
+      errors.push(`line[${i}]: currency exchange requires a compatible cash asset account`);
     }
     return { ...line, accountId: account.id };
   });
@@ -508,7 +516,12 @@ export async function insertManualCashJournal(
   };
   const resolved = resolveEntryAccountIds(entryInput, lookup);
   if (!resolved.ok) {
-    return { ok: false, errors: resolved.errors };
+    return insertBackfilledJournalEntry(userId, {
+      ...entryInput, sourceType: "MANUAL", sourceDocumentId: null,
+      sourceTransactionId: input.transactionId, type: input.type,
+      postingState: "SKIPPED", skipReason: resolved.errors.join("; "),
+      detail: manualCashDetail(input),
+    });
   }
   const validated = validateJournalEntry({
     ...entryInput,
@@ -564,7 +577,7 @@ export async function insertManualCashJournal(
           isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
-          type: input.type,
+          type: entry.detail.isFxConversion ? null : input.type,
           createdAt: now,
           updatedAt: now,
         })
@@ -688,7 +701,7 @@ export async function insertBackfilledJournalEntry(
           isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
-          type: input.type,
+          type: entry.detail.isFxConversion ? null : input.type,
           createdAt: now,
           updatedAt: now,
         })
@@ -711,9 +724,9 @@ export async function insertBackfilledJournalEntry(
  * Sync the linked journal entry when a capital-ledger row is edited (PUT).
  * Updates the money/date/currency/type header fields so every journal-based
  * read stays fresh, and rebuilds the two-line equity entry (cash + owner
- * equity) so the manual rows and the cash summary stay correct. Statement
- * multi-leg entries keep their original posting lines untouched (the GL remains
- * balanced; only the header detail is refreshed). Best-effort: never throws.
+ * equity) so the manual rows and cash summary stay correct. Resolve currencies
+ * and account UUIDs before replacing anything; unsupported accounts produce a
+ * SKIPPED record. Statement entries are untouched. Best-effort: never throws.
  */
 export async function syncCapitalLedgerJournal(
   userId: string,
@@ -735,89 +748,43 @@ export async function syncCapitalLedgerJournal(
     if (entries.length === 0) return;
 
     const { id: entryId } = entries[0];
-    const detail = manualCashDetail(current);
-    await db
-      .update(journalEntries)
-      .set({
-        entryDate: current.transactionDate,
-        description:
-          current.type === "CASH_IN" ? "ฝากเงินเข้าบัญชี" : "ถอนเงินจากบัญชี",
-        currency: current.currency,
-        amount: detail.amount,
-        amountThb: detail.amountThb,
-        fxRateEffective: detail.fxRateEffective,
-        type: current.type,
-        category: detail.category,
-        section: detail.section,
-        symbol: detail.symbol,
-        side: detail.side,
-        exchange: detail.exchange,
-        quantity: detail.quantity,
-        unitPrice: detail.unitPrice,
-        grossAmount: detail.grossAmount,
-        fees: detail.fees,
-        netAmount: detail.netAmount,
-        proceeds: detail.proceeds,
-        costBasis: detail.costBasis,
-        realizedGainLoss: detail.realizedGainLoss,
-        realizedGainLossThb: detail.realizedGainLossThb,
-        averageCost: detail.averageCost,
-        isFxConversion: detail.isFxConversion,
-        isMonthlyFeeAggregate: detail.isMonthlyFeeAggregate,
+    const lookup = await loadAccountLookup(userId);
+    const candidate: JournalEntryInput = {
+      entryDate: current.transactionDate,
+      description: current.type === "CASH_IN" ? "ฝากเงินเข้าบัญชี" : "ถอนเงินจากบัญชี",
+      sourceType: "MANUAL", sourceTransactionId: transactionId,
+      lines: manualCashLines(current), detail: manualCashDetail(current),
+    };
+    const resolved = resolveEntryAccountIds(candidate, lookup);
+    const validated = resolved.ok
+      ? validateJournalEntry({ ...candidate, lines: resolved.lines })
+      : validateJournalEntry({ ...candidate, lines: [], postingState: "SKIPPED",
+          skipReason: resolved.errors.join("; ") });
+    if (!validated.ok) return;
+    const entry = validated.entry;
+    // Resolve/validate first, then atomically replace headers and UUID-backed lines.
+    await db.transaction(async tx => {
+      const [owned] = await tx.select({ id: journalEntries.id }).from(journalEntries)
+        .where(and(eq(journalEntries.id, entryId), eq(journalEntries.userId, userId),
+          eq(journalEntries.sourceType, "MANUAL"))).for("update");
+      if (!owned) return;
+      await tx.update(journalEntries).set({
+        ...entry.detail, entryDate: entry.entryDate, description: entry.description,
+        type: current.type, postingState: entry.postingState, skipReason: entry.skipReason,
         updatedAt: new Date().toISOString(),
-      })
-      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
-      .execute();
-
-    // Two-line equity entries (manual cash rows) get their legs rebuilt to the
-    // new amount/fx. Multi-leg statement entries keep the balanced lines.
-    const lineCount = (
-      await db
-        .select({
-          c: sql`COUNT(*)`.as<number>("c"),
-        })
-        .from(journalEntryLines)
-        .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.userId, userId)))
-        .execute()
-    )[0]?.c ?? 0;
-    if (lineCount === 2) {
-      await db
-        .delete(journalEntryLines)
-        .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.userId, userId)))
-        .execute();
-      const entry = validateJournalEntry({
-        entryDate: current.transactionDate,
-        description:
-          current.type === "CASH_IN" ? "ฝากเงินเข้าบัญชี" : "ถอนเงินจากบัญชี",
-        sourceType: "MANUAL",
-        sourceTransactionId: current.transactionId,
-        lines: manualCashLines(current),
-        postingState: "POSTED",
-        skipReason: null,
-        detail,
-      });
-      if (entry.ok) {
-        for (const line of entry.entry.lines) {
-          await db
-            .insert(journalEntryLines)
-            .values({
-              id: randomUUID(),
-              journalEntryId: entryId,
-              userId,
-              accountId: line.accountId,
-              currency: line.currency,
-              debitAmount: line.side === "DEBIT" ? line.amount : null,
-              creditAmount: line.side === "CREDIT" ? line.amount : null,
-              amountThb: line.amountThb,
-              fxRateEffective: line.fxRateEffective,
-              fxRateStatement: line.fxRateStatement,
-              fxRateProvider: line.fxRateProvider,
-              memo: line.memo,
-            })
-            .execute();
-        }
+      }).where(and(eq(journalEntries.id, entryId), eq(journalEntries.userId, userId)));
+      await tx.delete(journalEntryLines)
+        .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.userId, userId)));
+      for (const line of entry.lines) {
+        await tx.insert(journalEntryLines).values({
+          id: randomUUID(), journalEntryId: entryId, userId, accountId: line.accountId,
+          currency: line.currency, debitAmount: line.side === "DEBIT" ? line.amount : null,
+          creditAmount: line.side === "CREDIT" ? line.amount : null, amountThb: line.amountThb,
+          fxRateEffective: line.fxRateEffective, fxRateStatement: line.fxRateStatement,
+          fxRateProvider: line.fxRateProvider, memo: line.memo,
+        });
       }
-    }
+    });
   } catch (error) {
     console.error("syncCapitalLedgerJournal: failed to sync entry", safeErrorLog(error));
   }
@@ -1099,7 +1066,7 @@ export async function insertStatementImport(
           isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
           postingState: entry.postingState,
           skipReason: entry.skipReason,
-          type: plan.row.type,
+          type: entry.detail.isFxConversion ? null : plan.row.type,
           createdAt: now,
           updatedAt: now,
         })
@@ -1903,7 +1870,9 @@ export async function reverseJournalEntry(
     sourceTransactionId: header.sourceTransactionId,
     postingState: "POSTED",
     skipReason: null,
-    detail: emptyTradeDetail(),
+    detail: { ...emptyTradeDetail(), isFxConversion: header.isFxConversion,
+      category: header.category, currency: header.currency, amount: header.amount,
+      exchangeFromCurrency: header.exchangeFromCurrency, exchangeFromAmount: header.exchangeFromAmount },
     lines: lineRows.map((l) => ({
       accountId: l.accountId,
       currency: l.currency,
@@ -1923,6 +1892,7 @@ export async function reverseJournalEntry(
     description: candidate.description,
     sourceType: "MANUAL",
     sourceTransactionId: candidate.sourceTransactionId,
+    detail: candidate.detail,
     lines: candidate.lines.map((l) => ({
       accountId: l.accountId,
       currency: l.currency,

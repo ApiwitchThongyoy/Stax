@@ -18,6 +18,7 @@
 // suite performs ZERO queries (pure functions only). Run:
 //   npx tsx scripts/test-statement-tax-recon.mts
 import "./_load-env.mjs";
+import { validateJournalEntry } from "../app/lib/general-ledger";
 import { realizedAmounts } from "../app/lib/accounting-amounts";
 
 import {
@@ -406,12 +407,15 @@ async function main() {
     !r3eEntry.entry.lines.some((l) => l.fxRateEffective === "1" || l.fxRateEffective === 1),
     "R3 (E) no posted line ever carries an invented rate of 1 for the unknown-FX row"
   );
-  // Control: a THB row with the same shape still posts normally.
+  // R3 still pins THB to 1; R7 separately refuses the USD-only income account.
   const r3eThb = map(txn({ category: "income", currency: "THB", amount: 100 }));
   ok(
-    postCapitalRow(r3eThb).ok === true &&
-      buildStatementJournalEntries([r3eThb])[0].postingState === "POSTED",
-    "R3 (E) control: a THB row still posts normally"
+    r3eThb.fxRateEffective === "1" &&
+      validateJournalEntry({ entryDate: r3eThb.transactionDate, description: "THB control",
+        lines: [{ accountId: "thb-cash", currency: "THB", debit: "100" },
+          { accountId: "thb-income", currency: "THB", credit: "100" }] }).ok &&
+      buildStatementJournalEntries([r3eThb])[0].postingState === "SKIPPED",
+    "R3 (E): THB needs no foreign FX; R7 rejects the USD-only income account"
   );
 
   // ---- Gain/loss backfill: heal FROZEN SELL rows (out-of-order imports) ----

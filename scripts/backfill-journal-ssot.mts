@@ -230,7 +230,7 @@ async function backfillUser(
           .set({
             sourceTransactionId: row.transactionId,
             sourceDocumentId: row.sourceDocumentId,
-            type: row.type,
+            type: detail.isFxConversion ? null : row.type,
             category: detail.category,
             section: detail.section,
             symbol: detail.symbol,
@@ -264,6 +264,7 @@ async function backfillUser(
 
     const isManualCash =
       row.sourceType === "MANUAL" &&
+      !journalDetailOf(validated).isFxConversion &&
       (row.type === "CASH_IN" || row.type === "CASH_OUT");
 
     if (candidates.length > 1) {

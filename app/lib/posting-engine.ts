@@ -48,12 +48,10 @@
 //                         parser for a deterministic TRUE/FALSE. The rule keys
 //                         on the provenance flag, NOT a section-name match.
 //
-// Currency-exchange-only rows (category "asset", no side) are NOT auto-posted —
-// they would break the agreed per-currency balance rule inside one entry. With
-// journal-as-SSOT they are instead recorded as a SKIPPED journal entry (full
-// trade detail, zero lines) so every imported row is still present in the journal.
+// Confirmed currency exchanges post cash-to-cash only when their persisted THB
+// legs balance. Missing source data/rates or incompatible accounts stay SKIPPED.
 import type { ValidatedCapitalRow } from "./statement-pipeline";
-import { validateJournalEntry } from "./general-ledger";
+import { validateJournalEntry, DEFAULT_CHART_OF_ACCOUNTS } from "./general-ledger";
 import type {
   JournalEntryInput,
   JournalLineInput,
@@ -247,6 +245,19 @@ function expenseAccountFor(row: ValidatedCapitalRow): string {
 
 /** Category-aware rule dispatch. Pure. */
 export function postCapitalRow(row: ValidatedCapitalRow): CapitalPostingResult {
+  const result = postCapitalRowUnchecked(row);
+  if (!result.ok) return result;
+  // Automatic postings use only the established role/code and exact currency.
+  const accounts = new Map(DEFAULT_CHART_OF_ACCOUNTS.map(a => [a.code, a.currency]));
+  for (const line of result.entry.lines) {
+    if (accounts.get(line.accountId) !== line.currency) {
+      return { ok: false, reason: `no compatible ${line.currency} account for ${line.accountId} - not posted` };
+    }
+  }
+  return result;
+}
+
+function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult {
   const category = (row.category ?? "").trim().toLowerCase();
   const amount = row.amountForeign;
 
@@ -391,10 +402,41 @@ export function postCapitalRow(row: ValidatedCapitalRow): CapitalPostingResult {
         reason: "SELL without trustworthy cost basis / realized gain - NON_COMPUTABLE, not posted",
       };
     }
-    // Currency-exchange-only rows: not auto-posted.
+    // Only explicit source/received amounts identify a computable exchange.
+    const from = row.exchangeFromCurrency;
+    const sourceAccount = from === "THB" ? CASH_THB : from === "USD" ? CASH_USD : null;
+    const targetAccount = row.currency === "THB" ? CASH_THB : row.currency === "USD" ? CASH_USD : null;
+    let sent: Decimal;
+    let received: Decimal;
+    let sourceFx: Decimal;
+    try {
+      sent = new Decimal(row.exchangeFromAmount ?? "");
+      received = new Decimal(row.amountForeign);
+      // For USD -> THB, the explicit statement exchange rate supplies THB/USD.
+      // Never derive reporting FX from a ratio merely to force balance.
+      sourceFx = from === "THB" ? new Decimal(1) : new Decimal(row.exchangeRate ?? "");
+    } catch {
+      return { ok: false, reason: "currency exchange lacks source amount or source reporting FX" };
+    }
+    if (!sourceAccount || !targetAccount || from === row.currency ||
+      !sent.isFinite() || !sent.gt(0) || !received.isFinite() || !received.gt(0) ||
+      !sourceFx.isFinite() || !sourceFx.gt(0)) {
+      return { ok: false, reason: "currency exchange has unsupported currency or invalid amounts/rate" };
+    }
     return {
-      ok: false,
-      reason: "currency exchange rows are not auto-posted (per-currency balance rule)",
+      ok: true,
+      entry: {
+        entryDate: row.transactionDate, description: descriptionFor(row),
+        sourceType: "STATEMENT", sourceDocumentId: row.sourceDocumentId,
+        sourceTransactionId: row.transactionId, detail: journalDetailOf(row),
+        lines: [
+          leg(targetAccount, "debit", received.toFixed(2), row),
+          leg(sourceAccount, "credit", sent.toFixed(2), {
+            currency: from!, fxRateEffective: sourceFx.toString(),
+            fxRateStatement: from === "THB" ? "1" : row.exchangeRate,
+          }),
+        ],
+      },
     };
   }
 

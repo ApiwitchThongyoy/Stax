@@ -71,7 +71,8 @@ export async function runUserIsolationTests(
     const fixtures = new Map<string, { cash: string; entry: string; account: string; trade: string }>();
     for (const [id, auth, amount] of [[a, ta, "100"], [b, tb, "900"]]) {
       const cash = await call("capital-ledgers", "POST", auth, {}, {
-        amountForeign: amount, currency: "THB", transactionDate: "2026-01-01", fxRateBot: "1", amountThb: amount,
+        // Use supported USD cash/equity accounts; rate 1 is explicit fixture data.
+        amountForeign: amount, currency: "USD", transactionDate: "2026-01-01", fxRateBot: "1", amountThb: amount,
         type: "CASH_IN", sourceType: "MANUAL", userId: b,
       });
       check(cash.status === 201 && cash.body.data.userId === id, `${amount} cash fixture uses authenticated owner`);
@@ -199,7 +200,8 @@ export async function runUserIsolationTests(
     }
     await sql`DELETE FROM journal_entry_lines WHERE id IN (${rogue1},${rogue2}) AND user_id=${a}`;
     const ownLedger = await call("ledger.$accountId", "GET", tb, { accountId: fb.account });
-    check(ownLedger.status === 200 && ownLedger.body.data.lines.length === 1, "B can read own account ledger");
+    // Both supported USD cash and income fixtures now use this USD cash account.
+    check(ownLedger.status === 200 && ownLedger.body.data.lines.length === 2, "B can read own account ledger");
     const ownDoc = await call("documents.$id.transactions", "GET", tb, { id: docB });
     check(ownDoc.status === 200 && ownDoc.body.data.transactions.length === 1, "B can read own document transactions");
 

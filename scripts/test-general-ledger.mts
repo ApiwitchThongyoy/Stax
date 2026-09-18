@@ -411,6 +411,69 @@ async function main() {
   ok(!thbEdge.ok && thbEdge.errors.some(e => e.includes("THB does not balance")),
     "R5: native-balanced entry rejected when THB .35 + .35 != .71");
 
+  // R6/R7: only genuine marked exchanges use reporting-currency balance.
+  const parsedExchange = parseStatementRows([
+    "CURRENCY EXCHANGE RECORDS",
+    "01/01/2026 10:00:00,GMT+07 THB 35,000.00 USD 1,000.00 35.0000",
+    "DIVIDENDS",
+  ]).transactions.find(t => t.exchangeFromCurrency === "THB");
+  const mappedExchange = parsedExchange ? mapToCapitalRow(parsedExchange, "user-1", "doc-1") : null;
+  ok(mappedExchange?.ok === true && mappedExchange.row.type === "FX_CONVERSION" &&
+    buildStatementJournalEntries([mappedExchange.row])[0].postingState === "POSTED",
+    "R6: real parser -> pipeline -> posting recognizes THB-to-USD transfer");
+  const fxRow = baseRow({ category: "asset", side: null, type: "FX_CONVERSION",
+    amountForeign: "1000.00", exchangeFromCurrency: "THB", exchangeFromAmount: "35000.00",
+    exchangeRate: "35", fxRateEffective: "35" });
+  const fxPlan = buildStatementJournalEntries([fxRow])[0];
+  const fxValidated = validateJournalEntry(fxPlan.entry);
+  ok(fxPlan.postingState === "POSTED" && fxValidated.ok &&
+    fxValidated.entry.lines.some(l => l.accountId === "1020" && l.currency === "USD" &&
+      l.side === "DEBIT" && l.amount === "1000.00" && l.amountThb === "35000.00") &&
+    fxValidated.entry.lines.some(l => l.accountId === "1010" && l.currency === "THB" &&
+      l.side === "CREDIT" && l.amount === "35000.00" && l.amountThb === "35000.00"),
+    "R6: THB 35000 -> USD 1000 posts distinct native amounts and equal THB totals");
+  const badFx = buildStatementJournalEntries([{ ...fxRow, fxRateEffective: "34.50" }])[0];
+  ok(badFx.postingState === "SKIPPED" && badFx.entry.lines.length === 0 &&
+    !!badFx.reason?.includes("THB does not balance"),
+    "R6: reporting FX 34.50 cannot balance THB 34500 against 35000");
+  ok(!validateJournalEntry({ ...fxPlan.entry, detail: { isFxConversion: false } }).ok,
+    "R6: unmarked cross-currency entries retain native balance checks");
+  ok(!validateJournalEntry({ entryDate: "2026-01-01", description: "normal native mismatch",
+    lines: [{ accountId: "1020", currency: "USD", debit: "100", fxRateEffective: "35" },
+      { accountId: "3010", currency: "USD", credit: "50", fxRateEffective: "70" }] }).ok,
+    "R5/R6: ordinary USD entry must balance natively even if THB totals match");
+  ok(!validateJournalEntry({ ...fxPlan.entry, detail: { ...fxPlan.entry.detail, amount: "999" } }).ok,
+    "R6: flag alone cannot bypass mismatched exchange details");
+  const currencyMap = new Map(DEFAULT_CHART_OF_ACCOUNTS.map(a => [a.code, a.currency]));
+  ok(!validateJournalEntry({ entryDate: "2026-01-01", description: "bad THB",
+    lines: [{ accountId: "1020", currency: "THB", debit: "100" },
+      { accountId: "3010", currency: "THB", credit: "100" }] }, currencyMap).ok,
+    "R7: validator rejects THB in USD accounts");
+  ok(!validateJournalEntry({ entryDate: "2026-01-01", description: "bad USD",
+    lines: [{ accountId: "1010", currency: "USD", debit: "100", fxRateEffective: "35" },
+      { accountId: "3010", currency: "USD", credit: "100", fxRateEffective: "35" }] }, currencyMap).ok,
+    "R7: validator rejects USD in THB cash account");
+  if (fxValidated.ok) {
+    const reverse = buildReversal(fxValidated.entry);
+    const reversed = validateJournalEntry({ ...reverse,
+      lines: reverse.lines.map(l => ({ accountId: l.accountId, currency: l.currency,
+        debit: l.side === "DEBIT" ? l.amount : null, credit: l.side === "CREDIT" ? l.amount : null,
+        fxRateEffective: l.fxRateEffective })) }, currencyMap);
+    ok(reversed.ok && reversed.entry.detail.isFxConversion &&
+      reversed.entry.detail.currency === "THB" && reversed.entry.lines.length === 2,
+      "R6/R7: reversal swaps exchange details and keeps compatible currencies");
+  }
+  for (const row of [
+    baseRow({ category: "equity", currency: "THB", fxRateEffective: "1" }),
+    baseRow({ category: "asset", side: "BUY", currency: "THB", fxRateEffective: "1", quantity: "1", unitPrice: "100" }),
+    baseRow({ category: "expense", currency: "THB", fxRateEffective: "1" }),
+    baseRow({ category: "income", currency: "THB", fxRateEffective: "1" }),
+  ]) {
+    const plan = buildStatementJournalEntries([row])[0];
+    ok(plan.postingState === "SKIPPED" && plan.entry.lines.length === 0 && !!plan.reason?.includes("compatible"),
+      `R7: unsupported THB ${row.category}/${row.side ?? ""} remains SKIPPED with no incompatible lines`);
+  }
+
   // Dividend income (no symbol) -> dividend account, memo carries the ticker.
   const div = postCapitalRow(baseRow({}));
   ok(div.ok && div.entry.lines.length === 2, "dividend income posts two legs");

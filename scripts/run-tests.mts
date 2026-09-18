@@ -4099,6 +4099,8 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
   // ================= CLEANUP =================
   const { runStatementDeleteTests } = await import("./statement-delete-db.mjs");
   await runStatementDeleteTests(client, ok, makePdf);
+  const { runCurrencyExchangeTests } = await import("./r6-r7-db.mjs");
+  await runCurrencyExchangeTests(client, ok);
 
   console.log("\n=== CLEANUP ===");
   const cleanIds: string[] = [];

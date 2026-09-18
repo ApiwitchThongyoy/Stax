@@ -22,7 +22,7 @@ Decimal.set({ precision: 40 });
 export const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"] as const;
 export const VALID_SOURCE_TYPES = ["MANUAL", "AI_PARSED"] as const;
 
-export type ParsedCapitalType = (typeof VALID_TRANSACTION_TYPES)[number];
+export type ParsedCapitalType = (typeof VALID_TRANSACTION_TYPES)[number] | "FX_CONVERSION";
 
 export interface ValidatedCapitalRow {
   transactionId: string;
@@ -165,7 +165,8 @@ export function mapToCapitalRow(
   // received), so it is category-aware, not sign-only. Every other category
   // keeps sign-only direction (negative amount = money out).
   const isMoneyOut = t.category === "expense" ? t.amount > 0 : t.amount < 0;
-  const type = isMoneyOut ? "CASH_OUT" : "CASH_IN";
+  const type = t.category === "asset" && t.side == null
+    ? "FX_CONVERSION" : isMoneyOut ? "CASH_OUT" : "CASH_IN";
 
   // Deterministic realized gain/loss (Decimal arithmetic). Only a SELL row with
   // a computable cost basis carries a value; anything else stays null (honest

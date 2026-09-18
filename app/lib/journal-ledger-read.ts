@@ -76,7 +76,7 @@ export function journalEntryToCapitalRow(e: CapitalJournalRecord) {
     transactionDate: e.entryDate,
     fxRateBot: null,
     amountThb: e.amountThb,
-    type: e.type,
+    type: e.isFxConversion ? null : e.type,
     sourceType: e.sourceType === "MANUAL" ? "MANUAL" : "AI_PARSED",
     sourceDocumentId: e.sourceDocumentId,
     category: e.category,
@@ -246,7 +246,7 @@ export async function listCashSummaryRows(
 /**
  * Currency-exchange rows for a user, read from the journal (SSOT). These are
  * STATEMENT rows the parser tagged category 'asset' with no side
- * (is_fx_conversion), recorded in the journal as SKIPPED entries but carrying
+ * (is_fx_conversion), recorded as POSTED or explicitly SKIPPED entries carrying
  * the full exchange detail — the cash page shows them in their own section,
  * never mixed into the equity money-movement totals. Ordered chronologically.
  */

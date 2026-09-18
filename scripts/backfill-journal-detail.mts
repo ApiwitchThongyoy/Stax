@@ -319,7 +319,10 @@ async function backfillUser(
     // The capital type (CASH_IN/CASH_OUT) is part of the SSOT record; fill it
     // only when the entry has none so general-ledger manual rows are untouched
     // (they carry no source link and never reach this loop anyway).
-    if (entry.type === null && cap.type !== null) {
+    if (detail.isFxConversion && entry.type !== null) {
+      patch.type = null;
+      changed = true;
+    } else if (!detail.isFxConversion && entry.type === null && cap.type !== null) {
       patch.type = cap.type;
       changed = true;
     }

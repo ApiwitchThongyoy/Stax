@@ -252,7 +252,8 @@ export type JournalEntryValidation =
  * transport-safe way.
  */
 export function validateJournalEntry(
-  input: JournalEntryInput
+  input: JournalEntryInput,
+  accountCurrencies?: ReadonlyMap<string, string>
 ): JournalEntryValidation {
   const errors: string[] = [];
 
@@ -265,6 +266,7 @@ export function validateJournalEntry(
   // SKIPPED entries deliberately carry no lines (they are the journal's record
   // of a row that was NOT double-entry posted). All other entries balance.
   const isSkipped = input.postingState === "SKIPPED";
+  const isFxConversion = input.detail?.isFxConversion === true;
   if (!isSkipped && (!Array.isArray(input.lines) || input.lines.length < 2)) {
     errors.push("an entry must contain at least 2 lines");
   }
@@ -320,6 +322,10 @@ export function validateJournalEntry(
       errors.push(`${idx}: rounded THB amount must be positive`);
       return;
     }
+    if (accountCurrencies && accountCurrencies.get(line.accountId) !== currency) {
+      errors.push(`${idx}: account currency is incompatible with ${currency}`);
+      return;
+    }
 
     const side: Side = hasDebit ? "DEBIT" : "CREDIT";
     lines.push({
@@ -348,7 +354,21 @@ export function validateJournalEntry(
 
   if (errors.length > 0) return { ok: false, errors };
 
-  if (!isSkipped) {
+  if (!isSkipped && isFxConversion) {
+    const d = input.detail!;
+    const debit = lines.find(l => l.side === "DEBIT");
+    const credit = lines.find(l => l.side === "CREDIT");
+    const received = dec(d.amount ?? "");
+    const sent = dec(d.exchangeFromAmount ?? "");
+    if (d.category !== "asset" || d.side != null || lines.length !== 2 ||
+      Object.keys(byCurrency).length !== 2 || !debit || !credit ||
+      debit.currency !== d.currency || credit.currency !== d.exchangeFromCurrency ||
+      !received?.gt(0) || !sent?.gt(0) ||
+      debit.amount !== roundMoney(received) || credit.amount !== roundMoney(sent)) {
+      errors.push("FX conversion requires one received-asset debit and one sent-asset credit matching the exchange detail");
+    }
+  }
+  if (!isSkipped && !isFxConversion) {
     for (const [currency, bucket] of Object.entries(byCurrency)) {
       if (!bucket.debit.equals(bucket.credit)) {
         errors.push(
@@ -360,8 +380,8 @@ export function validateJournalEntry(
 
   if (errors.length > 0) return { ok: false, errors };
 
-  // Compare the exact persisted cents; cross-currency policy is unchanged.
-  if (!isSkipped && Object.keys(byCurrency).length === 1) {
+  // Confirmed exchange entries balance in reporting currency, not native units.
+  if (!isSkipped && (isFxConversion || Object.keys(byCurrency).length === 1)) {
     const debitThb = Decimal.sum(0, ...lines.filter(l => l.side === "DEBIT").map(l => l.amountThb));
     const creditThb = Decimal.sum(0, ...lines.filter(l => l.side === "CREDIT").map(l => l.amountThb));
     if (!debitThb.eq(creditThb)) errors.push("THB does not balance: debit " + debitThb + " != credit " + creditThb);
@@ -392,7 +412,7 @@ export function validateJournalEntry(
     amountThb: detailAmount && detailFx?.gt(0) ? moneyInThb(detailAmount, detailFx) : null,
     fxRateEffective: d.fxRateEffective != null ? String(d.fxRateEffective) : null,
     fxRateStatement: d.fxRateStatement != null ? String(d.fxRateStatement) : null,
-    isFxConversion: Boolean(d.isFxConversion),
+    isFxConversion,
     exchangeFromCurrency: d.exchangeFromCurrency != null ? String(d.exchangeFromCurrency) : null,
     exchangeFromAmount: d.exchangeFromAmount != null ? String(d.exchangeFromAmount) : null,
     exchangeRate: d.exchangeRate != null ? String(d.exchangeRate) : null,
@@ -429,6 +449,7 @@ export interface ReversalCandidate {
   sourceType: EntrySourceType;
   sourceTransactionId: string | null;
   lines: ValidatedJournalLine[];
+  detail?: JournalTradeDetail;
 }
 
 /**
@@ -437,12 +458,22 @@ export interface ReversalCandidate {
  * POSTED entry (a reversal is a real event, not a delete).
  */
 export function buildReversal(entry: ValidatedJournalEntry): ReversalCandidate {
+  const sent = entry.lines.find(l => l.side === "CREDIT");
+  const received = entry.lines.find(l => l.side === "DEBIT");
+  const detail = entry.detail.isFxConversion && sent && received ? {
+    ...entry.detail,
+    currency: sent.currency, amount: sent.amount, amountThb: sent.amountThb,
+    fxRateEffective: sent.fxRateEffective, fxRateStatement: sent.fxRateStatement,
+    exchangeFromCurrency: received.currency, exchangeFromAmount: received.amount,
+    exchangeRate: null,
+  } : undefined;
   return {
     entryDate: entry.entryDate,
     description: `กลับรายการ: ${entry.description}`,
     sourceType: "MANUAL",
     sourceTransactionId: entry.sourceTransactionId,
     lines: rejectionLines(entry),
+    ...(detail ? { detail } : {}),
   };
 }
 

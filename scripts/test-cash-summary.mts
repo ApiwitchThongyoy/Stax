@@ -556,6 +556,19 @@ async function main() {
     "buildCashExchangeRows returns the same direction totals for the UI"
   );
 
+  const fxOnly = buildCashSummary(["AI_PARSED", "MANUAL"].map(sourceType => ({
+    transactionId: sourceType, type: "CASH_IN", sourceType, category: "asset",
+    transactionDate: "2026-01-01", amountThb: "35000", currency: "USD", amountForeign: "1000",
+  })));
+  ok(fxOnly.totalCashInThb === "0" && fxOnly.totalCashOutThb === "0",
+    "R6: exchanges never enter Cash In/Out, including legacy/manual cash-type labels");
+  const exactExchange = buildCashExchangeRows([{
+    transactionId: "precise-fx", transactionDate: "2026-01-01", currency: "USD",
+    amount: "9007199254740993.01", amountThb: "315251973915934755.35",
+    exchangeFromCurrency: "THB", exchangeFromAmount: "315251973915934755.35", exchangeRate: "35",
+  }]);
+  ok(exactExchange.exchangeTotals[0].totalForeign === "9007199254740993.01",
+    "R6: exchange totals preserve decimal cents beyond Number precision");
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);
   if (failures.length) {
