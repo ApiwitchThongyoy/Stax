@@ -3058,6 +3058,168 @@ async function main() {
     }
   }
 
+  // ================= REG: FX VARIANCE 5020 + SKIPPED-FX RECONCILE =================
+  // A confirmed exchange whose statement FX gives the two cash legs slightly
+  // different THB reporting bases posts a THB 5020 FX-variance leg for the exact
+  // difference (Dr received-cash + Cr sent-cash + Cr/Dr 5020). Legacy rows that
+  // were recorded SKIPPED by pre-variance imports are replayed through the REAL
+  // engine (never hand-written lines): dry-run is zero-write, apply promotes,
+  // a second apply is a no-op, and the source Capital_Transactions row is never
+  // mutated. Pair: 5000.00 THB -> 158.60 USD @ 31.5457 (= 5003.15 THB, +3.15).
+  {
+    console.log("\n=== REG: FX VARIANCE 5020 + SKIPPED-FX RECONCILE ===");
+    const { randomUUID } = await import("node:crypto");
+    const accountsRoute = await import("../app/routes/api/accounts");
+    const { reconcileSkippedFxPostings } = await import(
+      "../app/lib/ledger-service"
+    );
+
+    const fxEmail = `fxvar-${randomUUID()}@test.local`;
+    const fxPassword = "FxVariable!234";
+    const regRes = await registerAs(fxEmail, fxPassword);
+    const regJson = (await regRes.json()) as { data?: { user?: { id?: string } } };
+    const fxUserId = regJson.data?.user?.id;
+    if (!fxUserId) {
+      ok(false, "REG-FX: register failed to create the FX user");
+    } else {
+      smokeUserIds.push(fxUserId);
+      const fxLogin = await loginAs(fxEmail, fxPassword);
+      const fxToken = fxLogin.data?.accessToken as string | undefined;
+      if (!fxToken) {
+        ok(false, "REG-FX: registered FX user could not log in");
+      } else {
+        // 1. Fresh registration seeds the FX accounts: 5020 (THB variance),
+        //    1010 (THB cash) and 1020 (USD cash).
+        const accRes = await accountsRoute.loader({
+          request: authedRequest("GET", fxToken),
+        } as never);
+        const accBody = (await accRes.json()) as {
+          data?: { code: string; currency: string }[];
+        };
+        const accCodes = accBody.data ?? [];
+        const byCode = (code: string) => accCodes.filter((a) => a.code === code);
+        ok(
+          byCode("5020").length === 1 && byCode("5020")[0].currency === "THB" &&
+            byCode("1010").length === 1 && byCode("1010")[0].currency === "THB" &&
+            byCode("1020").length === 1 && byCode("1020")[0].currency === "USD",
+          "REG-FX: fresh CoA has 5020 THB + 1010 THB + 1020 USD"
+        );
+
+        // 2. Simulate a pre-variance SKIPPED FX row pair (production shape:
+        //    category asset, side null, type FX_CONVERSION, to-side stored in the
+        //    currency/amount columns, exchange_from_* for the source side).
+        const txSkipped = randomUUID();
+        await client`
+          INSERT INTO "Capital_Transactions"
+            (transaction_id, user_id, amount_foreign, currency, transaction_date,
+             amount_thb, type, source_type, source_document_id, category, section,
+             exchange, fx_rate_statement, fx_rate_effective, exchange_from_currency,
+             exchange_from_amount, exchange_rate, is_monthly_fee_aggregate)
+          VALUES (${txSkipped}, ${fxUserId}, '158.60', 'USD', '2026-01-14', '5000.00',
+                  'FX_CONVERSION', 'AI_PARSED', ${"doc-fxlegacy"}, 'asset', 'แลกเปลี่ยนสกุลเงิน',
+                  NULL, '31.5457', '31.5457', 'THB', '5000.00', '31.5457', NULL)`;
+        const fxEntryId = randomUUID();
+        await client`
+          INSERT INTO journal_entries
+            (id, user_id, entry_no, entry_date, description, source_type,
+             source_transaction_id, status, category, section, currency,
+             amount, amount_thb, fx_rate_effective, posting_state, skip_reason,
+             created_at, updated_at, type)
+          VALUES (${fxEntryId}, ${fxUserId}, 9001, '2026-01-14', 'รายการจากงบ (legacy FX)',
+                  'STATEMENT', ${txSkipped}, 'POSTED', 'asset', 'แลกเปลี่ยนสกุลเงิน',
+                  'USD', '158.60', '5000.00', '31.5457', 'SKIPPED',
+                  'THB does not balance at statement FX',
+                  ${new Date().toISOString()}, ${new Date().toISOString()}, NULL)`;
+
+        // 3. Dry run: zero-write diagnosis. promoted stays 0, the entry still
+        //    has zero lines, and the report surfaces the exact +3.15 variance.
+        const dryRun = await reconcileSkippedFxPostings(fxUserId);
+        ok(
+          dryRun.dryRun === true && dryRun.scanned >= 1 && dryRun.promotable >= 1 &&
+            dryRun.promoted === 0,
+          "REG-FX: dry run diagnoses >=1 promotable row with zero promotions"
+        );
+        const fxRep = dryRun.entries.find((e) => e.transactionId === txSkipped);
+        ok(
+          !!fxRep && fxRep.from === "THB" && fxRep.to === "USD" &&
+            fxRep.sentAmount === "5000.00" && fxRep.receivedAmount === "158.60" &&
+            fxRep.lineCount === 3 && fxRep.varianceThb === "3.15" &&
+            fxRep.varianceSide === "CREDIT" &&
+            fxRep.debitThb === "5003.15" && fxRep.creditThb === "5003.15",
+          "REG-FX: dry run reports the exact 3-line 5020 variance (+3.15 Cr, THB-balanced)"
+        );
+        const [dryEntry] = await client`
+          SELECT posting_state, (SELECT count(*)::int FROM journal_entry_lines l WHERE l.journal_entry_id = ${fxEntryId}) AS lines
+          FROM journal_entries WHERE id = ${fxEntryId}`;
+        ok(
+          dryEntry.posting_state === "SKIPPED" && dryEntry.lines === 0,
+          "REG-FX: dry run writes nothing (entry untouched, zero lines)"
+        );
+
+        // 4. Apply: promotes the SAME journal entry id (real engine lines).
+        const apply = await reconcileSkippedFxPostings(fxUserId, { apply: true });
+        ok(
+          apply.promoted >= 1,
+          "REG-FX: --apply promotes the SKIPPED FX entry"
+        );
+        const [postApply] = await client`
+          SELECT posting_state, skip_reason FROM journal_entries WHERE id = ${fxEntryId}`;
+        ok(
+          postApply.posting_state === "POSTED" && postApply.skip_reason === null,
+          "REG-FX: promoted entry is POSTED with a cleared skip reason"
+        );
+        const fxLegs = await client`
+          SELECT a.code, l.debit_amount, l.credit_amount, l.memo
+          FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
+          WHERE l.journal_entry_id = ${fxEntryId}
+          ORDER BY a.code`;
+        const fxLine = (code: string) => fxLegs.find((l: any) => l.code === code);
+        const l1010 = fxLine("1010");
+        const l1020 = fxLine("1020");
+        const l5020 = fxLine("5020");
+        ok(
+          fxLegs.length === 3 &&
+            !!l1010 && Number(l1010.credit_amount) === 5000.0 &&
+            !!l1020 && Number(l1020.debit_amount) === 158.6 &&
+            !!l5020 && Number(l5020.credit_amount) === 3.15 &&
+            l5020.memo === "FX conversion variance",
+          "REG-FX: promoted entry = Cr 1010 5000.00 / Dr 1020 158.60 / Cr 5020 3.15 (real lines)"
+        );
+        const [stillFx] = await client`
+          SELECT posting_state FROM journal_entries WHERE id = ${fxEntryId}`;
+        ok(
+          stillFx.posting_state === "POSTED",
+          "REG-FX: promotion preserved the journal entry id (same record upgraded)"
+        );
+
+        // 5. Idempotent: a second apply promotes nothing.
+        const apply2 = await reconcileSkippedFxPostings(fxUserId, { apply: true });
+        ok(apply2.promoted === 0, "REG-FX: re-running apply is a no-op");
+
+        // 6. The source Capital_Transactions row is never mutated.
+        const [keptFxRow] = await client`
+          SELECT amount_foreign, currency, category, side, type, fx_rate_effective,
+                 exchange_from_currency, exchange_from_amount, exchange_rate
+          FROM "Capital_Transactions" WHERE transaction_id = ${txSkipped}`;
+        ok(
+          !!keptFxRow && Number(keptFxRow.amount_foreign) === 158.6 &&
+            keptFxRow.currency === "USD" && keptFxRow.category === "asset" &&
+            keptFxRow.side === null && keptFxRow.type === "FX_CONVERSION" &&
+            Number(keptFxRow.fx_rate_effective) === 31.5457 &&
+            keptFxRow.exchange_from_currency === "THB" &&
+            Number(keptFxRow.exchange_from_amount) === 5000.0 &&
+            Number(keptFxRow.exchange_rate) === 31.5457,
+          "REG-FX: reconcile never mutates the source Capital_Transactions row"
+        );
+
+        // Self-clean the simulated rows.
+        await client`DELETE FROM journal_entry_lines WHERE user_id = ${fxUserId}`;
+        await client`DELETE FROM journal_entries WHERE user_id = ${fxUserId}`;
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${fxUserId}`;
+      }
+    }
+  }
+
   // ================= REG: TRANSACTION RECORD VIEW (ledger line -> source tx) =================
   // A statement posting attaches sourceTransactionId to each journal line; the
   // account-ledger route surfaces it on every line, and GET

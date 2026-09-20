@@ -436,10 +436,15 @@ async function main() {
     fxValidated.entry.lines.some(l => l.accountId === "1010" && l.currency === "THB" &&
       l.side === "CREDIT" && l.amount === "35000.00" && l.amountThb === "35000.00"),
     "R6: THB 35000 -> USD 1000 posts distinct native amounts and equal THB totals");
-  const badFx = buildStatementJournalEntries([{ ...fxRow, fxRateEffective: "34.50" }])[0];
-  ok(badFx.postingState === "SKIPPED" && badFx.entry.lines.length === 0 &&
-    !!badFx.reason?.includes("THB does not balance"),
-    "R6: reporting FX 34.50 cannot balance THB 34500 against 35000");
+  const badFxPlan = buildStatementJournalEntries([{ ...fxRow, fxRateEffective: "34.50" }])[0];
+  const badFxValidated = validateJournalEntry({ ...badFxPlan.entry });
+  const badFx = badFxPlan.postingState === "POSTED" && badFxValidated.ok ? badFxValidated.entry : null;
+  ok(!!badFx && badFx.lines.length === 3,
+    "R6: reporting FX 34.50 now posts 3 legs (THB 34500 vs 35000 absorbed by the 5020 variance)");
+  if (badFx) {
+    ok(badFx.lines.some((l) => l.accountId === "5020" && l.side === "DEBIT" && l.amount === "500.00"),
+      "R6: FX 34.50 variance = found Dr 5020 500.00 (exact reporting-base difference)");
+  }
   ok(!validateJournalEntry({ ...fxPlan.entry, detail: { isFxConversion: false } }).ok,
     "R6: unmarked cross-currency entries retain native balance checks");
   ok(!validateJournalEntry({ entryDate: "2026-01-01", description: "normal native mismatch",
@@ -475,6 +480,156 @@ async function main() {
     const plan = buildStatementJournalEntries([row])[0];
     ok(plan.postingState === "SKIPPED" && plan.entry.lines.length === 0 && !!plan.reason?.includes("compatible"),
       `R7: unsupported THB ${row.category}/${row.side ?? ""} remains SKIPPED with no incompatible lines`);
+  }
+
+  // FX VARIANCE LEG (5020 THB): a confirmed exchange whose statement FX gives
+  // the two cash legs slightly different THB reporting bases posts a THB
+  // variance leg for the exact difference, WITHOUT ever touching source values.
+  const fxThbToUsd = (sent: string, received: string, rate: string): ValidatedCapitalRow =>
+    baseRow({ category: "asset", side: null, type: "FX_CONVERSION",
+      amountForeign: received, currency: "USD",
+      exchangeFromCurrency: "THB", exchangeFromAmount: sent, exchangeRate: rate,
+      fxRateEffective: rate });
+  // Decode a row into its FROZEN validated entry (null if not keepable).
+  const fxFrozen = (row: ValidatedCapitalRow) => {
+    const plan = buildStatementJournalEntries([row])[0];
+    if (plan.postingState !== "POSTED") return null;
+    const v = validateJournalEntry({ ...plan.entry });
+    return v.ok ? v.entry : null;
+  };
+  const fxVariance = (entry: ReturnType<typeof fxFrozen>) =>
+    entry ? entry.lines.find((l) => l.accountId === "5020") ?? null : null;
+
+  // Production pair (verified): 5000 THB -> 158.60 USD @ 31.5457 = +3.15.
+  const p1 = fxFrozen(fxThbToUsd("5000.00", "158.60", "31.5457"));
+  ok(!!p1 && p1.lines.length === 3, "FX variance: non-balancing exchange produces a valid 3-leg entry");
+  if (p1) {
+    const v = fxVariance(p1);
+    ok(!!v && v.currency === "THB" && v.side === "CREDIT" && v.amount === "3.15" &&
+      v.amountThb === "3.15" && v.fxRateEffective === "1" && v.fxRateStatement === "1" &&
+      v.memo === "FX conversion variance",
+      "FX variance: Cr 5020 = exact +3.15 THB difference, THB pinned, human memo");
+    ok(p1.lines.some((l) => l.accountId === "1020" && l.side === "DEBIT" &&
+        l.amount === "158.60" && l.amountThb === "5003.15"),
+      "FX variance: USD received leg keeps statement amount/FX (5003.15 THB base)");
+    ok(p1.lines.some((l) => l.accountId === "1010" && l.side === "CREDIT" &&
+        l.amount === "5000.00" && l.amountThb === "5000.00"),
+      "FX variance: THB sent leg keeps the source amount (5000.00) verbatim");
+  }
+
+  // Production pair (verified): 10000 THB -> 319.80 USD @ 31.269 = -0.17.
+  const p2 = fxFrozen(fxThbToUsd("10000.00", "319.80", "31.269"));
+  ok(!!p2 && p2.lines.length === 3, "FX variance: negative difference also produces 3 legs");
+  if (p2) {
+    const v = fxVariance(p2);
+    ok(!!v && v.side === "DEBIT" && v.amount === "0.17", "FX variance: Dr 5020 = exact 0.17 THB difference");
+  }
+
+  // The seven remaining production diffs (+5.91, +28.81, -0.22, -0.13, -0.19,
+  // -0.25, -0.24) as engineered pairs where roundMoney(received * rate) lands
+  // EXACTLY on the recorded target THB cents.
+  const productionDiffs: { sent: string; received: string; rate: string; side: "DEBIT" | "CREDIT"; amount: string }[] = [
+    { sent: "55329.09", received: "1581.00", rate: "35.0", side: "CREDIT", amount: "5.91" },
+    { sent: "3171.19", received: "100.00", rate: "32.0", side: "CREDIT", amount: "28.81" },
+    { sent: "3542.22", received: "100.00", rate: "35.42", side: "DEBIT", amount: "0.22" },
+    { sent: "157.86", received: "5.00", rate: "31.5457", side: "DEBIT", amount: "0.13" },
+    { sent: "324.87", received: "10.00", rate: "32.4675", side: "DEBIT", amount: "0.19" },
+    { sent: "8750.25", received: "250.00", rate: "35.0", side: "DEBIT", amount: "0.25" },
+    { sent: "625.62", received: "20.00", rate: "31.269", side: "DEBIT", amount: "0.24" },
+  ];
+  for (const d of productionDiffs) {
+    const entry = fxFrozen(fxThbToUsd(d.sent, d.received, d.rate));
+    const v = fxVariance(entry);
+    ok(!!entry && entry.lines.length === 3 && !!v &&
+        v.side === d.side && v.amount === d.amount,
+      `FX variance: ${d.sent} THB -> ${d.received} USD @ ${d.rate} = ${d.side} ${d.amount}`);
+  }
+
+  // 5020 is a THB default account, so the engine-level compatibility check
+  // preserves the 3-leg posting end-to-end.
+  ok(postCapitalRow(fxThbToUsd("5000.00", "158.60", "31.5457")).ok,
+    "FX variance: engine accepts the 5020 THB account (default chart)");
+
+  // Balanced USD -> THB (variance==0) still posts exactly two cash legs.
+  const back = fxFrozen(baseRow({ category: "asset", side: null,
+    type: "FX_CONVERSION", amountForeign: "35000.00", currency: "THB", fxRateEffective: "1",
+    exchangeFromCurrency: "USD", exchangeFromAmount: "1000.00", exchangeRate: "35" }));
+  ok(!!back && back.lines.length === 2 && !fxVariance(back) &&
+    back.detail.currency === "THB" && back.detail.exchangeFromCurrency === "USD",
+    "FX variance: balanced USD -> THB stays 2 legs (no variance line)");
+
+  // Missing trusted FX stays SKIPPED (never a fabricated 1:1 or variance).
+  const noFx = buildStatementJournalEntries([baseRow({ category: "asset", side: null,
+    type: "FX_CONVERSION", amountForeign: "158.60", currency: "USD",
+    exchangeFromCurrency: "THB", exchangeFromAmount: "5000.00",
+    exchangeRate: null, fxRateEffective: null })])[0];
+  ok(noFx.postingState === "SKIPPED" && noFx.entry.lines.length === 0 &&
+    !!noFx.reason?.includes("effective FX rate"), "FX variance: unknown rate stays SKIPPED (zero lines)");
+  // Unsupported third currency stays SKIPPED too.
+  const eurFx = buildStatementJournalEntries([baseRow({ category: "asset", side: null,
+    type: "FX_CONVERSION", amountForeign: "100.00", currency: "EUR",
+    exchangeFromCurrency: "THB", exchangeFromAmount: "3600.00",
+    exchangeRate: "36", fxRateEffective: "36" })])[0];
+  ok(eurFx.postingState === "SKIPPED" && eurFx.entry.lines.length === 0,
+    "FX variance: unsupported currency stays SKIPPED");
+
+  if (p1) {
+    // A THB line that is NOT exactly the reporting-base difference is rejected
+    // (start from a balanced 2-leg exchange so the fake line is the ONLY extra).
+    const base2 = fxFrozen(baseRow({ category: "asset", side: null, type: "FX_CONVERSION",
+      amountForeign: "1000.00", currency: "USD",
+      exchangeFromCurrency: "THB", exchangeFromAmount: "35000.00", exchangeRate: "35",
+      fxRateEffective: "35" }));
+    ok(!!base2 && base2.lines.length === 2, "FX variance: balanced THB 35000 -> USD 1000 @ 35 is 2 legs");
+    if (base2) {
+      const fake = validateJournalEntry({
+        entryDate: base2.entryDate, description: "fake third leg",
+        detail: base2.detail, lines: [
+          ...base2.lines.map((l) => ({ accountId: l.accountId, currency: l.currency,
+            debit: l.side === "DEBIT" ? l.amount : null, credit: l.side === "CREDIT" ? l.amount : null,
+            fxRateEffective: l.fxRateEffective, memo: l.memo })),
+          { accountId: "1010", currency: "THB", debit: "999.00" },
+        ],
+      });
+      ok(!fake.ok && fake.errors.some((e) => e.includes("variance line must be")),
+        "FX variance: arbitrary third leg on a balanced exchange rejected (must equal exact difference)");
+      // A FOURTH leg on a genuine 3-leg entry is rejected outright.
+      const bogus4 = validateJournalEntry({
+        entryDate: p1.entryDate, description: "bogus fourth leg",
+        detail: p1.detail, lines: [
+          ...p1.lines.map((l) => ({ accountId: l.accountId, currency: l.currency,
+            debit: l.side === "DEBIT" ? l.amount : null, credit: l.side === "CREDIT" ? l.amount : null,
+            fxRateEffective: l.fxRateEffective, memo: l.memo })),
+          { accountId: "1020", currency: "USD", credit: "1.00", fxRateEffective: "31" },
+        ],
+      });
+      ok(!bogus4.ok && bogus4.errors.some((e) =>
+        e.includes("requires exactly two cash legs and at most one THB variance line") ||
+        e.includes("requires one received-asset debit and one sent-asset credit")),
+        "FX variance: a 3-leg entry with a 4th arbitrary leg is rejected");
+    }
+    // USD leg into the THB cash account is rejected by the account map.
+    const mismatch = validateJournalEntry({
+      entryDate: p1.entryDate, description: "account mismatch",
+      lines: [
+        { accountId: "1020", currency: "USD", debit: "158.60", fxRateEffective: "31.5457" },
+        { accountId: "1010", currency: "USD", credit: "158.60", fxRateEffective: "31.5457" },
+      ],
+    }, new Map(DEFAULT_CHART_OF_ACCOUNTS.map((a) => [a.code, a.currency])));
+    ok(!mismatch.ok, "FX variance: USD leg into the THB cash account rejected");
+    // Wire into a 3-leg entry it is dropped by buildReversal (details swapped).
+    const reversed = buildReversal(p1);
+    const rr = validateJournalEntry({
+      ...reversed,
+      lines: reversed.lines.map((l) => ({ accountId: l.accountId, currency: l.currency,
+        debit: l.side === "DEBIT" ? l.amount : null, credit: l.side === "CREDIT" ? l.amount : null,
+        fxRateEffective: l.fxRateEffective })),
+    }, new Map(DEFAULT_CHART_OF_ACCOUNTS.map((a) => [a.code, a.currency])));
+    ok(rr.ok && rr.entry.detail.isFxConversion &&
+      rr.entry.detail.currency === "THB" && rr.entry.detail.amount === "5000.00" &&
+      rr.entry.detail.exchangeFromCurrency === "USD" && rr.entry.detail.exchangeFromAmount === "158.60" &&
+      rr.entry.lines.some((l) => l.accountId === "5020" && l.side === "DEBIT" && l.amount === "3.15"),
+      "FX variance: 3-leg reversal picks cash legs by currency and validates");
   }
 
   // THB owner deposits ARE now supported: the default chart of accounts gained

@@ -43,8 +43,14 @@ export async function runCurrencyExchangeTests(sql: postgres.Sql, ok: (value: bo
       "exchange persists USD debit 1000 and THB credit 35000");
     check(lines.every(l => l.amount_thb === "35000.00" && l.currency === l.account_currency),
       "both reporting legs equal THB 35000 and match account currencies");
-    check(badHeader.posting_state === "SKIPPED" && badHeader.skip_reason.includes("THB does not balance"),
-      "FX 34.50 rejects reporting imbalance without inventing balancing lines");
+    const badLines = await sql`SELECT l.*,a.code,a.currency AS account_currency FROM journal_entry_lines l
+      JOIN accounts a ON a.id=l.account_id WHERE l.journal_entry_id=${badHeader.id}`;
+    check(badHeader.posting_state === "POSTED" &&
+      badLines.length === 3 &&
+      badLines.some(l => l.code === "1020" && l.currency === "USD" && l.debit_amount === "1000.00") &&
+      badLines.some(l => l.code === "1010" && l.currency === "THB" && l.credit_amount === "35000.00") &&
+      badLines.some(l => l.code === "5020" && l.currency === "THB" && l.debit_amount === "500.00"),
+      "FX 34.50 now posts the exact THB reporting difference as a Dr 5020 variance leg");
     check(buyHeader.posting_state === "SKIPPED" && buyHeader.skip_reason.includes("compatible"),
       "THB BUY cannot use USD investment account");
     const rebuilt = posting.buildStatementJournalEntries([{

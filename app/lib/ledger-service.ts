@@ -45,7 +45,10 @@ import {
   type Side,
   type ValidatedJournalEntry,
 } from "./general-ledger";
-import { buildStatementJournalEntries } from "./posting-engine";
+import {
+  buildStatementJournalEntries,
+  FX_VARIANCE_MEMO,
+} from "./posting-engine";
 import { recomputeAllGainLoss, recomputeCostBasisMap, saveCostBasisState, type CostBasisActionRow, type ValidatedCapitalRow } from "./statement-pipeline";
 
 Decimal.set({ precision: 40 });
@@ -249,12 +252,28 @@ function resolveEntryAccountIds(
     if (account.currency !== line.currency.trim().toUpperCase()) {
       errors.push(`line[${i}]: account ${account.code} is ${account.currency}-denominated but the line is ${line.currency}`);
     }
-    if (input.detail?.isFxConversion === true &&
-      (account.type !== "ASSET" || !["1010", "1020"].includes(account.code))) {
-      errors.push(`line[${i}]: currency exchange requires a compatible cash asset account`);
+    if (input.detail?.isFxConversion === true) {
+      const isCashAsset =
+        account.type === "ASSET" && (account.code === "1010" || account.code === "1020");
+      const isVarianceLeg =
+        account.code === "5020" && (line.currency ?? "").trim().toUpperCase() === "THB";
+      if (!isCashAsset && !isVarianceLeg) {
+        errors.push(
+          `line[${i}]: currency exchange requires a compatible cash asset account (or the 5020 THB FX-variance leg)`
+        );
+      }
     }
     return { ...line, accountId: account.id };
   });
+  if (input.detail?.isFxConversion === true) {
+    const varianceRefs = input.lines.filter(
+      (l) => (l.accountId ?? "").trim() === "5020" && (l.currency ?? "").trim().toUpperCase() === "THB"
+    );
+    if (varianceRefs.length > 1) {
+      errors.push("currency exchange allows at most one 5020 THB FX-variance leg");
+    }
+    if (errors.length > 0) return { ok: false, errors };
+  }
   if (errors.length > 0) return { ok: false, errors };
   return { ok: true, lines };
 }
@@ -1427,6 +1446,208 @@ export async function reconcileSkippedEquityPostings(
       result.stillSkipped.push({ transactionId: row.transactionId, reason });
       continue;
     }
+
+    // Promote: replace the SKIPPED record with the same header + REAL lines.
+    try {
+      await db.transaction(async (tx) => {
+        await tx
+          .delete(journalEntryLines)
+          .where(
+            and(
+              eq(journalEntryLines.userId, userId),
+              eq(journalEntryLines.journalEntryId, entry.id)
+            )
+          )
+          .execute();
+        await tx
+          .update(journalEntries)
+          .set({ postingState: "POSTED", skipReason: null, updatedAt: now })
+          .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entry.id)))
+          .execute();
+        for (const line of validated.entry.lines) {
+          await tx.insert(journalEntryLines).values({
+            id: randomUUID(), userId, journalEntryId: entry.id, accountId: line.accountId,
+            currency: line.currency, debitAmount: line.side === "DEBIT" ? line.amount : null,
+            creditAmount: line.side === "CREDIT" ? line.amount : null, amountThb: line.amountThb,
+            fxRateEffective: line.fxRateEffective, fxRateStatement: line.fxRateStatement,
+            fxRateProvider: line.fxRateProvider, memo: line.memo,
+          }).execute();
+        }
+      });
+      result.promoted += 1;
+    } catch (error) {
+      safeErrorLog(error);
+      result.stillSkipped.push({
+        transactionId: row.transactionId,
+        reason: "transaction failed during promotion",
+      });
+    }
+  }
+
+  return result;
+}
+
+/** One evaluated SKIPPED STATEMENT currency-exchange row. */
+export interface FxReconcileEntryReport {
+  transactionId: string;
+  transactionDate: string;
+  from: string | null;
+  to: string | null;
+  /** Sent amount in the source currency (statement verbatim). */
+  sentAmount: string;
+  /** Received amount in the target currency (statement verbatim). */
+  receivedAmount: string;
+  oldSkipReason: string | null;
+  /** Candidate line count (3 = with 5020 variance leg, 2 = balanced). */
+  lineCount: number;
+  /** THB 5020 FX-variance leg amount (null when the exchange balances natively). */
+  varianceThb: string | null;
+  varianceSide: "DEBIT" | "CREDIT" | null;
+  /** Candidate total THB debits and credits (equal for a keepable entry). */
+  debitThb: string;
+  creditThb: string;
+}
+
+export interface ReconcileSkippedFxResult {
+  scanned: number;
+  /** Rows whose replay produced a keepable POSTED entry (both modes). */
+  promotable: number;
+  /** Rows actually promoted (real lines written). 0 in a dry run. */
+  promoted: number;
+  /** Rows that remain SKIPPED after the replay + why (idempotent re-run safe). */
+  stillSkipped: { transactionId: string; reason: string }[];
+  entries: FxReconcileEntryReport[];
+  /** True when opts.apply was NOT set: zero database writes were made. */
+  dryRun: boolean;
+}
+
+/**
+ * Deterministic reconcile of existing SKIPPED STATEMENT currency-exchange rows.
+ * Confirmed exchanges (category asset, side null, type FX_CONVERSION) that were
+ * recorded SKIPPED by earlier imports — e.g. the production row pairs whose
+ * statement FX yields a small THB variance (5000 THB -> 158.60 USD @ 31.5457 =
+ * +3.15) — are replayed through the REAL engine and, when keepable, promoted
+ * with their cash legs + the 5020 THB FX-variance leg, exactly like a fresh
+ * import of the same statement would produce. NEVER writes by hand and NEVER
+ * mutates the source Capital_Transactions values.
+ *
+ * DEFAULT IS A DRY RUN (`opts.apply` absent/false): it only SELECTs and reports
+ * what WOULD be promoted (promoted stays 0). `apply: true` seeds the CoA (5020
+ * is a default) and promotes in per-entry transactions, preserving the existing
+ * journal entry id/entry_no and source links. Idempotent: a second apply
+ * promotes 0.
+ */
+export async function reconcileSkippedFxPostings(
+  userId: string,
+  opts: { apply?: boolean } = {}
+): Promise<ReconcileSkippedFxResult> {
+  const dryRun = opts.apply !== true;
+  // A dry run must make ZERO database writes: never seed the chart of accounts
+  // (that INSERTs). Promotion seeds first so a missing 5020 is not a blocker.
+  let lookup = await loadAccountLookup(userId);
+  if (!dryRun) {
+    const seeded = await seedDefaultChartOfAccounts(userId);
+    if (seeded > 0) lookup = await loadAccountLookup(userId);
+  }
+
+  const rows = await db
+    .select()
+    .from(capitalTransactions)
+    .where(eq(capitalTransactions.userId, userId))
+    .orderBy(capitalTransactions.transactionDate, capitalTransactions.transactionId)
+    .execute();
+  const rowById = new Map(rows.map((r) => [r.transactionId, r]));
+
+  const skippedEntries = await db
+    .select()
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.userId, userId),
+        eq(journalEntries.sourceType, "STATEMENT"),
+        eq(journalEntries.postingState, "SKIPPED")
+      )
+    )
+    .orderBy(asc(journalEntries.entryNo))
+    .execute();
+
+  const result: ReconcileSkippedFxResult = {
+    scanned: 0, promotable: 0, promoted: 0, stillSkipped: [], entries: [], dryRun,
+  };
+  const now = new Date().toISOString();
+  const cashIds = new Set(
+    [...lookup.values()]
+      .filter((a) => a.type === "ASSET" && (a.code === "1010" || a.code === "1020"))
+      .map((a) => a.id)
+  );
+
+  for (const entry of skippedEntries) {
+    if (!entry.sourceTransactionId) continue;
+    const row = rowById.get(entry.sourceTransactionId);
+    if (!row) continue;
+    const category = (row.category ?? "").trim().toLowerCase();
+    const sideRaw = (row.side ?? "").trim();
+    const isFxRow =
+      category === "asset" &&
+      (sideRaw === "" || sideRaw === "null") &&
+      (row.type ?? "").trim() === "FX_CONVERSION";
+    if (!isFxRow) continue;
+
+    result.scanned += 1;
+    // Replay ONLY through the pure engine (identical to a fresh import).
+    const [plan] = buildStatementJournalEntries([row as ValidatedCapitalRow]);
+    if (!plan || plan.postingState !== "POSTED") {
+      result.stillSkipped.push({
+        transactionId: row.transactionId,
+        reason: plan?.reason ?? entry.skipReason ?? "replay did not produce a keepable entry",
+      });
+      continue;
+    }
+
+    const resolved = resolveEntryAccountIds(plan.entry, lookup);
+    if (!resolved.ok) {
+      result.stillSkipped.push({
+        transactionId: row.transactionId,
+        reason: resolved.errors.join("; "),
+      });
+      continue;
+    }
+    const validated = validateJournalEntry({ ...plan.entry, lines: resolved.lines });
+    if (!validated.ok || currencyMismatchErrors(validated.entry, lookup).length > 0) {
+      const reason = !validated.ok
+        ? `invalid entry: ${validated.errors.join("; ")}`
+        : currencyMismatchErrors(validated.entry, lookup).join("; ");
+      result.stillSkipped.push({ transactionId: row.transactionId, reason });
+      continue;
+    }
+
+    const varianceLine = validated.entry.lines.find(
+      (l) => l.currency === "THB" && !cashIds.has(l.accountId) && l.memo === FX_VARIANCE_MEMO
+    );
+    const debitThb = Decimal.sum(
+      0,
+      ...validated.entry.lines.filter((l) => l.side === "DEBIT").map((l) => l.amountThb)
+    ).toFixed(2);
+    const creditThb = Decimal.sum(
+      0,
+      ...validated.entry.lines.filter((l) => l.side === "CREDIT").map((l) => l.amountThb)
+    ).toFixed(2);
+    result.entries.push({
+      transactionId: row.transactionId,
+      transactionDate: row.transactionDate,
+      from: row.exchangeFromCurrency ?? null,
+      to: row.currency ?? null,
+      sentAmount: row.exchangeFromAmount ?? "",
+      receivedAmount: row.amountForeign ?? "",
+      oldSkipReason: entry.skipReason,
+      lineCount: validated.entry.lines.length,
+      varianceThb: varianceLine?.amount ?? null,
+      varianceSide: varianceLine?.side ?? null,
+      debitThb,
+      creditThb,
+    });
+    result.promotable += 1;
+    if (dryRun) continue;
 
     // Promote: replace the SKIPPED record with the same header + REAL lines.
     try {

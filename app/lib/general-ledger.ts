@@ -357,16 +357,50 @@ export function validateJournalEntry(
 
   if (!isSkipped && isFxConversion) {
     const d = input.detail!;
-    const debit = lines.find(l => l.side === "DEBIT");
-    const credit = lines.find(l => l.side === "CREDIT");
     const received = dec(d.amount ?? "");
     const sent = dec(d.exchangeFromAmount ?? "");
-    if (d.category !== "asset" || d.side != null || lines.length !== 2 ||
-      Object.keys(byCurrency).length !== 2 || !debit || !credit ||
-      debit.currency !== d.currency || credit.currency !== d.exchangeFromCurrency ||
-      !received?.gt(0) || !sent?.gt(0) ||
-      debit.amount !== roundMoney(received) || credit.amount !== roundMoney(sent)) {
+    // The two cash legs are identified deterministically (side + currency +
+    // amount) from the exchange detail — never by array position or "first
+    // debit/credit" — so a well-formed THB variance leg can never be mistaken
+    // for either cash leg (its THB amount never equals a source/received cash
+    // amount at realistic magnitudes).
+    const receivedAmount = received?.gt(0) ? roundMoney(received) : "";
+    const sentAmount = sent?.gt(0) ? roundMoney(sent) : "";
+    const receivedLine = lines.find(
+      (l) => l.side === "DEBIT" &&
+        l.currency === (d.currency ?? "").trim().toUpperCase() &&
+        l.amount === receivedAmount
+    );
+    const sentLine = lines.find(
+      (l) => l.side === "CREDIT" &&
+        l.currency === (d.exchangeFromCurrency ?? "").trim().toUpperCase() &&
+        l.amount === sentAmount
+    );
+    const varianceLines = lines.filter((l) => l !== receivedLine && l !== sentLine);
+    if (d.category !== "asset" || d.side != null || lines.length < 2 || lines.length > 3 ||
+      Object.keys(byCurrency).length !== 2 || !receivedLine || !sentLine ||
+      !received?.gt(0) || !sent?.gt(0)) {
       errors.push("FX conversion requires one received-asset debit and one sent-asset credit matching the exchange detail");
+    } else {
+      const receivedThb = new Decimal(receivedLine.amountThb);
+      const sentThb = new Decimal(sentLine.amountThb);
+      const diff = receivedThb.minus(sentThb);
+      if (varianceLines.length === 1) {
+        const v = varianceLines[0];
+        const expectedSide = diff.gt(0) ? "CREDIT" : "DEBIT";
+        if (diff.isZero() || v.currency !== "THB" || v.side !== expectedSide ||
+          v.amount !== roundMoney(diff.abs())) {
+          errors.push("FX conversion variance line must be THB with amount and side exactly equal to the reporting-base difference");
+        }
+      } else if (varianceLines.length === 0) {
+        if (!diff.isZero()) {
+          errors.push(
+            `FX conversion does not balance in THB: received ${receivedLine.amountThb} != sent ${sentLine.amountThb}`
+          );
+        }
+      } else {
+        errors.push("FX conversion requires exactly two cash legs and at most one THB variance line");
+      }
     }
   }
   if (!isSkipped && !isFxConversion) {
@@ -459,8 +493,24 @@ export interface ReversalCandidate {
  * POSTED entry (a reversal is a real event, not a delete).
  */
 export function buildReversal(entry: ValidatedJournalEntry): ReversalCandidate {
-  const sent = entry.lines.find(l => l.side === "CREDIT");
-  const received = entry.lines.find(l => l.side === "DEBIT");
+  // For FX entries identify the received (DEBIT) and sent (CREDIT) cash legs
+  // DETERMINISTICALLY from the exchange detail so a 3-leg entry (received cash,
+  // sent cash, THB 5020 variance) always reverses the right cash legs and the
+  // variance leg is the leftover that gets its side flipped. Non-FX keeps the
+  // generic first debit/credit (entries are strict 2-leg).
+  const isFx = entry.detail.isFxConversion;
+  const sent = isFx
+    ? entry.lines.find(
+        (l) => l.side === "CREDIT" &&
+          l.currency === (entry.detail.exchangeFromCurrency ?? "").trim().toUpperCase()
+      )
+    : entry.lines.find((l) => l.side === "CREDIT");
+  const received = isFx
+    ? entry.lines.find(
+        (l) => l.side === "DEBIT" &&
+          l.currency === (entry.detail.currency ?? "").trim().toUpperCase()
+      )
+    : entry.lines.find((l) => l.side === "DEBIT");
   const detail = entry.detail.isFxConversion && sent && received ? {
     ...entry.detail,
     currency: sent.currency, amount: sent.amount, amountThb: sent.amountThb,
