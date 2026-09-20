@@ -79,6 +79,9 @@ const monthlyClosingTab = read("app/component/Ledger/MonthlyClosingTab.tsx");
 const monthlyClosingRoute = read(
   "app/routes/api/reports/monthly-closing.ts"
 );
+const trialBalanceRoute = read("app/routes/api/reports/trial-balance.ts");
+const incomeStatementRoute = read("app/routes/api/reports/income-statement.ts");
+const balanceSheetRoute = read("app/routes/api/reports/balance-sheet.ts");
 const generalLedgerPage = read("app/component/Ledger/GeneralLedgerPage.tsx");
 const corporateActionEngine = read("app/lib/corporate-action.ts");
 const corporateActionService = read("app/lib/corporate-action-service.ts");
@@ -2183,6 +2186,26 @@ ok(
     monthlyClosingTab.includes("formatSignedAmount(r.closing)") &&
     !monthlyClosingTab.includes("toFixed("),
   "MonthlyClosingTab renders server fields verbatim (debit-positive signs, no recompute in React)"
+);
+
+// ---------------------------------------------------------------------------
+// Report routes reject impossible calendar dates (2026-02-30) and reversed
+// from>to ranges with the same strict validator as the batch account summary.
+// ---------------------------------------------------------------------------
+for (const [label, route] of [
+  ["trial-balance", trialBalanceRoute],
+  ["income-statement", incomeStatementRoute],
+  ["monthly-closing", monthlyClosingRoute],
+] as const) {
+  ok(
+    route.includes("new Date(Date.UTC(year, month - 1, day)).toISOString().slice(0, 10) === value") &&
+      route.includes("from && to && from > to"),
+    `${label} route strictly validates ISO dates and rejects reversed from>to ranges`
+  );
+}
+ok(
+  balanceSheetRoute.includes("new Date(Date.UTC(year, month - 1, day)).toISOString().slice(0, 10) === value"),
+  "balance-sheet route strictly validates the as-of date"
 );
 
 console.log("\n================ SUMMARY ================");
