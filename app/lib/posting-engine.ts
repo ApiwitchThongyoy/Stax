@@ -48,9 +48,18 @@
 //                         parser for a deterministic TRUE/FALSE. The rule keys
 //                         on the provenance flag, NOT a section-name match.
 //
-// Confirmed currency exchanges post cash-to-cash only when their persisted THB
-// legs balance. Missing source data/rates or incompatible accounts stay SKIPPED.
+// Confirmed currency exchanges post cash-to-cash (Dr received cash / Cr sent
+// cash) using the persisted statement amounts and FX. Because the statement FX
+// is authoritative and NEVER re-derived to force a balance, the two cash legs'
+// THB reporting bases can differ by a few satang. When they do, the exchange
+// also posts a THB variance leg to 5020 (รายได้/ค่าใช้จ่าย - จากอัตราแลกเปลี่ยน):
+//   debit THB > credit THB -> Cr 5020 THB for the exact difference
+//   credit THB > debit THB -> Dr 5020 THB for the exact difference
+// The leg is THB, fxRateEffective 1, positive, memo "FX conversion variance",
+// and never alters the source Capital_Transactions values (they stay verbatim).
+// Missing source data/rates or incompatible accounts stay SKIPPED.
 import type { ValidatedCapitalRow } from "./statement-pipeline";
+import { moneyInThb } from "./accounting-amounts";
 import { validateJournalEntry, DEFAULT_CHART_OF_ACCOUNTS } from "./general-ledger";
 import type {
   JournalEntryInput,
@@ -71,8 +80,11 @@ const GAIN_INCOME = "4020";
 const DIVIDEND_INCOME = "4010";
 const INTEREST_INCOME = "4030";
 const FEE_EXPENSE = "5010";
+const FX_VARIANCE = "5020";
 const WHT_EXPENSE = "5110";
 const LOSS_EXPENSE = "5120";
+/** Memo stamped on the THB 5020 FX-variance leg of a non-balancing exchange. */
+export const FX_VARIANCE_MEMO = "FX conversion variance";
 
 export type CapitalPostingResult =
   | { ok: true; entry: JournalEntryInput; note?: string }
@@ -434,19 +446,40 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
       !sourceFx.isFinite() || !sourceFx.gt(0)) {
       return { ok: false, reason: "currency exchange has unsupported currency or invalid amounts/rate" };
     }
+    // Both cash legs keep the persisted statement amounts and FX verbatim. The
+    // two THB reporting bases use the SAME moneyInThb/roundMoney semantics as
+    // validateJournalEntry (received = received first, exchangeFrom = source).
+    const receivedEff =
+      row.currency === "THB" ? new Decimal(1) : new Decimal(row.fxRateEffective ?? "");
+    const receivedThb = moneyInThb(received.toFixed(2), receivedEff);
+    const sentThb = moneyInThb(sent.toFixed(2), sourceFx);
+    const variance = new Decimal(receivedThb).minus(sentThb);
+    const lines: JournalLineInput[] = [
+      leg(targetAccount, "debit", received.toFixed(2), row),
+      leg(sourceAccount, "credit", sent.toFixed(2), {
+        currency: from!, fxRateEffective: sourceFx.toString(),
+        fxRateStatement: from === "THB" ? "1" : row.exchangeRate,
+      }),
+    ];
+    if (!variance.isZero()) {
+      lines.push({
+        accountId: FX_VARIANCE,
+        currency: "THB",
+        fxRateEffective: "1",
+        fxRateStatement: "1",
+        memo: FX_VARIANCE_MEMO,
+        ...(variance.gt(0)
+          ? { credit: variance.abs().toFixed(2) }
+          : { debit: variance.abs().toFixed(2) }),
+      });
+    }
     return {
       ok: true,
       entry: {
         entryDate: row.transactionDate, description: descriptionFor(row),
         sourceType: "STATEMENT", sourceDocumentId: row.sourceDocumentId,
         sourceTransactionId: row.transactionId, detail: journalDetailOf(row),
-        lines: [
-          leg(targetAccount, "debit", received.toFixed(2), row),
-          leg(sourceAccount, "credit", sent.toFixed(2), {
-            currency: from!, fxRateEffective: sourceFx.toString(),
-            fxRateStatement: from === "THB" ? "1" : row.exchangeRate,
-          }),
-        ],
+        lines,
       },
     };
   }

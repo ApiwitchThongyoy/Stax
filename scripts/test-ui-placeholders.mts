@@ -99,6 +99,8 @@ const tradingJournalMigration = read("drizzle/0022_add_journal_entry_note.sql");
 const tradingJournalPage = read(
   "app/component/DashboardUser/TradingJournalPage.tsx"
 );
+const postingEngine = read("app/lib/posting-engine.ts");
+const fxReconcileScript = read("scripts/reconcile-fx-postings.mts");
 
 // ---------------------------------------------------------------------------
 // 1. No stale fake placeholder values anywhere in the user UI.
@@ -2206,6 +2208,68 @@ for (const [label, route] of [
 ok(
   balanceSheetRoute.includes("new Date(Date.UTC(year, month - 1, day)).toISOString().slice(0, 10) === value"),
   "balance-sheet route strictly validates the as-of date"
+);
+
+// ---------------------------------------------------------------------------
+// FX variance leg (5020 THB) + skipped-FX reconcile.
+// A confirmed exchange whose statement FX gives the two cash legs slightly
+// different THB reporting bases posts a THB variance leg for the exact
+// difference; legacy SKIPPED FX rows can be replayed deterministically.
+// ---------------------------------------------------------------------------
+ok(
+  postingEngine.includes('const FX_VARIANCE = "5020"') &&
+    postingEngine.includes('FX_VARIANCE_MEMO = "FX conversion variance"'),
+  "posting-engine defines the 5020 FX-variance account code and human memo"
+);
+ok(
+  postingEngine.includes("const variance = new Decimal(receivedThb).minus(sentThb)") &&
+    postingEngine.includes("...(variance.gt(0)") &&
+    postingEngine.includes("variance.abs().toFixed(2)"),
+  "posting-engine computes the exact THB difference through moneyInThb and only adds a THB 5020 leg when nonzero"
+);
+ok(
+  (() => {
+    const at = postingEngine.indexOf("accountId: FX_VARIANCE,");
+    return (
+      at !== -1 &&
+      postingEngine.slice(at, at + 120).includes('currency: "THB"') &&
+      postingEngine.slice(at, at + 160).includes('memo: FX_VARIANCE_MEMO')
+    );
+  })(),
+  "posting-engine stamps the variance leg THB-currency with the human memo"
+);
+ok(
+  postingEngine.includes('import { moneyInThb } from "./accounting-amounts"'),
+  "posting-engine derives both THB bases with the shared accounting-amounts helpers"
+);
+ok(
+  generalLedger.includes("varianceLines.length === 1") &&
+    generalLedger.includes('v.currency !== "THB"') &&
+    generalLedger.includes("roundMoney(diff.abs())") &&
+    generalLedger.includes("exactly two cash legs and at most one THB variance line"),
+  "validator enforces the 3-leg FX shape (received/sent by currency+amount, exact THB variance)"
+);
+ok(
+  ledgerService.includes("const isVarianceLeg =") &&
+    ledgerService.includes("account.code === \"5020\"") &&
+    ledgerService.includes("currency exchange allows at most one 5020 THB FX-variance leg"),
+  "resolveEntryAccountIds admits the 5020 THB variance leg with an at-most-one guard"
+);
+ok(
+  ledgerService.includes("const dryRun = opts.apply !== true") &&
+    ledgerService.includes("A dry run must make ZERO database writes: never seed the chart of accounts") &&
+    ledgerService.includes("if (!dryRun)") &&
+    ledgerService.includes('(row.type ?? "").trim() === "FX_CONVERSION"') &&
+    ledgerService.includes("promotes in per-entry transactions, preserving the existing") &&
+    ledgerService.includes("journal entry id/entry_no and source links. Idempotent: a second apply") &&
+    ledgerService.includes("promotes 0."),
+  "reconcileSkippedFxPostings is dry-run-by-default, zero-write when dry, FX-only and idempotent"
+);
+ok(
+  fxReconcileScript.includes("DEFAULT IS A DRY RUN: zero database writes. Pass --apply to actually promote.") &&
+    fxReconcileScript.includes("DRY RUN (no writes)") &&
+    fxReconcileScript.includes("process.exit(0)"),
+  "reconcile-fx-postings.mts is a dry-run-first CLI (--apply to write) and exits cleanly"
 );
 
 console.log("\n================ SUMMARY ================");
