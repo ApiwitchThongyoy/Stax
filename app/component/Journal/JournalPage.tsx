@@ -1,13 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import {
-  NotebookPen,
   X,
   RotateCcw,
   ArrowRight,
   ChevronDown,
   ChevronUp,
   Search,
-  CalendarDays,
   CircleHelp,
 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
@@ -48,21 +46,6 @@ const CATEGORY_LABELS: Record<string, string> = {
   expense: "ค่าใช้จ่าย",
 };
 
-const THAI_MONTHS = [
-  "ม.ค.",
-  "ก.พ.",
-  "มี.ค.",
-  "เม.ย.",
-  "พ.ค.",
-  "มิ.ย.",
-  "ก.ค.",
-  "ส.ค.",
-  "ก.ย.",
-  "ต.ค.",
-  "พ.ย.",
-  "ธ.ค.",
-];
-
 function sideLabel(side: string | null): string {
   return side ? SIDE_LABELS[side] ?? side : "-";
 }
@@ -71,12 +54,6 @@ function sideLabel(side: string | null): string {
 function friendlyCategory(category: string | null): string {
   if (!category) return "ไม่ระบุ";
   return CATEGORY_LABELS[category] ?? category;
-}
-
-function formatThaiDate(iso: string): string {
-  const [y, m, d] = iso.split("-").map(Number);
-  if (!y || !m || !d) return iso;
-  return `${d} ${THAI_MONTHS[m - 1] ?? m} ${y}`;
 }
 
 /** Friendly one-line summary of what the entry means (server fields only). */
@@ -128,19 +105,6 @@ function matchesSearch(
     .join(" ")
     .toLowerCase();
   return haystack.includes(q);
-}
-
-/** Group entries by date; newest date first. */
-function groupEntriesByDate(
-  entries: GeneralLedgerJournalEntry[]
-): [string, GeneralLedgerJournalEntry[]][] {
-  const groups = new Map<string, GeneralLedgerJournalEntry[]>();
-  for (const e of entries) {
-    const arr = groups.get(e.entryDate) ?? [];
-    arr.push(e);
-    groups.set(e.entryDate, arr);
-  }
-  return [...groups.entries()].sort((a, b) => b[0].localeCompare(a[0]));
 }
 
 /** Count the journal visibility counters from the loaded entries. */
@@ -208,7 +172,7 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
   );
   const [query, setQuery] = useState("");
   const [showLegend, setShowLegend] = useState(false);
-  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [reverseTarget, setReverseTarget] =
     useState<GeneralLedgerJournalEntry | null>(null);
   const [isReversing, setIsReversing] = useState(false);
@@ -223,9 +187,11 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
         sourceType: appliedSource === "" ? undefined : appliedSource,
         postingState: appliedPosting === "" ? undefined : appliedPosting,
       });
+      // สมุดรายวันเรียงตามวันที่ (เก่าก่อน) + เลขที่รายการ เพื่อให้อ่าน
+      // ลำดับเหตุการณ์ได้ตรงกับงบการเงิน
       const sorted = [...items].sort(
         (a, b) =>
-          b.entryDate.localeCompare(a.entryDate) || b.entryNo - a.entryNo
+          a.entryDate.localeCompare(b.entryDate) || a.entryNo - b.entryNo
       );
       setEntries(sorted);
       setLoadState("success");
@@ -287,21 +253,16 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
 
   const summary = summaryOf(entries);
   const filtered = entries.filter((e) => matchesSearch(e, query));
-  const groups = groupEntriesByDate(filtered);
   const searching = query.trim() !== "";
 
-  const toggleCollapsed = (id: string) => {
-    setCollapsedIds((prev) => {
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
   };
-
-  const collapseAll = () =>
-    setCollapsedIds(new Set(filtered.map((e) => e.id)));
-  const expandAll = () => setCollapsedIds(new Set());
 
   const inputClass =
     "px-3 py-2 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition";
@@ -402,20 +363,6 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
         </div>
         <button
           type="button"
-          onClick={collapseAll}
-          className="bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
-        >
-          ยุบทั้งหมด
-        </button>
-        <button
-          type="button"
-          onClick={expandAll}
-          className="bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
-        >
-          ขยายทั้งหมด
-        </button>
-        <button
-          type="button"
           onClick={() => setShowLegend((s) => !s)}
           className="inline-flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
         >
@@ -448,10 +395,15 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
             รายการที่นำเข้าก่อนระบบลงบัญชีอัตโนมัติ — ตัวเลขและรายละเอียดอยู่ครบ
             แต่ยังไม่มีคู่เดบิต/เครดิต สามารถกดย้อนกลับเพื่อดูรายละเอียดได้
           </p>
+          <p>
+            • รายการเรียงตามวันที่ (เก่าก่อน) · กดแถว
+            <span className="text-gray-800 font-medium"> ดูรายละเอียด</span>{" "}
+            เพื่อขยายข้อมูล Statement ของรายการนั้น
+          </p>
         </div>
       )}
 
-      <div className="mt-6 space-y-4">
+      <div className="mt-6">
         {loadState === "loading" ? (
           <Panel>
             <LoadingRows />
@@ -485,272 +437,309 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
           </Panel>
         ) : (
           <>
-            <p className="text-xs text-gray-500">
+            <p className="text-xs text-gray-500 mb-2">
               พบ {filtered.length} รายการ
-              {searching ? ` จาก ${entries.length} รายการในกรอบเวลานี้` : ""}
+              {searching ? ` จาก ${entries.length} รายการในกรอบเวลานี้` : ""} ·
+              เรียงตามวันที่ (เก่าก่อน)
             </p>
-            {groups.map(([date, groupEntries]) => (
-              <section key={date} className="mb-6 last:mb-0">
-                <div className="flex items-center justify-between mb-2 px-1">
-                  <h3 className="flex items-center gap-1.5 text-sm font-semibold text-gray-700">
-                    <CalendarDays className="w-4 h-4 text-gray-400" />
-                    {formatThaiDate(date)}
-                  </h3>
-                  <span className="text-xs text-gray-400">
-                    {groupEntries.length} รายการ
-                  </span>
-                </div>
-                <div className="space-y-4">
-                  {groupEntries.map((entry) => {
-                    const totals = entryTotals(entry);
-                    const reversed = isReversed(entry);
-                    const balanced =
-                      Math.abs(totals.debit - totals.credit) < 0.005;
-                    const skipped = entry.postingState === "SKIPPED";
-                    const detail = detailRows(entry);
-                    const summaryText = tradeSummary(entry);
-                    const showSubtitle = summaryText !== entry.description;
-                    const collapsed = collapsedIds.has(entry.id);
-                    return (
-                      <div
-                        key={entry.id}
-                        className={`bg-white rounded-xl border overflow-hidden ${
-                          reversed || skipped
-                            ? "border-gray-100"
-                            : "border-gray-100"
-                        } ${reversed ? "opacity-70" : ""}`}
-                      >
-                        <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-4 border-b border-gray-100">
-                          <div className="flex items-start gap-2.5 min-w-0">
-                            <NotebookPen
-                              className={`mt-0.5 w-4 h-4 shrink-0 ${
-                                skipped
-                                  ? "text-amber-500"
-                                  : reversed
-                                    ? "text-gray-300"
-                                    : "text-blue-800"
-                              }`}
-                            />
-                            <div className="min-w-0">
-                              <p
-                                className={`text-sm font-semibold truncate ${
-                                  reversed
-                                    ? "text-gray-400 line-through"
-                                    : "text-gray-800"
-                                }`}
-                              >
-                                #{entry.entryNo} · {summaryText}
-                              </p>
-                              {showSubtitle && (
-                                <p className="text-xs text-gray-400 truncate">
-                                  {entry.description}
-                                </p>
-                              )}
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <SourceBadge source={entry.sourceType} />
-                            {skipped && (
-                              <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-600">
-                                ข้ามไม่ลงบัญชี
-                              </span>
-                            )}
-                            {reversed && <ReversedBadge />}
-                            {!reversed && !skipped && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setActionError("");
-                                  setReverseTarget(entry);
-                                }}
-                                className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 border border-gray-200 hover:bg-gray-50 px-2 py-1 rounded-lg transition"
-                              >
-                                <RotateCcw className="w-3 h-3" />
-                                กลับรายการ
-                              </button>
-                            )}
-                            {entry.sourceDocumentId && onNavigateToArchive && (
-                              <button
-                                type="button"
-                                onClick={onNavigateToArchive}
-                                className="inline-flex items-center gap-1 text-xs font-medium text-blue-800 border border-blue-100 hover:bg-blue-50 px-2 py-1 rounded-lg transition"
-                              >
-                                ดู Statement
-                                <ArrowRight className="w-3 h-3" />
-                              </button>
-                            )}
+            <Panel>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs text-gray-400 border-b border-gray-100">
+                      <th className="px-4 py-3 font-medium">วันที่</th>
+                      <th className="px-4 py-3 font-medium">เลขที่</th>
+                      <th className="px-4 py-3 font-medium">รายการ</th>
+                      <th className="px-4 py-3 font-medium">แหล่ง</th>
+                      <th className="px-4 py-3 font-medium">สถานะ</th>
+                      <th className="px-4 py-3 font-medium">บัญชี</th>
+                      <th className="px-4 py-3 font-medium text-right">เดบิต</th>
+                      <th className="px-4 py-3 font-medium text-right">เครดิต</th>
+                      <th className="px-4 py-3 font-medium text-right">
+                        จำนวน (THB)
+                      </th>
+                      <th className="px-4 py-3 font-medium">การจัดการ</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map((entry) => {
+                      const totals = entryTotals(entry);
+                      const reversed = isReversed(entry);
+                      const balanced =
+                        Math.abs(totals.debit - totals.credit) < 0.005;
+                      const skipped = entry.postingState === "SKIPPED";
+                      const detail = detailRows(entry);
+                      const summaryText = tradeSummary(entry);
+                      const showSubtitle = summaryText !== entry.description;
+                      const expanded = expandedIds.has(entry.id);
+                      const lineCount = skipped ? 1 : entry.lines.length;
+
+                      const actions = (
+                        <div className="flex flex-wrap items-center justify-end gap-1.5">
+                          {!reversed && !skipped && (
                             <button
                               type="button"
-                              onClick={() => toggleCollapsed(entry.id)}
-                              aria-label={
-                                collapsed ? "ขยายรายละเอียด" : "ยุบรายละเอียด"
-                              }
-                              className="text-gray-400 hover:text-gray-600 p-1 rounded-lg transition"
+                              onClick={() => {
+                                setActionError("");
+                                setReverseTarget(entry);
+                              }}
+                              className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 border border-gray-200 hover:bg-gray-50 px-2 py-1 rounded-lg transition"
                             >
-                              {collapsed ? (
-                                <ChevronDown className="w-4 h-4" />
-                              ) : (
-                                <ChevronUp className="w-4 h-4" />
-                              )}
+                              <RotateCcw className="w-3 h-3" />
+                              กลับรายการ
                             </button>
-                          </div>
+                          )}
+                          {entry.sourceDocumentId && onNavigateToArchive && (
+                            <button
+                              type="button"
+                              onClick={onNavigateToArchive}
+                              className="inline-flex items-center gap-1 text-xs font-medium text-blue-800 border border-blue-100 hover:bg-blue-50 px-2 py-1 rounded-lg transition"
+                            >
+                              ดู Statement
+                              <ArrowRight className="w-3 h-3" />
+                            </button>
+                          )}
+                          {detail.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => toggleExpanded(entry.id)}
+                              aria-label={
+                                expanded ? "ซ่อนรายละเอียด" : "ดูรายละเอียด"
+                              }
+                              className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 hover:bg-gray-50 px-2 py-1 rounded-lg transition"
+                            >
+                              {expanded ? (
+                                <ChevronUp className="w-3.5 h-3.5" />
+                              ) : (
+                                <ChevronDown className="w-3.5 h-3.5" />
+                              )}
+                              {expanded ? "ซ่อนรายละเอียด" : "ดูรายละเอียด"}
+                            </button>
+                          )}
                         </div>
+                      );
 
-                        {skipped && (
-                          <div className="px-5 py-3 bg-amber-50/60 border-b border-amber-100">
-                            <p className="text-xs text-amber-700">
-                              <span className="font-medium">ไม่ลงบัญชี:</span>{" "}
-                              {entry.skipReason === "backfilled-record-only"
-                                ? "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่"
-                                : entry.skipReason || "รายการนี้ถูกข้ามการลงบัญชี"}
-                            </p>
-                          </div>
-                        )}
-
-                        {collapsed ? (
-                          <button
-                            type="button"
-                            onClick={() => toggleCollapsed(entry.id)}
-                            className="w-full px-5 py-3 text-left text-xs text-gray-400 hover:bg-gray-50 transition"
+                      const headerCells = (rowSpan: number) => (
+                        <>
+                          <td
+                            rowSpan={rowSpan}
+                            className="px-4 py-3 text-gray-500 whitespace-nowrap align-top"
                           >
-                            กดเพื่อดูรายละเอียด — ข้อมูล Statement และคู่
-                            เดบิต/เครดิต
-                          </button>
-                        ) : (
-                          <>
-                            {detail.length > 0 && (
-                              <div className="px-5 py-4 border-b border-gray-100">
-                                <p className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 mb-2">
-                                  รายละเอียดรายการจาก Statement
-                                </p>
-                                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-x-6 gap-y-2">
-                                  {detail.map((row) => (
-                                    <div
-                                      key={row.label}
-                                      className="flex items-baseline justify-between gap-3 text-xs"
-                                    >
-                                      <span className="text-gray-400">
-                                        {row.label}
-                                      </span>
-                                      <span
-                                        className={`font-medium text-right whitespace-nowrap ${
-                                          row.label.includes("กำไร/ขาดทุน")
-                                            ? row.value.startsWith("-")
-                                              ? "text-red-500"
-                                              : "text-emerald-600"
-                                            : "text-gray-700"
-                                        }`}
-                                      >
-                                        {row.value}
-                                      </span>
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
+                            {entry.entryDate}
+                          </td>
+                          <td
+                            rowSpan={rowSpan}
+                            className="px-4 py-3 text-gray-500 align-top"
+                          >
+                            #{entry.entryNo}
+                          </td>
+                          <td
+                            rowSpan={rowSpan}
+                            className="px-4 py-3 align-top min-w-[200px]"
+                          >
+                            <p
+                              className={`text-sm font-medium ${
+                                reversed
+                                  ? "text-gray-400 line-through"
+                                  : "text-gray-800"
+                              }`}
+                            >
+                              {summaryText}
+                            </p>
+                            {showSubtitle && (
+                              <p className="text-xs text-gray-400">
+                                {entry.description}
+                              </p>
                             )}
+                            {skipped && (
+                              <p className="mt-1 text-xs text-amber-700">
+                                <span className="font-medium">ไม่ลงบัญชี:</span>{" "}
+                                {entry.skipReason === "backfilled-record-only"
+                                  ? "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่"
+                                  : entry.skipReason ||
+                                    "รายการนี้ถูกข้ามการลงบัญชี"}
+                              </p>
+                            )}
+                          </td>
+                          <td
+                            rowSpan={rowSpan}
+                            className="px-4 py-3 align-top"
+                          >
+                            <SourceBadge source={entry.sourceType} />
+                          </td>
+                          <td
+                            rowSpan={rowSpan}
+                            className="px-4 py-3 align-top"
+                          >
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {skipped ? (
+                                <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-600">
+                                  ข้ามไม่ลงบัญชี
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-blue-50 text-blue-700">
+                                  ลงบัญชีแล้ว
+                                </span>
+                              )}
+                              {reversed && <ReversedBadge />}
+                              {!skipped && (
+                                <span
+                                  className={`inline-flex items-center text-xs font-medium px-2 py-1 rounded-full ${
+                                    balanced
+                                      ? "bg-emerald-50 text-emerald-600"
+                                      : "bg-red-50 text-red-500"
+                                  }`}
+                                >
+                                  {balanced ? "สมดุล" : "ไม่สมดุล"}
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                        </>
+                      );
 
-                            {!skipped ? (
-                              <div className="overflow-x-auto">
-                                <table className="w-full text-sm">
-                                  <thead>
-                                    <tr className="text-left text-xs text-gray-400 border-b border-gray-50">
-                                      <th className="px-5 py-2 font-medium">
-                                        บัญชี
-                                      </th>
-                                      <th className="px-5 py-2 font-medium">
-                                        หมายเหตุ
-                                      </th>
-                                      <th className="px-5 py-2 font-medium text-right">
-                                        เดบิต
-                                      </th>
-                                      <th className="px-5 py-2 font-medium text-right">
-                                        เครดิต
-                                      </th>
-                                      <th className="px-5 py-2 font-medium text-right">
-                                        จำนวน (THB)
-                                      </th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {entry.lines.map((line) => (
-                                      <tr
-                                        key={line.id}
-                                        className="border-b border-gray-50 last:border-0"
-                                      >
-                                        <td className="px-5 py-2.5">
-                                          <div className="flex items-center gap-2">
-                                            <p className="text-gray-800">
-                                              {line.accountName}
-                                            </p>
-                                            <AccountTypeBadge
-                                              type={line.accountType}
-                                            />
-                                          </div>
-                                          <p className="text-xs text-gray-400">
-                                            {line.accountCode} · {line.currency}
-                                          </p>
-                                        </td>
-                                        <td className="px-5 py-2.5 text-xs text-gray-400">
-                                          {line.memo || "-"}
-                                        </td>
-                                        <td className="px-5 py-2.5 text-gray-800 font-medium text-right whitespace-nowrap">
-                                          {line.side === "DEBIT"
-                                            ? formatAmount(line.amount)
-                                            : "-"}
-                                        </td>
-                                        <td className="px-5 py-2.5 text-gray-800 font-medium text-right whitespace-nowrap">
-                                          {line.side === "CREDIT"
-                                            ? formatAmount(line.amount)
-                                            : "-"}
-                                        </td>
-                                        <td className="px-5 py-2.5 text-gray-500 text-right whitespace-nowrap">
-                                          {formatBaht(line.amountThb)}
-                                        </td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                  <tfoot>
-                                    <tr className="border-t border-gray-50">
-                                      <td className="px-5 py-2.5 text-xs font-medium text-gray-500">
-                                        รวม{" "}
-                                        {totals.debit.toLocaleString(undefined, {
-                                          minimumFractionDigits: 2,
-                                          maximumFractionDigits: 2,
-                                        })}
-                                      </td>
-                                      <td />
-                                      <td />
-                                      <td className="px-5 py-2.5 text-right">
-                                        <span
-                                          className={`inline-flex items-center text-xs font-medium px-2 py-1 rounded-full ${
-                                            balanced
-                                              ? "bg-emerald-50 text-emerald-600"
-                                              : "bg-red-50 text-red-500"
-                                          }`}
+                      return (
+                        <Fragment key={entry.id}>
+                          {entry.lines.length === 0 ? (
+                            <tr
+                              className={`border-b border-gray-50 hover:bg-gray-50/40 transition ${
+                                reversed ? "opacity-60" : ""
+                              }`}
+                            >
+                              {headerCells(1)}
+                              <td className="px-4 py-3 text-xs text-gray-300">
+                                -
+                              </td>
+                              <td className="px-4 py-3 text-right text-gray-800 font-medium whitespace-nowrap">
+                                -
+                              </td>
+                              <td className="px-4 py-3 text-right text-gray-800 font-medium whitespace-nowrap">
+                                -
+                              </td>
+                              <td className="px-4 py-3 text-right text-gray-500 whitespace-nowrap">
+                                -
+                              </td>
+                              <td className="px-4 py-3 align-top">{actions}</td>
+                            </tr>
+                          ) : (
+                            <>
+                              {entry.lines.map((line, i) => (
+                                <tr
+                                  key={line.id}
+                                  className={`border-b border-gray-50 hover:bg-gray-50/40 transition ${
+                                    reversed ? "opacity-60" : ""
+                                  }`}
+                                >
+                                  {i === 0 && headerCells(lineCount)}
+                                  <td className="px-4 py-3">
+                                    <div className="flex items-center gap-2">
+                                      <p className="text-gray-800">
+                                        {line.accountName}
+                                      </p>
+                                      <AccountTypeBadge
+                                        type={line.accountType}
+                                      />
+                                    </div>
+                                    <p className="text-xs text-gray-400">
+                                      {line.accountCode} · {line.currency}
+                                    </p>
+                                  </td>
+                                  <td className="px-4 py-3 text-gray-800 font-medium text-right whitespace-nowrap">
+                                    {line.side === "DEBIT"
+                                      ? formatAmount(line.amount)
+                                      : "-"}
+                                  </td>
+                                  <td className="px-4 py-3 text-gray-800 font-medium text-right whitespace-nowrap">
+                                    {line.side === "CREDIT"
+                                      ? formatAmount(line.amount)
+                                      : "-"}
+                                  </td>
+                                  <td className="px-4 py-3 text-gray-500 text-right whitespace-nowrap">
+                                    {formatBaht(line.amountThb)}
+                                  </td>
+                                  {i === 0 && (
+                                    <td
+                                      rowSpan={lineCount}
+                                      className="px-4 py-3 align-top"
+                                    >
+                                      {actions}
+                                    </td>
+                                  )}
+                                </tr>
+                              ))}
+                              <tr className="border-b border-gray-50 bg-gray-50/40">
+                                <td
+                                  colSpan={6}
+                                  className="px-4 py-2.5 text-right text-xs font-medium text-gray-500"
+                                >
+                                  รวม
+                                </td>
+                                <td className="px-4 py-2.5 text-right">
+                                  <span
+                                    className={`inline-flex items-center text-xs font-medium px-2 py-1 rounded-full ${
+                                      balanced
+                                        ? "bg-emerald-50 text-emerald-600"
+                                        : "bg-red-50 text-red-500"
+                                    }`}
+                                  >
+                                    {balanced ? "สมดุล" : "ไม่สมดุล"}
+                                  </span>
+                                </td>
+                                <td />
+                                <td className="px-4 py-2.5 text-right text-xs text-gray-500 whitespace-nowrap">
+                                  {formatBaht(totals.debit)}
+                                </td>
+                                <td />
+                              </tr>
+                            </>
+                          )}
+                          {expanded && (
+                            <tr className="bg-gray-50/60 border-b border-gray-100">
+                              <td colSpan={10} className="px-6 py-4">
+                                {detail.length === 0 ? (
+                                  <p className="text-xs text-gray-400">
+                                    ไม่มีรายละเอียดเพิ่มเติมจาก Statement
+                                  </p>
+                                ) : (
+                                  <>
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 mb-2">
+                                      รายละเอียดรายการจาก Statement
+                                    </p>
+                                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-x-6 gap-y-2">
+                                      {detail.map((row) => (
+                                        <div
+                                          key={row.label}
+                                          className="flex items-baseline justify-between gap-3 text-xs"
                                         >
-                                          {balanced ? "สมดุล" : "ไม่สมดุล"}
-                                        </span>
-                                      </td>
-                                      <td className="px-5 py-2.5 text-right text-xs text-gray-500 whitespace-nowrap">
-                                        {formatBaht(totals.debit)}
-                                      </td>
-                                    </tr>
-                                  </tfoot>
-                                </table>
-                              </div>
-                            ) : (
-                              <div className="px-5 py-4 text-xs text-gray-400">
-                                รายการนี้ถูกบันทึกในสมุดรายวันไว้ครบถ้วนแต่ไม่มีการลงบัญชีคู่
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </section>
-            ))}
+                                          <span className="text-gray-400">
+                                            {row.label}
+                                          </span>
+                                          <span
+                                            className={`font-medium text-right whitespace-nowrap ${
+                                              row.label.includes("กำไร/ขาดทุน")
+                                                ? row.value.startsWith("-")
+                                                  ? "text-red-500"
+                                                  : "text-emerald-600"
+                                                : "text-gray-700"
+                                            }`}
+                                          >
+                                            {row.value}
+                                          </span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </>
+                                )}
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Panel>
           </>
         )}
       </div>

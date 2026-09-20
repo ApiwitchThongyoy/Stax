@@ -805,3 +805,172 @@ export function summarizeAccountLedgers(
     });
   return { rows, totalsByCurrency };
 }
+
+// ---------------------------------------------------------------------------
+// Monthly closing (งบปิดเดือน): one account-balance snapshot per month + a
+// double-sided balance check and a continuity invariant. Each month's opening
+// is always computed from the STORED opening balance plus the full prior
+// history (never from the previous report), so `from`/`to` only limit WHICH
+// months are reported — they never change the numbers. Sides are checked on
+// the month's OWN lines (debit === credit per native currency via the trial
+// balance). Continuity: month[N+1].opening must equal month[N].closing for
+// every account+currency — if it ever does not, the report flags the pair.
+// ---------------------------------------------------------------------------
+
+export interface MonthlyClosingLineInput extends AccountLedgerSummaryLineInput {
+  /** Stored THB base (null when the source line has none). */
+  amountThb?: string | null;
+}
+
+/** One account's balance snapshot for a single month (normal-side movement). */
+export interface MonthlyClosingAccountRow extends AccountLedgerSummaryRow {}
+
+export interface MonthlyClosingMonthResult {
+  /** ISO "yyyy-mm". */
+  month: string;
+  rows: MonthlyClosingAccountRow[];
+  totalsByCurrency: AccountLedgerSummaryCurrencyTotal[];
+  /** The month's own POSTED lines balance (debit === credit) in every currency. */
+  balanced: boolean;
+  /** THB-base balance check; null when some line carries no THB base. */
+  balancedThb: boolean | null;
+  /** Number of POSTED journal lines in the month. */
+  lineCount: number;
+}
+
+export interface MonthlyClosingContinuityIssue {
+  /** The month whose opening mismatches the previous month's closing. */
+  month: string;
+  accountId: string;
+  currency: string;
+  /** Closing of the previous month. */
+  expected: string;
+  /** Opening of this month (as computed from the full prior history). */
+  actual: string;
+}
+
+export interface MonthlyClosingContinuity {
+  ok: boolean;
+  issues: MonthlyClosingContinuityIssue[];
+}
+
+export interface MonthlyClosingResult {
+  months: MonthlyClosingMonthResult[];
+  continuity: MonthlyClosingContinuity;
+}
+
+function monthStart(month: string): string {
+  return `${month}-01`;
+}
+
+function monthEnd(month: string): string {
+  const [y, m] = month.split("-").map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${month}-${String(last).padStart(2, "0")}`;
+}
+
+function betweenMonths(from: string, to: string): string[] {
+  const [y0, m0] = from.split("-").map(Number);
+  const [y1, m1] = to.split("-").map(Number);
+  const out: string[] = [];
+  let y = y0;
+  let m = m0;
+  let guard = 0;
+  while ((y !== y1 || m !== m1) && guard < 600) {
+    out.push(`${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}`);
+    m += 1;
+    if (m > 12) {
+      m = 1;
+      y += 1;
+    }
+    guard += 1;
+  }
+  out.push(`${String(y1).padStart(4, "0")}-${String(m1).padStart(2, "0")}`);
+  return out;
+}
+
+function derivedMonthRange(lines: readonly MonthlyClosingLineInput[]): {
+  from: string;
+  to: string;
+} {
+  let min = "";
+  let max = "";
+  for (const l of lines) {
+    const m = l.entryDate.slice(0, 7);
+    if (!min || m < min) min = m;
+    if (!max || m > max) max = m;
+  }
+  if (!min) {
+    const now = new Date();
+    min = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    max = min;
+  }
+  return { from: min, to: max };
+}
+
+export function buildMonthlyClosing(
+  accounts: readonly AccountLedgerSummaryInput[],
+  lines: readonly MonthlyClosingLineInput[],
+  from?: string,
+  to?: string
+): MonthlyClosingResult {
+  const range = from && to ? { from, to } : derivedMonthRange(lines);
+  const months = betweenMonths(range.from, range.to);
+  const accountMap: Record<string, AccountInfo> = Object.fromEntries(
+    accounts.map((a) => [
+      a.accountId,
+      { code: a.code, name: a.name, type: a.type, currency: a.currency },
+    ])
+  );
+  const monthResults: MonthlyClosingMonthResult[] = [];
+  const prevClosingsByAccount = new Map<string, string>();
+  const issues: MonthlyClosingContinuityIssue[] = [];
+
+  for (const month of months) {
+    const start = monthStart(month);
+    const end = monthEnd(month);
+    const linesUpToEnd = lines.filter((l) => l.entryDate <= end);
+    const monthOnly = lines.filter((l) => l.entryDate >= start && l.entryDate <= end);
+    const summary = summarizeAccountLedgers(accounts, linesUpToEnd, start);
+    const tb = trialBalance(
+      monthOnly.map((l) => {
+        const a = accounts.find((x) => x.accountId === l.accountId);
+        return {
+          accountId: l.accountId,
+          side: l.side,
+          amount: l.amount,
+          amountThb: l.amountThb ?? null,
+          currency: a?.currency,
+        } as ReportLine;
+      }),
+      accountMap
+    );
+    const balancedThb = monthOnly.every((l) => l.amountThb != null)
+      ? tb.balancedThb
+      : null;
+    for (const r of summary.rows) {
+      const key = `${r.accountId}|${r.currency}`;
+      const prev = prevClosingsByAccount.get(key);
+      if (prev != null && prev !== r.opening) {
+        issues.push({
+          month,
+          accountId: r.accountId,
+          currency: r.currency,
+          expected: prev,
+          actual: r.opening,
+        });
+      }
+      prevClosingsByAccount.set(key, r.closing);
+    }
+    monthResults.push({
+      month,
+      rows: summary.rows,
+      totalsByCurrency: summary.totalsByCurrency,
+      balanced: tb.balanced,
+      balancedThb,
+      lineCount: monthOnly.length,
+    });
+  }
+
+  return { months: monthResults, continuity: { ok: issues.length === 0, issues } };
+}

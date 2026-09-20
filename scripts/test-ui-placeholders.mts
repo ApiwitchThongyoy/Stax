@@ -75,6 +75,11 @@ const journalPage = read("app/component/Journal/JournalPage.tsx");
 const journalTab = read("app/component/Ledger/JournalTab.tsx");
 const trialBalanceTab = read("app/component/Ledger/TrialBalanceTab.tsx");
 const balanceSheetTab = read("app/component/Ledger/BalanceSheetTab.tsx");
+const monthlyClosingTab = read("app/component/Ledger/MonthlyClosingTab.tsx");
+const monthlyClosingRoute = read(
+  "app/routes/api/reports/monthly-closing.ts"
+);
+const generalLedgerPage = read("app/component/Ledger/GeneralLedgerPage.tsx");
 const corporateActionEngine = read("app/lib/corporate-action.ts");
 const corporateActionService = read("app/lib/corporate-action-service.ts");
 const corporateActionRoute = read("app/routes/api/corporate-actions.ts");
@@ -806,10 +811,11 @@ ok(
   "Journal searches entries client-side across description/symbol/accounts/memo"
 );
 ok(
-  journalPage.includes("function groupEntriesByDate(") &&
-    journalPage.includes("function formatThaiDate(") &&
-    journalPage.includes("THAI_MONTHS"),
-  "Journal groups entries by date with a Thai-formatted day header"
+  journalPage.includes("a.entryDate.localeCompare(b.entryDate) || a.entryNo - b.entryNo") &&
+    journalPage.includes(">วันที่</th>") &&
+    journalPage.includes("เรียงตามวันที่ (เก่าก่อน)") &&
+    !journalPage.includes("function groupEntriesByDate("),
+  "Journal table is a flat date-first (ASC) list with a วันที่ column and no per-day grouping headers"
 );
 ok(
   journalPage.includes("function tradeSummary(entry: GeneralLedgerJournalEntry)") &&
@@ -824,19 +830,21 @@ ok(
   "Journal search box filters live + an honest no-match state"
 );
 ok(
-  journalPage.includes("collapsedIds") &&
-    journalPage.includes("toggleCollapsed(entry.id)") &&
-    journalPage.includes("collapseAll") &&
-    journalPage.includes("expandAll") &&
-    journalPage.includes("ยุบทั้งหมด") &&
-    journalPage.includes("ขยายทั้งหมด"),
-  "Journal supports per-card collapse/expand + collapse-all/expand-all"
+  journalPage.includes("expandedIds") &&
+    journalPage.includes("toggleExpanded(entry.id)") &&
+    journalPage.includes('expanded ? "ซ่อนรายละเอียด" : "ดูรายละเอียด"') &&
+    !journalPage.includes("collapseAll") &&
+    !journalPage.includes("expandAll") &&
+    !journalPage.includes("ยุบทั้งหมด"),
+  "Journal toggles each entry's detail row individually (no per-day grouping or collapse-all/expand-all)"
 );
 ok(
   journalPage.includes("ChevronDown") &&
     journalPage.includes("ChevronUp") &&
-    journalPage.includes('collapsed ? "ขยายรายละเอียด" : "ยุบรายละเอียด"'),
-  "Journal card chevron toggles the detail section (default expanded)"
+    journalPage.includes("expandedIds.has(entry.id)") &&
+    journalPage.includes('"ซ่อนรายละเอียด"') &&
+    journalPage.includes('"ดูรายละเอียด"'),
+  "Journal per-entry chevron toggles that entry's detail section (default closed, one row per entry)"
 );
 ok(
   journalPage.includes("วิธีอ่านสมุดรายวัน") &&
@@ -849,10 +857,10 @@ ok(
   "Journal legend explains debit/credit without green/red color labels, and adds a backfilled-legacy explainer"
 );
 ok(
-  journalPage.includes('px-5 py-2.5 text-gray-800 font-medium') &&
+  journalPage.includes("px-4 py-3 text-gray-800 font-medium text-right") &&
     !journalPage.includes("px-5 py-2.5 text-emerald-600") &&
     !journalPage.includes("px-5 py-2.5 text-red-500") &&
-    journalTab.includes('px-5 py-2.5 text-gray-800 font-medium') &&
+    journalTab.includes("px-4 py-3 text-gray-800 font-medium text-right") &&
     !journalTab.includes("px-5 py-2.5 text-emerald-600") &&
     !journalTab.includes("px-5 py-2.5 text-red-500"),
   "Debit/credit amounts are neutral gray in both journal views (no green/red)"
@@ -2096,6 +2104,85 @@ ok(
     adminDashboard.includes('placeholder="ค้นหาชื่อไฟล์ ผู้ใช้ หรือกิจกรรม"') &&
     adminDashboard.includes("พบ {filteredUploadLog.length + filteredAccessLog.length} รายการ"),
   "Admin audit tab has one search box filtering both uploads + access logs client-side"
+);
+// ---------------------------------------------------------------------------
+// Monthly closing (งบปิดเดือน): pure engine + service + route + tab wiring.
+// The report is AS-OF book closing — from/to only pick which months are SHOWN,
+// every month's opening is recomputed from the stored opening balance plus the
+// full prior history, so the figures never depend on the requested window.
+// ---------------------------------------------------------------------------
+ok(
+  routesFile.includes("api/v1/reports/monthly-closing"),
+  "monthly-closing report route is registered next to the other reports"
+);
+{
+  const route = monthlyClosingRoute;
+  ok(
+    route.includes("getMonthlyClosing") &&
+      route.includes("seedDefaultChartOfAccounts") &&
+      route.includes("isValidIsoDate") &&
+      route.includes('from/to must be ISO dates (yyyy-mm-dd)') &&
+      route.includes('status: 405') &&
+      route.includes("Method not allowed"),
+    "monthly-closing route seeds CoA, validates ISO dates and is GET-only (405)"
+  );
+}
+ok(
+  generalLedger.includes("export function buildMonthlyClosing") &&
+    generalLedger.includes("MonthlyClosingMonthResult") &&
+    generalLedger.includes("MonthlyClosingContinuityIssue") &&
+    generalLedger.includes("monthStart") &&
+    generalLedger.includes("monthEnd") &&
+    generalLedger.includes("betweenMonths") &&
+    generalLedger.includes("summarizeAccountLedgers(accounts, linesUpToEnd, start)") &&
+    generalLedger.includes("continuity"),
+  "pure engine exports buildMonthlyClosing + month helpers + continuity"
+);
+ok(
+  ledgerService.includes("export async function getMonthlyClosing(") &&
+    ledgerService.includes("buildMonthlyClosing(accounts, lines, from, to)") &&
+    ledgerService.includes("fetchRawLines(userId, undefined, undefined)") &&
+    ledgerService.includes("MonthlyClosingLineInput"),
+  "ledger-service getMonthlyClosing loads the full POSTED history + accounts in parallel"
+);
+ok(
+  serverApi.includes("fetchMonthlyClosing") &&
+    serverApi.includes("GeneralLedgerMonthlyClosing") &&
+    serverApi.includes("/api/v1/reports/monthly-closing") &&
+    serverApi.includes("import(\"./general-ledger\").MonthlyClosingMonthResult"),
+  "server-api client has the monthly-closing fetch + DTO types"
+);
+ok(
+  generalLedgerPage.includes('{ id: "monthly", label: "งบปิดเดือน" }') &&
+    generalLedgerPage.includes("<MonthlyClosingTab />"),
+  "GL page gains the งบปิดเดือน tab wired to MonthlyClosingTab"
+);
+ok(
+  monthlyClosingTab.includes("fetchMonthlyClosing") &&
+    monthlyClosingTab.includes("thaiMonthLabel(") &&
+    monthlyClosingTab.includes("THAI_MONTHS") &&
+    monthlyClosingTab.includes("report.continuity") &&
+    monthlyClosingTab.includes("report.months.map((m) => {") &&
+    monthlyClosingTab.includes("setSelectedMonth(open ? null : m.month)"),
+  "MonthlyClosingTab fetches the report, renders per-month rows with expandable account detail"
+);
+ok(
+  monthlyClosingTab.includes("ยอดเปิด") &&
+    monthlyClosingTab.includes("ยอดปิด") &&
+    monthlyClosingTab.includes("เคลื่อนไหว") &&
+    monthlyClosingTab.includes("เดบิต") &&
+    monthlyClosingTab.includes("เครดิต") &&
+    monthlyClosingTab.includes("ความต่อเนื่อง") &&
+    monthlyClosingTab.includes("ต่อเนื่อง") &&
+    monthlyClosingTab.includes("ยอดเปิดของเดือนถัดไป = ยอดปิดของเดือนก่อนหน้า"),
+  "MonthlyClosingTab shows opening/movement/closing, balance badges and a continuity panel"
+);
+ok(
+  monthlyClosingTab.includes("formatSignedAmount(r.opening)") &&
+    monthlyClosingTab.includes("formatSignedAmount(r.netMovement)") &&
+    monthlyClosingTab.includes("formatSignedAmount(r.closing)") &&
+    !monthlyClosingTab.includes("toFixed("),
+  "MonthlyClosingTab renders server fields verbatim (debit-positive signs, no recompute in React)"
 );
 
 console.log("\n================ SUMMARY ================");

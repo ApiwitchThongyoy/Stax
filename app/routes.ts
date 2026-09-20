@@ -51,6 +51,7 @@ export default [
   route("api/v1/reports/trial-balance", "routes/api/reports/trial-balance.ts"),
   route("api/v1/reports/income-statement", "routes/api/reports/income-statement.ts"),
   route("api/v1/reports/balance-sheet", "routes/api/reports/balance-sheet.ts"),
+  route("api/v1/reports/monthly-closing", "routes/api/reports/monthly-closing.ts"),
 
   route("api/v1/statements/upload", "routes/api/statements/upload.ts"),
   route("api/v1/statements/preview", "routes/api/statements/preview.ts"),

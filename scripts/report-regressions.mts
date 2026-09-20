@@ -1,4 +1,4 @@
-import { balanceSheet, incomeStatement, trialBalance, type AccountMap, type Side } from "../app/lib/general-ledger";
+import { balanceSheet, buildMonthlyClosing, incomeStatement, trialBalance, type AccountLedgerSummaryInput, type AccountMap, type MonthlyClosingLineInput, type Side } from "../app/lib/general-ledger";
 
 export function runReportRegressions(ok: (value: boolean, label: string) => void) {
   const accounts: AccountMap = {
@@ -46,4 +46,47 @@ export function runReportRegressions(ok: (value: boolean, label: string) => void
   check(trialBalance(skipped, accounts).rows.length === 0, "SKIPPED has no TB effect");
   check(incomeStatement(skipped, accounts).netIncomeThb === "0.00", "SKIPPED has no income effect");
   check(balanceSheet(skipped, accounts).totalAssetsThb === "0.00", "SKIPPED has no balance-sheet effect");
+
+  runMonthlyClosingRegressions(ok);
+}
+
+function runMonthlyClosingRegressions(ok: (value: boolean, label: string) => void) {
+  const accounts: AccountLedgerSummaryInput[] = [
+    { accountId: "cash", code: "cash", name: "USD cash", currency: "USD", type: "ASSET", openingBalance: null },
+    { accountId: "capital", code: "capital", name: "USD capital", currency: "USD", type: "EQUITY", openingBalance: null },
+    { accountId: "thb", code: "thb", name: "THB cash", currency: "THB", type: "ASSET", openingBalance: null },
+    { accountId: "equity", code: "equity", name: "THB equity", currency: "THB", type: "EQUITY", openingBalance: null },
+  ];
+  const monthLine = (accountId: string, entryDate: string, side: Side, amount: string, amountThb?: string | null): MonthlyClosingLineInput => ({ accountId, entryDate, side, amount, amountThb });
+  const check = (v: boolean, label: string) => ok(v, "R18 monthly closing: " + label);
+  const full = [
+    monthLine("cash", "2025-12-15", "DEBIT", "100"),
+    monthLine("capital", "2025-12-15", "CREDIT", "100"),
+    monthLine("cash", "2026-01-10", "DEBIT", "50"),
+    monthLine("capital", "2026-01-10", "CREDIT", "50"),
+    monthLine("cash", "2026-02-05", "DEBIT", "30"),
+    monthLine("capital", "2026-02-05", "CREDIT", "30"),
+  ];
+  const janFeb = buildMonthlyClosing(accounts, full, "2026-01-01", "2026-02-28");
+  check(janFeb.months.length === 2 && janFeb.months[0].month === "2026-01" && janFeb.months[1].month === "2026-02", "months reported ASC in the requested window");
+  const jan = janFeb.months[0];
+  check(jan.rows[0].opening === "100.00" && jan.rows[0].closing === "150.00" && jan.lineCount === 2, "January opening includes full prior history and closes at 150");
+  check(jan.balanced, "January month lines balance (debit === credit)");
+  check(jan.balancedThb === null, "missing THB base keeps balancedThb null, never fabricated");
+  const feb = janFeb.months[1];
+  const febUsd = feb.totalsByCurrency.find((t) => t.currency === "USD");
+  check(feb.rows[0].opening === "150.00" && feb.rows[0].closing === "180.00" && febUsd?.closing === "360.00", "February carries January closing forward to 180 (totals sum both accounts)");
+  check(janFeb.continuity.ok && janFeb.continuity.issues.length === 0, "continuity holds (next opening === previous closing)");
+  const windowed = buildMonthlyClosing(accounts, full, "2026-02-01", "2026-02-28");
+  check(windowed.months.length === 1 && windowed.months[0].rows[0].opening === "150.00" && windowed.months[0].rows[0].closing === "180.00", "from/to only limit reporting; numbers equal the full-history run");
+  const thbLines = [
+    monthLine("thb", "2026-01-10", "DEBIT", "1000", "1000"),
+    monthLine("equity", "2026-01-10", "CREDIT", "1000", "1000"),
+  ];
+  const thbRes = buildMonthlyClosing(accounts, thbLines, "2026-01-01", "2026-01-31");
+  check(thbRes.months[0].balancedThb === true, "full THB base reports a real balancedThb");
+  const emptyMonth = buildMonthlyClosing(accounts, [monthLine("cash", "2025-11-01", "DEBIT", "10"), monthLine("capital", "2025-11-01", "CREDIT", "10")], "2025-11-01", "2026-01-31");
+  const emptyJan = emptyMonth.months[1];
+  check(emptyJan.lineCount === 0 && emptyJan.balanced && emptyJan.rows[0].opening === "10.00" && emptyJan.rows[0].closing === "10.00", "a month with no lines still reports opening/closing and stays balanced");
+  check(emptyMonth.continuity.ok, "continuity survives empty months");
 }

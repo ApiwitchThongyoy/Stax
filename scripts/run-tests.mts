@@ -44,6 +44,7 @@ const accountsRoute = await import("../app/routes/api/accounts");
 const journalRoute = await import("../app/routes/api/journal");
 const journalReverseRoute = await import("../app/routes/api/journal.$id.reverse");
 const trialBalanceRoute = await import("../app/routes/api/reports/trial-balance");
+const monthlyClosingRoute = await import("../app/routes/api/reports/monthly-closing");
 
 const { AuditAction } = await import("../app/lib/audit-log");
 
@@ -2441,6 +2442,149 @@ async function main() {
           ok(
             revRes.status === 200 && typeof revJson.data?.reversalEntryNo === "number",
             "REG-GL: reversal posts a mirror entry (200)"
+          );
+        }
+      }
+    }
+  }
+
+  // ================= REG: MONTHLY CLOSING =================
+  // The งบปิดเดือน report is an AS-OF book closing: every month's opening is
+  // recomputed from the stored opening balance plus the FULL prior history, so
+  // ?from/?to only pick which months are REPORTED — the numbers must equal a
+  // plain book-closing run regardless of the requested window. Proves through
+  // the REAL route:
+  //   - two balanced manual entries (Jan + Feb) produce per-month rows whose
+  //     January closing is carried forward into February's opening;
+  //   - a February-only window still reports the same February opening/closing
+  //     (window independence, never a partial-history restatement);
+  //   - each month is balanced in native currency + THB (±0.00 exact cents);
+  //   - continuity (next month opening === previous month closing) holds.
+  {
+    console.log("\n=== REG: MONTHLY CLOSING ===");
+    const { randomUUID } = await import("node:crypto");
+    const mcEmail = `mc-${randomUUID()}@test.local`;
+    const mcPassword = "McClose!234";
+    const mcReg = await registerAs(mcEmail, mcPassword);
+    const mcRegJson = (await mcReg.json()) as {
+      data?: { user?: { id?: string } };
+    };
+    const mcUserId = mcRegJson.data?.user?.id;
+    if (!mcUserId) {
+      ok(false, "REG-MC: register failed to create the monthly-closing user");
+    } else {
+      smokeUserIds.push(mcUserId);
+      const mcLogin = await loginAs(mcEmail, mcPassword);
+      const mcToken = mcLogin.data?.accessToken as string | undefined;
+      if (!mcToken) {
+        ok(false, "REG-MC: registered user could not log in");
+      } else {
+        const postEntry = async (
+          entryDate: string,
+          debit: string,
+          credit: string
+        ): Promise<boolean> => {
+          const res = await journalRoute.action({
+            request: jsonBody(
+              {
+                entryDate,
+                description: `ปิดเดือน ${entryDate}`,
+                lines: [
+                  { accountId: "1020", currency: "USD", debit, fxRateEffective: "35.0" },
+                  { accountId: "3010", currency: "USD", credit, fxRateEffective: "35.0" },
+                ],
+              },
+              "POST",
+              mcToken
+            ),
+          } as never);
+          return res.status === 201;
+        };
+        const janOk = await postEntry("2026-01-15", "100.00", "100.00");
+        const febOk = await postEntry("2026-02-10", "30.00", "30.00");
+        ok(janOk && febOk, "REG-MC: seeded two balanced manual entries (Jan 100, Feb 30)");
+
+        const fetchReport = async (from?: string, to?: string) =>
+          await monthlyClosingRoute.loader({
+            request: new Request(
+              from && to
+                ? `http://test.local/api?from=${from}&to=${to}`
+                : "http://test.local/api",
+              {
+                method: "GET",
+                headers: { Authorization: `Bearer ${mcToken}` },
+              }
+            ),
+          } as never);
+
+        const fullRes = await fetchReport("2026-01-01", "2026-02-28");
+        const fullJson = (await fullRes.json()) as {
+          data?: {
+            months: {
+              month: string;
+              balanced: boolean;
+              balancedThb: boolean | null;
+              lineCount: number;
+              rows: { accountId: string; code: string; opening: string; closing: string }[];
+            }[];
+            continuity: { ok: boolean; issues: unknown[] };
+          };
+        };
+        ok(fullRes.status === 200, "REG-MC: full-window report loads (200)");
+        const mFull = fullJson.data?.months;
+        ok(
+          mFull?.length === 2 &&
+            mFull[0].month === "2026-01" &&
+            mFull[1].month === "2026-02",
+          "REG-MC: Jan..Feb window reports exactly those two months ASC"
+        );
+        if (mFull) {
+          const jan = mFull[0];
+          const feb = mFull[1];
+          const janCash = jan.rows.find((r) => r.code === "1020");
+          const febCash = feb.rows.find((r) => r.code === "1020");
+          ok(
+            janCash?.opening === "0.00" &&
+              janCash?.closing === "100.00" &&
+              jan.lineCount === 2,
+            "REG-MC: January 1020 opens 0 and closes 100 (2 lines)"
+          );
+          ok(
+            febCash?.opening === "100.00" &&
+              febCash?.closing === "130.00" &&
+              feb.lineCount === 2,
+            "REG-MC: February 1020 opens at January's closing 100 and closes 130"
+          );
+          ok(
+            jan.balanced === true &&
+              feb.balanced === true &&
+              jan.balancedThb === true &&
+              feb.balancedThb === true,
+            "REG-MC: every month balances in native + THB bases"
+          );
+          ok(
+            fullJson.data?.continuity?.ok === true &&
+              (fullJson.data?.continuity?.issues ?? []).length === 0,
+            "REG-MC: continuity holds across the window"
+          );
+
+          // Window independence: a Feb-only request must report the SAME Feb
+          // numbers (opening still accumulated from full prior history).
+          const febRes = await fetchReport("2026-02-01", "2026-02-28");
+          const febJson = (await febRes.json()) as {
+            data?: { months: typeof mFull };
+          };
+          const febOnly = febJson.data?.months;
+          const febOnlyCash = febOnly?.[0]?.rows?.find(
+            (r) => r.code === "1020"
+          );
+          ok(
+            febOnly?.length === 1 &&
+              febOnly[0].month === "2026-02" &&
+              febOnlyCash?.opening === "100.00" &&
+              febOnlyCash?.closing === "130.00" &&
+              febOnly[0].lineCount === 2,
+            "REG-MC: Feb-only window reports the same numbers (as-of book closing)"
           );
         }
       }

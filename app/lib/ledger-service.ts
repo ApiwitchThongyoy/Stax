@@ -29,6 +29,7 @@ import {
   trialBalance,
   normalSideOf,
   validateJournalEntry,
+  buildMonthlyClosing,
   type AccountLedgerSummaryInput,
   type AccountLedgerSummaryLineInput,
   type AccountLedgerSummaryResult,
@@ -39,6 +40,7 @@ import {
   type JournalLineInput,
   type JournalTradeDetail,
   type LedgerSymbolSummary,
+  type MonthlyClosingLineInput,
   type PostingState,
   type Side,
   type ValidatedJournalEntry,
@@ -1776,10 +1778,13 @@ function toSymbolSummaryLine(r: RawLineWithEntry) {
 }
 
 /**
- * Account ledger with a running balance (positive on the account normal side). `opening` is the
- * balance accumulated before `from` (account opening balance + prior postings).
- * `symbolSummary` groups the period's lines by their memo label (per-stock, for
- * a dividend account) — empty when no memo'd lines.
+ * Account ledger with a signed running balance in the DEBIT-POSITIVE accounting
+ * convention (debits +, credits −), matching the Trial Balance `balance` column,
+ * so credit-normal accounts (INCOME/LIABILITY/EQUITY) show negative balances
+ * (e.g. a realized gain shows as a negative Y thousands in the gain account).
+ * `opening` is the balance accumulated before `from` (account opening balance +
+ * prior postings). `symbolSummary` groups the period's lines by their memo label
+ * (per-stock, for a dividend account) — empty when no memo'd lines.
  */
 export async function getAccountLedger(
   userId: string,
@@ -1808,7 +1813,7 @@ export async function getAccountLedger(
 
   const normalSide = normalSideOf(account[0].type as AccountMap[string]["type"]);
   let openingDec = new Decimal(account[0]?.openingBalance ?? "0");
-  const movementOf = (r: RawLineWithEntry) => new Decimal(r.line.debitAmount ?? r.line.creditAmount ?? "0").mul((r.line.debitAmount != null ? "DEBIT" : "CREDIT") === normalSide ? 1 : -1);
+  const movementOf = (r: RawLineWithEntry) => new Decimal(r.line.debitAmount ?? r.line.creditAmount ?? "0").mul(r.line.debitAmount != null ? 1 : -1);
   for (const r of raw) if (from && r.entry.entryDate < from) openingDec = openingDec.plus(movementOf(r));
   const period = raw.filter(r => !from || r.entry.entryDate >= from);
   let running = openingDec;
@@ -1936,6 +1941,41 @@ export async function getBalanceSheet(userId: string, to?: string) {
     amountThb: r.line.amountThb,
   }));
   return { ...balanceSheet(lines, accountMap, openingBalances, openingBalancesThb, lines.filter((_, i) => raw[i].entry.entryDate >= periodFrom)), periodFrom };
+}
+
+// ---------------------------------------------------------------------------
+// Monthly closing (งบปิดเดือน)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-month account balances for the user's chart of accounts. `from`/`to`
+ * are ISO dates that only limit WHICH months are reported; every month's
+ * opening is still computed from the stored opening balance plus the full
+ * prior history, so the figures equal a plain book-closing run regardless of
+ * the requested window. Only POSTED lines (selectRawLines) feed the engine —
+ * SKIPPED entries can never move a total or inflate a lineCount.
+ */
+export async function getMonthlyClosing(userId: string, from?: string, to?: string) {
+  const [accountRows, raw] = await Promise.all([
+    getAccounts(userId),
+    fetchRawLines(userId, undefined, undefined),
+  ]);
+  const accounts: AccountLedgerSummaryInput[] = accountRows.map((a) => ({
+    accountId: a.id,
+    code: a.code,
+    name: a.name,
+    type: a.type as AccountType,
+    currency: a.currency,
+    openingBalance: a.openingBalance,
+  }));
+  const lines: MonthlyClosingLineInput[] = raw.map((r) => ({
+    accountId: r.line.accountId,
+    entryDate: r.entry.entryDate,
+    side: r.line.debitAmount != null ? ("DEBIT" as Side) : ("CREDIT" as Side),
+    amount: r.line.debitAmount ?? r.line.creditAmount ?? "0",
+    amountThb: r.line.amountThb,
+  }));
+  return buildMonthlyClosing(accounts, lines, from, to);
 }
 
 // ---------------------------------------------------------------------------
