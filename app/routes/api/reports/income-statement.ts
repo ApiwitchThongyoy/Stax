@@ -18,7 +18,7 @@ function isValidIsoDate(value: string): boolean {
   const month = Number(m[2]);
   const day = Number(m[3]);
   if (year < 1900 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31) return false;
-  return true;
+  return new Date(Date.UTC(year, month - 1, day)).toISOString().slice(0, 10) === value;
 }
 
 export async function loader({ request }: Route.LoaderArgs) {
@@ -30,7 +30,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   const url = new URL(request.url);
   const from = url.searchParams.get("from") ?? undefined;
   const to = url.searchParams.get("to") ?? undefined;
-  if ((from && !isValidIsoDate(from)) || (to && !isValidIsoDate(to))) {
+  if ((from && !isValidIsoDate(from)) || (to && !isValidIsoDate(to)) || (from && to && from > to)) {
     return Response.json(
       { success: false, message: "from/to must be ISO dates (yyyy-mm-dd)" },
       { status: 400 }
