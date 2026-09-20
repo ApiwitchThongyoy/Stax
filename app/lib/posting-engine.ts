@@ -59,8 +59,8 @@
 // and never alters the source Capital_Transactions values (they stay verbatim).
 // Missing source data/rates or incompatible accounts stay SKIPPED.
 import type { ValidatedCapitalRow } from "./statement-pipeline";
-import { moneyInThb } from "./accounting-amounts";
-import { validateJournalEntry, DEFAULT_CHART_OF_ACCOUNTS } from "./general-ledger";
+import { moneyInThb, roundMoney } from "./accounting-amounts";
+import { validateJournalEntry, DEFAULT_CHART_OF_ACCOUNTS, ROUNDING_ADJUSTMENT_MEMO } from "./general-ledger";
 import type {
   JournalEntryInput,
   JournalLineInput,
@@ -85,6 +85,67 @@ const WHT_EXPENSE = "5110";
 const LOSS_EXPENSE = "5120";
 /** Memo stamped on the THB 5020 FX-variance leg of a non-balancing exchange. */
 export const FX_VARIANCE_MEMO = "FX conversion variance";
+
+/**
+ * Auto-levy a THB rounding-adjustment leg on a wholly-valid single-currency
+ * non-THB entry. The 2-stage THB conversion (round the native leg to cents,
+ * then round cents x fx) can make an entry's per-line THB reporting bases
+ * differ by up to a satang even when the native amounts balance exactly (e.g.
+ * Dr 10.00 + Dr 10.00 vs Cr 20.00 at fx 3.1415 -> Dr THB 62.84 vs Cr THB
+ * 62.83). Instead of SKIPPING such rows, the entry posts with an extra
+ * THB-only 5020 leg of exactly the <= 0.01 difference — CREDIT when the debit
+ * base exceeded the credit base, DEBIT otherwise — stamped with
+ * ROUNDING_ADJUSTMENT_MEMO so the validator recognises it and accepts the
+ * whole entry. Never applied to FX conversions (two currencies), THB entries,
+ * missing/non-positive FX, a zero difference, or a difference larger than
+ * 0.01 THB. Source amounts and rates are never altered.
+ */
+export function applyThbRoundingAdjustment(entry: JournalEntryInput): JournalEntryInput {
+  const currencies = [
+    ...new Set(entry.lines.map((l) => String(l.currency ?? "").trim().toUpperCase())),
+  ];
+  if (currencies.length !== 1) return entry;
+  if (currencies[0] === "THB") return entry;
+  for (const l of entry.lines) {
+    const rawFx = l.fxRateEffective;
+    let raw: Decimal;
+    try {
+      raw = new Decimal(String(rawFx ?? ""));
+    } catch {
+      return entry;
+    }
+    if (!raw.isFinite() || raw.lte(0)) return entry;
+  }
+  let debitThb = new Decimal(0);
+  let creditThb = new Decimal(0);
+  for (const l of entry.lines) {
+    const amount = roundMoney(String(l.debit ?? l.credit ?? ""));
+    const fx = new Decimal(String(l.fxRateEffective));
+    const lineThb = new Decimal(moneyInThb(amount, fx));
+    const hasDebit = l.debit !== undefined && l.debit !== null && l.debit !== "";
+    if (hasDebit) debitThb = debitThb.plus(lineThb);
+    else creditThb = creditThb.plus(lineThb);
+  }
+  const diff = debitThb.minus(creditThb);
+  if (diff.isZero() || diff.abs().gt(new Decimal("0.01"))) return entry;
+  const side: "debit" | "credit" = diff.gt(0) ? "credit" : "debit";
+  return {
+    ...entry,
+    lines: [
+      ...entry.lines,
+      {
+        accountId: FX_VARIANCE,
+        currency: "THB",
+        fxRateEffective: "1",
+        fxRateStatement: "1",
+        memo: ROUNDING_ADJUSTMENT_MEMO,
+        ...(side === "debit"
+          ? { debit: roundMoney(diff.abs()) }
+          : { credit: roundMoney(diff.abs()) }),
+      },
+    ],
+  };
+}
 
 export type CapitalPostingResult =
   | { ok: true; entry: JournalEntryInput; note?: string }
@@ -269,14 +330,19 @@ function expenseAccountFor(row: ValidatedCapitalRow): string {
 export function postCapitalRow(row: ValidatedCapitalRow): CapitalPostingResult {
   const result = postCapitalRowUnchecked(row);
   if (!result.ok) return result;
+  // A <= 0.01 reporting-base rounding difference on an otherwise-valid
+  // single-currency non-THB entry is absorbed by a THB rounding-adjustment leg
+  // instead of SKIP (the entry stays POSTED — the numbers themselves never
+  // change, only the derived THB base gains an exact adjustment leg).
+  const entry = applyThbRoundingAdjustment(result.entry);
   // Automatic postings use only the established role/code and exact currency.
   const accounts = new Map(DEFAULT_CHART_OF_ACCOUNTS.map(a => [a.code, a.currency]));
-  for (const line of result.entry.lines) {
+  for (const line of entry.lines) {
     if (accounts.get(line.accountId) !== line.currency) {
       return { ok: false, reason: `no compatible ${line.currency} account for ${line.accountId} - not posted` };
     }
   }
-  return result;
+  return { ...result, entry };
 }
 
 function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult {

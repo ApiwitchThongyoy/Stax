@@ -10,6 +10,8 @@ import {
   fetchAccountLedger,
   fetchAccountCategorySummary,
   fetchUserTransaction,
+  ownerSignedFromDebitPositive,
+  ownerSignedFromNormalSide,
   type CapitalLedgerRow,
   type GeneralLedgerAccount,
   type GeneralLedgerAccountCategoryRow,
@@ -703,20 +705,36 @@ export default function AccountCategoryView({
                           </td>
                           <td className="px-5 py-3 text-right text-gray-600 whitespace-nowrap">
                             {formatSignedAmount(
-                              l.side === "DEBIT" ? l.amount : `-${l.amount}`
+                              ownerSignedFromDebitPositive(
+                                selected.type,
+                                l.side === "DEBIT" ? l.amount : `-${l.amount}`
+                              ) ?? "0"
                             )}
                           </td>
                           <td className="px-5 py-3 text-right font-medium whitespace-nowrap">
                             <span
                               className={
-                                Number(l.runningBalance) > 0
-                                  ? "text-emerald-600"
-                                  : Number(l.runningBalance) < 0
-                                    ? "text-red-600"
-                                    : "text-gray-600"
+                                (() => {
+                                  const own = Number(
+                                    ownerSignedFromDebitPositive(
+                                      selected.type,
+                                      l.runningBalance
+                                    ) ?? "0"
+                                  );
+                                  return own > 0
+                                    ? "text-emerald-600"
+                                    : own < 0
+                                      ? "text-red-600"
+                                      : "text-gray-600";
+                                })()
                               }
                             >
-                              {formatSignedAmount(l.runningBalance)}
+                              {formatSignedAmount(
+                                ownerSignedFromDebitPositive(
+                                  selected.type,
+                                  l.runningBalance
+                                ) ?? "0"
+                              )}
                             </span>
                           </td>
                         </tr>
@@ -732,7 +750,9 @@ export default function AccountCategoryView({
                         </td>
                         <td colSpan={3}></td>
                         <td className="px-5 py-3 text-gray-800 font-semibold text-right whitespace-nowrap">
-                          {formatSignedAmount(opening)}
+                          {formatSignedAmount(
+                            ownerSignedFromDebitPositive(selected.type, opening) ?? "0"
+                          )}
                         </td>
                       </tr>
                       <tr className="bg-gray-50/60">
@@ -744,17 +764,21 @@ export default function AccountCategoryView({
                         </td>
                         <td colSpan={2}></td>
                         <td className="px-5 py-3 text-gray-800 font-semibold text-right whitespace-nowrap">
-                          {formatSignedAmount(movement)}
+                          {formatSignedAmount(
+                            ownerSignedFromDebitPositive(selected.type, movement) ?? "0"
+                          )}
                         </td>
                         <td className="px-5 py-3 text-gray-800 font-semibold text-right whitespace-nowrap">
-                          {formatSignedAmount(closing)}
+                          {formatSignedAmount(
+                            ownerSignedFromDebitPositive(selected.type, closing) ?? "0"
+                          )}
                         </td>
                       </tr>
                     </tfoot>
                   </table>
                 </div>
                 <p className="px-5 py-3 text-xs text-gray-400 border-t border-gray-100">
-                  ยอดตามหลักเดบิตบวก (เดบิต + / เครดิต −) — ตรงกับคอลัมน์ balance ของงบทดลอง บัญชีที่ปกติเป็นเครดิต (ส่วนทุน/รายได้/หนี้สิน) จะแสดงเป็นตัวติดลบ
+                  แสดงตามหลักเครื่องหมายเจ้าของ: สินทรัพย์/หนี้สิน เป็นบวกเมื่อมียอดอยู่ฝั่งปกติ ส่วนทุน/รายได้/ค่าใช้จ่าย เป็นลบ ไม่ใช่การคำนวณใหม่ — ตัวเลขมาจากเซิร์ฟเวอร์ (แค่กลับเครื่องหมายเพื่อให้อ่านง่าย)
                 </p>
               </>
             )}
@@ -821,11 +845,11 @@ export default function AccountCategoryView({
             <div className="mt-2 space-y-1.5">
               {categoryTotals.map((t) => (
                 <p key={t.currency} className="text-sm font-semibold text-gray-800">
-                  {t.currency} · ปิด {formatAmount(t.closing)}
+                  {t.currency} · ปิด {formatAmount(ownerSignedFromNormalSide(type, t.closing) ?? t.closing)}
                   <span className="text-xs text-gray-400 font-normal">
                     {" "}
-                    (ยกมา {formatAmount(t.opening)} · เคลื่อนไหว{" "}
-                    {formatSignedAmount(t.movement)})
+                    (ยกมา {formatAmount(ownerSignedFromNormalSide(type, t.opening) ?? t.opening)} · เคลื่อนไหว{" "}
+                    {formatSignedAmount(ownerSignedFromNormalSide(type, t.movement) ?? "0")})
                   </span>
                 </p>
               ))}
@@ -947,13 +971,13 @@ export default function AccountCategoryView({
                       </td>
                       <td className="px-5 py-3.5 text-gray-500">{row.currency}</td>
                       <td className="px-5 py-3.5 text-gray-600 text-right whitespace-nowrap">
-                        {s ? formatAmount(s.opening) : "-"}
+                        {s ? formatAmount(ownerSignedFromNormalSide(row.type, s.opening) ?? s.opening) : "-"}
                       </td>
                       <td className="px-5 py-3.5 text-gray-600 text-right whitespace-nowrap">
-                        {s ? formatSignedAmount(s.netMovement) : "-"}
+                        {s ? formatSignedAmount(ownerSignedFromNormalSide(row.type, s.netMovement) ?? "0") : "-"}
                       </td>
                       <td className="px-5 py-3.5 text-gray-700 font-medium text-right whitespace-nowrap">
-                        {s ? formatSignedAmount(s.closing) : "-"}
+                        {s ? formatSignedAmount(ownerSignedFromNormalSide(row.type, s.closing) ?? "0") : "-"}
                       </td>
                       <td className="px-5 py-3.5 text-gray-600 text-right">
                         {s ? s.lineCount : "-"}

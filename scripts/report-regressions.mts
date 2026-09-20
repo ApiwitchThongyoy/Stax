@@ -41,11 +41,52 @@ export function runReportRegressions(ok: (value: boolean, label: string) => void
   check(unknownOpening.totalAssetsThb === null && unknownOpening.totalEquityAndLiabilitiesThb === null && !unknownOpening.balancedThb && unknownOpening.reportingStatus === "UNAVAILABLE", "foreign openings never fabricate THB zero");
   const fx = [line("cash", "DEBIT", "1000", "35000"), line("thb", "CREDIT", "35000", "35000")];
   const fxSheet = balanceSheet(fx, accounts);
-  check(fxSheet.totalAssets === null && fxSheet.balancedThb && !fxSheet.balanced, "FX balances in reporting base; native currency balances are informational");
+  check(fxSheet.totalAssets === null && fxSheet.balanced && fxSheet.balancedThb, "FX balances in reporting base; the THB base is now the authoritative balanced signal");
   const skipped = [line("income", "CREDIT", "999", "34965"), line("cash", "DEBIT", "999", "34965")].map(l => ({ ...l, postingState: "SKIPPED" }));
   check(trialBalance(skipped, accounts).rows.length === 0, "SKIPPED has no TB effect");
   check(incomeStatement(skipped, accounts).netIncomeThb === "0.00", "SKIPPED has no income effect");
   check(balanceSheet(skipped, accounts).totalAssetsThb === "0.00", "SKIPPED has no balance-sheet effect");
+
+  // ---- R9-12: THB-primary `balanced` (the THB reporting base is authoritative) ----
+  const nativeBalanced = trialBalance([
+    line("thb", "DEBIT", "1000", "1000"), line("equity", "CREDIT", "1000", "1000"),
+    line("cash", "DEBIT", "100", "3500"), line("capital", "CREDIT", "100", "3500"),
+  ], accounts);
+  check(nativeBalanced.totalDebit === null && nativeBalanced.balanced === true && nativeBalanced.balancedThb === true,
+    "TB THB-primary: mixed native THB/USD inequality still reports balanced=true when the THB base equals (4500)");
+  check(nativeBalanced.totalDebitThb === "4500.00" && nativeBalanced.totalCreditThb === "4500.00",
+    "TB THB-primary: THB totals stay distinct column values (Debit/Credit are real columns)");
+  const thbImbalanced = trialBalance([
+    line("thb", "DEBIT", "1000", "1000"), line("equity", "CREDIT", "1000.01", "1000.01"),
+  ], accounts);
+  check(thbImbalanced.totalDebitThb === "1000.00" && thbImbalanced.totalCreditThb === "1000.01" &&
+    thbImbalanced.rows[0].debit === "0.00" && thbImbalanced.rows[0].credit === "1000.01" &&
+    thbImbalanced.rows[1].debit === "1000.00" && thbImbalanced.rows[1].credit === "0.00" &&
+    thbImbalanced.balanced === false && thbImbalanced.balancedThb === false,
+    "TB THB-primary: a genuine THB imbalance (1000.00 vs 1000.01) flips balanced=false and keeps real Debit/Credit columns");
+
+  // ---- R9-12: balance-sheet as-of lock (numbers are window-independent) ----
+  // Dataset: NO activity before 2026-01-01; valid POSTED activity across 2026.
+  // The engine never invents a fallback for an empty earlier window, and each
+  // as-of reads ONLY stored openings + the POSTED history through that date.
+  const janLine = (a: string, s: Side, amount: string) => line(a, s, amount, amount);
+  const book2026 = [
+    janLine("thb", "DEBIT", "10000"), janLine("equity", "CREDIT", "10000"), // Jan capital
+    janLine("thb", "DEBIT", "2000"), janLine("revenue", "CREDIT", "2000"),  // Feb income
+    janLine("expense", "DEBIT", "500"), janLine("thb", "CREDIT", "500"),    // Mar expense
+  ];
+  const start2025 = balanceSheet([], accounts);
+  check(start2025.assets.length === 0 && start2025.liabilities.length === 0 && start2025.totalAssetsThb === "0.00" &&
+    start2025.totalEquityAndLiabilitiesThb === "0.00" && start2025.balancedThb,
+    "BS as-of 2025-01-01: empty window stays zero, never falls back to future activity");
+  const jan31 = balanceSheet(book2026.slice(0, 2), accounts);
+  check(jan31.totalAssetsThb === "10000.00" && jan31.totalEquityAndLiabilitiesThb === "10000.00" &&
+    jan31.netIncomeThb === "0.00" && jan31.balancedThb,
+    "BS as-of 2026-01-31: January only (capital 10000 / 10000), no February leak");
+  const mar31 = balanceSheet(book2026, accounts);
+  check(mar31.totalAssetsThb === "11500.00" && mar31.totalEquityAndLiabilitiesThb === "11500.00" &&
+    mar31.netIncomeThb === "1500.00" && mar31.balancedThb,
+    "BS as-of 2026-03-31: cash 10000+2000-500 = equity 10000 + NI (2000-500) 1500, balances in THB");
 
   runMonthlyClosingRegressions(ok);
 }

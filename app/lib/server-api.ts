@@ -560,6 +560,44 @@ export function holdingCurrencyCode(symbol: string): string {
   return holdingCurrency(symbol);
 }
 
+/**
+ * Owner-sign presentation helper (display-only): re-signs a DEBIT-POSITIVE
+ * account balance so that ASSET and LIABILITY read positively while EQUITY,
+ * INCOME and EXPENSE read negatively (e.g. a positive credit balance in a
+ * liability account displays as a negative owner amount). Input values come
+ * DEBIT-positive from the server (getAccountLedger opening/movement/closing);
+ * this never recomputes P&L/tax — it only flips the sign for presentation.
+ * null/blank input stays null so callers can render "-".
+ */
+export function ownerSignedFromDebitPositive(
+  type: GeneralLedgerAccountType,
+  value: string | null | undefined
+): string | null {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return value;
+  const negate = type === "EQUITY" || type === "INCOME" || type === "EXPENSE";
+  return (negate ? -n : n).toString();
+}
+
+/**
+ * Owner-sign presentation helper (display-only): re-signs a NORMAL-SIDE account
+ * balance so that ASSET, EQUITY and INCOME read positively while LIABILITY and
+ * EXPENSE read negatively. Input values arrive NORMAL-SIDE from the server
+ * (summarizeAccountLedgers account rows and category totals); this only flips
+ * the sign for presentation, never for computation. null/blank stays null.
+ */
+export function ownerSignedFromNormalSide(
+  type: GeneralLedgerAccountType,
+  value: string | null | undefined
+): string | null {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return value;
+  const negate = type === "LIABILITY" || type === "EXPENSE";
+  return (negate ? -n : n).toString();
+}
+
 export interface GeneralLedgerAccountLedger {
   opening: string;
   lines: GeneralLedgerLineView[];
