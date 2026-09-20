@@ -456,6 +456,15 @@ export type GeneralLedgerBalanceSheetCurrencyTotal = import("./general-ledger").
 
 export type GeneralLedgerBalanceSheet = import("./general-ledger").BalanceSheetResult;
 
+/** Monthly-closing result returned by GET /api/v1/reports/monthly-closing. */
+export type GeneralLedgerMonthlyClosingAccountRow = import("./general-ledger").MonthlyClosingAccountRow;
+
+export type GeneralLedgerMonthlyClosingMonth = import("./general-ledger").MonthlyClosingMonthResult;
+
+export type GeneralLedgerMonthlyClosingContinuityIssue = import("./general-ledger").MonthlyClosingContinuityIssue;
+
+export type GeneralLedgerMonthlyClosing = import("./general-ledger").MonthlyClosingResult;
+
 /** Per-account ledger result returned by GET /api/v1/ledger/accounts/:id. */
 export interface GeneralLedgerLineView {
   lineId: string;
@@ -789,6 +798,23 @@ export async function fetchBalanceSheet(
   const out = await okJson<GeneralLedgerBalanceSheet>(res);
   if (!out.ok || !out.data) {
     throw new Error(out.message || "Failed to load balance sheet");
+  }
+  return out.data;
+}
+
+/** Fetch the monthly-closing report (per-month account balances). */
+export async function fetchMonthlyClosing(
+  accessToken: string,
+  from?: string,
+  to?: string
+): Promise<GeneralLedgerMonthlyClosing> {
+  const res = await fetch(
+    `/api/v1/reports/monthly-closing${periodParams(from, to)}`,
+    { headers: authHeaders(accessToken) }
+  );
+  const out = await okJson<GeneralLedgerMonthlyClosing>(res);
+  if (!out.ok || !out.data) {
+    throw new Error(out.message || "Failed to load monthly closing");
   }
   return out.data;
 }

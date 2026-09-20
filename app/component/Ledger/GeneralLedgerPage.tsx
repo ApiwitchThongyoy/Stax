@@ -6,8 +6,9 @@ import AccountLedgerDetail from "./AccountLedgerDetail";
 import TrialBalanceTab from "./TrialBalanceTab";
 import IncomeStatementTab from "./IncomeStatementTab";
 import BalanceSheetTab from "./BalanceSheetTab";
+import MonthlyClosingTab from "./MonthlyClosingTab";
 
-type GlTab = "accounts" | "journal" | "trial" | "income" | "balance";
+type GlTab = "accounts" | "journal" | "trial" | "income" | "balance" | "monthly";
 
 const TABS: { id: GlTab; label: string }[] = [
   { id: "accounts", label: "ผังบัญชี" },
@@ -15,6 +16,7 @@ const TABS: { id: GlTab; label: string }[] = [
   { id: "trial", label: "งบทดลอง" },
   { id: "income", label: "งบกำไรขาดทุน" },
   { id: "balance", label: "งบดุล" },
+  { id: "monthly", label: "งบปิดเดือน" },
 ];
 
 interface GeneralLedgerPageProps {
@@ -65,6 +67,8 @@ export default function GeneralLedgerPage({
           <TrialBalanceTab />
         ) : tab === "income" ? (
           <IncomeStatementTab />
+        ) : tab === "monthly" ? (
+          <MonthlyClosingTab />
         ) : (
           <BalanceSheetTab />
         )}

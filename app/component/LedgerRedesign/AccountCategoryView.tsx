@@ -164,6 +164,8 @@ export default function AccountCategoryView({
   const [appliedFrom, setAppliedFrom] = useState(period.from);
   const [appliedTo, setAppliedTo] = useState(period.to);
   const [opening, setOpening] = useState("0");
+  const [movement, setMovement] = useState("0");
+  const [closing, setClosing] = useState("0");
   const [lines, setLines] = useState<GeneralLedgerLineView[]>([]);
   const [symbolSummary, setSymbolSummary] = useState<
     GeneralLedgerSymbolSummary[]
@@ -264,6 +266,8 @@ export default function AccountCategoryView({
         appliedTo
       );
       setOpening(data.opening);
+      setMovement(data.movement);
+      setClosing(data.closing);
       setLines(data.lines);
       setSymbolSummary(data.symbolSummary);
       setDetailState("success");
@@ -646,10 +650,11 @@ export default function AccountCategoryView({
                         <th className="px-5 py-3 font-medium">เลขที่</th>
                         <th className="px-5 py-3 font-medium">วันที่</th>
                         <th className="px-5 py-3 font-medium">รายการ</th>
-                        <th className="px-5 py-3 font-medium">ฝั่ง</th>
                         <th className="px-5 py-3 font-medium">ที่มา</th>
                         <th className="px-5 py-3 font-medium">ธุรกรรม</th>
-                        <th className="px-5 py-3 font-medium text-right">จำนวนเงิน</th>
+                        <th className="px-5 py-3 font-medium text-right">เดบิต</th>
+                        <th className="px-5 py-3 font-medium text-right">เครดิต</th>
+                        <th className="px-5 py-3 font-medium text-right">เคลื่อนไหว</th>
                         <th className="px-5 py-3 font-medium text-right">ยอดคงเหลือ</th>
                       </tr>
                     </thead>
@@ -674,17 +679,6 @@ export default function AccountCategoryView({
                             )}
                           </td>
                           <td className="px-5 py-3">
-                            <span
-                              className={`inline-flex items-center text-xs font-medium px-2 py-1 rounded-full ${
-                                l.side === "DEBIT"
-                                  ? "bg-emerald-50 text-emerald-600"
-                                  : "bg-red-50 text-red-500"
-                              }`}
-                            >
-                              {l.side === "DEBIT" ? "เดบิต" : "เครดิต"}
-                            </span>
-                          </td>
-                          <td className="px-5 py-3">
                             <SourceBadge source={l.sourceType} />
                           </td>
                           <td className="px-5 py-3">
@@ -701,8 +695,16 @@ export default function AccountCategoryView({
                               <span className="text-xs text-gray-300">-</span>
                             )}
                           </td>
-                          <td className="px-5 py-3 text-right text-gray-700 whitespace-nowrap">
-                            {formatAmount(l.amount)}
+                          <td className="px-5 py-3 text-right text-gray-800 font-medium whitespace-nowrap">
+                            {l.side === "DEBIT" ? formatAmount(l.amount) : "-"}
+                          </td>
+                          <td className="px-5 py-3 text-right text-gray-800 font-medium whitespace-nowrap">
+                            {l.side === "CREDIT" ? formatAmount(l.amount) : "-"}
+                          </td>
+                          <td className="px-5 py-3 text-right text-gray-600 whitespace-nowrap">
+                            {formatSignedAmount(
+                              l.side === "DEBIT" ? l.amount : `-${l.amount}`
+                            )}
                           </td>
                           <td className="px-5 py-3 text-right font-medium whitespace-nowrap">
                             <span
@@ -724,24 +726,36 @@ export default function AccountCategoryView({
                       <tr className="border-t bg-gray-50/60">
                         <td
                           className="px-5 py-3 text-sm font-semibold text-gray-700"
-                          colSpan={6}
+                          colSpan={5}
                         >
-                          ยอดยกมา / ยอดคงเหลือ ({selected.currency})
+                          ยอดยกมา (ก่อนช่วง, {selected.currency})
+                        </td>
+                        <td colSpan={3}></td>
+                        <td className="px-5 py-3 text-gray-800 font-semibold text-right whitespace-nowrap">
+                          {formatSignedAmount(opening)}
+                        </td>
+                      </tr>
+                      <tr className="bg-gray-50/60">
+                        <td
+                          className="px-5 py-3 text-sm font-semibold text-gray-700"
+                          colSpan={5}
+                        >
+                          ยอดรวมเคลื่อนไหว ({selected.currency})
+                        </td>
+                        <td colSpan={2}></td>
+                        <td className="px-5 py-3 text-gray-800 font-semibold text-right whitespace-nowrap">
+                          {formatSignedAmount(movement)}
                         </td>
                         <td className="px-5 py-3 text-gray-800 font-semibold text-right whitespace-nowrap">
-                          {formatAmount(opening)}
-                        </td>
-                        <td className="px-5 py-3 text-gray-800 font-semibold text-right whitespace-nowrap">
-                          {formatSignedAmount(
-                            lines.length > 0
-                              ? lines[lines.length - 1].runningBalance
-                              : opening
-                          )}
+                          {formatSignedAmount(closing)}
                         </td>
                       </tr>
                     </tfoot>
                   </table>
                 </div>
+                <p className="px-5 py-3 text-xs text-gray-400 border-t border-gray-100">
+                  ยอดตามหลักเดบิตบวก (เดบิต + / เครดิต −) — ตรงกับคอลัมน์ balance ของงบทดลอง บัญชีที่ปกติเป็นเครดิต (ส่วนทุน/รายได้/หนี้สิน) จะแสดงเป็นตัวติดลบ
+                </p>
               </>
             )}
           </Panel>

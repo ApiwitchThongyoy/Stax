@@ -48,9 +48,11 @@ export function formatSignedAmount(
 }
 
 export function defaultPeriod(): { from: string; to: string } {
+  // Default period starts at the ledger's oldest supported data (2025-01-01)
+  // so reports/journal show the full history instead of only the current year.
   const now = new Date();
   return {
-    from: `${now.getFullYear()}-01-01`,
+    from: "2025-01-01",
     to: now.toISOString().slice(0, 10),
   };
 }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router";
-import { Plus, X, RotateCcw, ScrollText, Search } from "lucide-react";
+import { Plus, X, RotateCcw, Search } from "lucide-react";
 import { useAuth } from "../../lib/auth";
 import {
   fetchAccounts,
@@ -63,7 +63,7 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
       setAccounts(accRows);
       const sorted = [...items].sort(
         (a, b) =>
-          b.entryDate.localeCompare(a.entryDate) || b.entryNo - a.entryNo
+          a.entryDate.localeCompare(b.entryDate) || a.entryNo - b.entryNo
       );
       setEntries(sorted);
       setLoadState("success");
@@ -244,123 +244,200 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                 </div>
               </Panel>
             ) : (
-          filteredEntries.map((entry) => {
-            const totals = entryTotals(entry);
-            const reversed = isReversed(entry);
-            const balanced = Math.abs(totals.debit - totals.credit) < 0.005;
-            return (
-              <div
-                key={entry.id}
-                className={`bg-white rounded-xl border overflow-hidden ${
-                  reversed ? "border-gray-100 opacity-70" : "border-gray-100"
-                }`}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-4 border-b border-gray-100">
-                  <div className="flex items-center gap-2.5">
-                    <ScrollText
-                      className={`w-4 h-4 ${
-                        reversed ? "text-gray-300" : "text-blue-800"
-                      }`}
-                    />
-                    <p
-                      className={`text-sm font-semibold ${
-                        reversed ? "text-gray-400 line-through" : "text-gray-800"
-                      }`}
-                    >
-                      #{entry.entryNo} · {entry.description}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-gray-400">
-                      {entry.entryDate}
-                    </span>
-                    <SourceBadge source={entry.sourceType} />
-                    {reversed && <ReversedBadge />}
-                    {!reversed && (
-                      <button
-                        type="button"
-                        onClick={() => openReverseModal(entry)}
-                        className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 border border-gray-200 hover:bg-gray-50 px-2 py-1 rounded-lg transition"
-                      >
-                        <RotateCcw className="w-3 h-3" />
-                        กลับรายการ
-                      </button>
-                    )}
-                  </div>
-                </div>
-
+              <Panel>
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead>
-                      <tr className="text-left text-xs text-gray-400 border-b border-gray-50">
-                        <th className="px-5 py-2 font-medium">บัญชี</th>
-                        <th className="px-5 py-2 font-medium">หมายเหตุ</th>
-                        <th className="px-5 py-2 font-medium text-right">เดบิต</th>
-                        <th className="px-5 py-2 font-medium text-right">เครดิต</th>
-                        <th className="px-5 py-2 font-medium text-right">
+                      <tr className="text-left text-xs text-gray-400 border-b border-gray-100">
+                        <th className="px-4 py-3 font-medium">วันที่</th>
+                        <th className="px-4 py-3 font-medium">เลขที่</th>
+                        <th className="px-4 py-3 font-medium">รายการ</th>
+                        <th className="px-4 py-3 font-medium">แหล่ง</th>
+                        <th className="px-4 py-3 font-medium">สถานะ</th>
+                        <th className="px-4 py-3 font-medium">บัญชี</th>
+                        <th className="px-4 py-3 font-medium">หมายเหตุ</th>
+                        <th className="px-4 py-3 font-medium text-right">เดบิต</th>
+                        <th className="px-4 py-3 font-medium text-right">เครดิต</th>
+                        <th className="px-4 py-3 font-medium text-right">
                           จำนวน (THB)
                         </th>
+                        <th className="px-4 py-3 font-medium">การจัดการ</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {entry.lines.map((line) => (
-                        <tr
-                          key={line.id}
-                          className="border-b border-gray-50 last:border-0"
-                        >
-                          <td className="px-5 py-2.5">
-                            <p className="text-gray-800">{line.accountName}</p>
-                            <p className="text-xs text-gray-400">
-                              {line.accountCode} · {line.currency}
-                            </p>
-                          </td>
-                          <td className="px-5 py-2.5 text-xs text-gray-400">
-                            {line.memo || "-"}
-                          </td>
-                          <td className="px-5 py-2.5 text-gray-800 font-medium text-right whitespace-nowrap">
-                            {line.side === "DEBIT"
-                              ? formatAmount(line.amount)
-                              : "-"}
-                          </td>
-                          <td className="px-5 py-2.5 text-gray-800 font-medium text-right whitespace-nowrap">
-                            {line.side === "CREDIT"
-                              ? formatAmount(line.amount)
-                              : "-"}
-                          </td>
-                          <td className="px-5 py-2.5 text-gray-500 text-right whitespace-nowrap">
-                            {formatBaht(line.amountThb)}
-                          </td>
-                        </tr>
-                      ))}
+                      {filteredEntries.map((entry) => {
+                        const totals = entryTotals(entry);
+                        const reversed = isReversed(entry);
+                        const balanced =
+                          Math.abs(totals.debit - totals.credit) < 0.005;
+                        const skipped = entry.postingState === "SKIPPED";
+                        const lineCount = skipped ? 1 : entry.lines.length;
+                        const headerCells = (rowSpan: number) => (
+                          <>
+                            <td
+                              rowSpan={rowSpan}
+                              className="px-4 py-3 text-gray-500 whitespace-nowrap align-top"
+                            >
+                              {entry.entryDate}
+                            </td>
+                            <td
+                              rowSpan={rowSpan}
+                              className="px-4 py-3 text-gray-500 align-top"
+                            >
+                              #{entry.entryNo}
+                            </td>
+                            <td
+                              rowSpan={rowSpan}
+                              className="px-4 py-3 align-top min-w-[200px]"
+                            >
+                              <p
+                                className={`text-sm font-medium ${
+                                  reversed
+                                    ? "text-gray-400 line-through"
+                                    : "text-gray-800"
+                                }`}
+                              >
+                                {entry.description}
+                              </p>
+                              {skipped && (
+                                <p className="mt-1 text-xs text-amber-700">
+                                  <span className="font-medium">
+                                    ไม่ลงบัญชี:
+                                  </span>{" "}
+                                  {entry.skipReason === "backfilled-record-only"
+                                    ? "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่"
+                                    : entry.skipReason ||
+                                      "รายการนี้ถูกข้ามการลงบัญชี"}
+                                </p>
+                              )}
+                            </td>
+                            <td rowSpan={rowSpan} className="px-4 py-3 align-top">
+                              <SourceBadge source={entry.sourceType} />
+                            </td>
+                            <td rowSpan={rowSpan} className="px-4 py-3 align-top">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                {skipped ? (
+                                  <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-600">
+                                    ข้ามไม่ลงบัญชี
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-blue-50 text-blue-700">
+                                    ลงบัญชีแล้ว
+                                  </span>
+                                )}
+                                {reversed && <ReversedBadge />}
+                                {!skipped && (
+                                  <span
+                                    className={`inline-flex items-center text-xs font-medium px-2 py-1 rounded-full ${
+                                      balanced
+                                        ? "bg-emerald-50 text-emerald-600"
+                                        : "bg-red-50 text-red-500"
+                                    }`}
+                                  >
+                                    {balanced ? "สมดุล" : "ไม่สมดุล"}
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                          </>
+                        );
+                        return (
+                          entry.lines.length === 0 ? (
+                            <tr
+                              key={entry.id}
+                              className={`border-b border-gray-50 hover:bg-gray-50/40 transition ${
+                                reversed ? "opacity-60" : ""
+                              }`}
+                            >
+                              {headerCells(1)}
+                              <td className="px-4 py-3 text-xs text-gray-300">
+                                -
+                              </td>
+                              <td className="px-4 py-3 text-right text-gray-800 font-medium whitespace-nowrap">
+                                -
+                              </td>
+                              <td className="px-4 py-3 text-right text-gray-800 font-medium whitespace-nowrap">
+                                -
+                              </td>
+                              <td className="px-4 py-3 text-right text-gray-500 whitespace-nowrap">
+                                -
+                              </td>
+                              <td className="px-4 py-3 align-top">
+                                <div className="flex items-center justify-end gap-1.5">
+                                  {!reversed && (
+                                    <button
+                                      type="button"
+                                      onClick={() => openReverseModal(entry)}
+                                      className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 border border-gray-200 hover:bg-gray-50 px-2 py-1 rounded-lg transition"
+                                    >
+                                      <RotateCcw className="w-3 h-3" />
+                                      กลับรายการ
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          ) : (
+                            entry.lines.map((line, i) => (
+                              <tr
+                                key={line.id}
+                                className={`border-b border-gray-50 hover:bg-gray-50/40 transition ${
+                                  reversed ? "opacity-60" : ""
+                                }`}
+                              >
+                                {i === 0 && headerCells(lineCount)}
+                                <td className="px-4 py-3">
+                                  <p className="text-gray-800">
+                                    {line.accountName}
+                                  </p>
+                                  <p className="text-xs text-gray-400">
+                                    {line.accountCode} · {line.currency}
+                                  </p>
+                                </td>
+                                <td className="px-4 py-3 text-xs text-gray-400">
+                                  {line.memo || "-"}
+                                </td>
+                                <td className="px-4 py-3 text-gray-800 font-medium text-right whitespace-nowrap">
+                                  {line.side === "DEBIT"
+                                    ? formatAmount(line.amount)
+                                    : "-"}
+                                </td>
+                                <td className="px-4 py-3 text-gray-800 font-medium text-right whitespace-nowrap">
+                                  {line.side === "CREDIT"
+                                    ? formatAmount(line.amount)
+                                    : "-"}
+                                </td>
+                                <td className="px-4 py-3 text-gray-500 text-right whitespace-nowrap">
+                                  {formatBaht(line.amountThb)}
+                                </td>
+                                {i === 0 && (
+                                  <td
+                                    rowSpan={lineCount}
+                                    className="px-4 py-3 align-top"
+                                  >
+                                    <div className="flex items-center justify-end gap-1.5">
+                                      {!reversed && (
+                                        <button
+                                          type="button"
+                                          onClick={() => openReverseModal(entry)}
+                                          className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 border border-gray-200 hover:bg-gray-50 px-2 py-1 rounded-lg transition"
+                                        >
+                                          <RotateCcw className="w-3 h-3" />
+                                          กลับรายการ
+                                        </button>
+                                      )}
+                                    </div>
+                                  </td>
+                                )}
+                              </tr>
+                            ))
+                          )
+                        );
+                      })}
                     </tbody>
-                    <tfoot>
-                      <tr className="border-t border-gray-50">
-                        <td className="px-5 py-2.5 text-xs font-medium text-gray-500">
-                          รวม {totals.debit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                        </td>
-                        <td />
-                        <td />
-                        <td className="px-5 py-2.5 text-right">
-                          <span
-                            className={`inline-flex items-center text-xs font-medium px-2 py-1 rounded-full ${
-                              balanced
-                                ? "bg-emerald-50 text-emerald-600"
-                                : "bg-red-50 text-red-500"
-                            }`}
-                          >
-                            {balanced ? "สมดุล" : "ไม่สมดุล"}
-                          </span>
-                        </td>
-                        <td className="px-5 py-2.5 text-right text-xs text-gray-500 whitespace-nowrap">
-                          {formatBaht(totals.debit)}
-                        </td>
-                      </tr>
-                    </tfoot>
                   </table>
                 </div>
-              </div>
-            );
-          })
+              </Panel>
             )}
           </>
         )}
