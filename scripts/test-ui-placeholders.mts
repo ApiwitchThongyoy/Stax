@@ -101,6 +101,7 @@ const tradingJournalPage = read(
 );
 const postingEngine = read("app/lib/posting-engine.ts");
 const fxReconcileScript = read("scripts/reconcile-fx-postings.mts");
+const roundingReconcileScript = read("scripts/reconcile-rounding-postings.mts");
 
 // ---------------------------------------------------------------------------
 // 1. No stale fake placeholder values anywhere in the user UI.
@@ -2067,11 +2068,11 @@ ok(
   "category table headers: ยอดยกมา / เคลื่อนไหว / ยอดคงเหลือ / จำนวนรายการ"
 );
 ok(
-  accountCategoryView.includes("{s ? formatAmount(s.opening) : \"-\"}") &&
-    accountCategoryView.includes("{s ? formatSignedAmount(s.netMovement) : \"-\"}") &&
-    accountCategoryView.includes("{s ? formatSignedAmount(s.closing) : \"-\"}") &&
+  accountCategoryView.includes("{s ? formatAmount(ownerSignedFromNormalSide(row.type, s.opening) ?? s.opening) : \"-\"}") &&
+    accountCategoryView.includes("{s ? formatSignedAmount(ownerSignedFromNormalSide(row.type, s.netMovement) ?? \"0\") : \"-\"}") &&
+    accountCategoryView.includes("{s ? formatSignedAmount(ownerSignedFromNormalSide(row.type, s.closing) ?? \"0\") : \"-\"}") &&
     accountCategoryView.includes('{s ? s.lineCount : "-"}'),
-  "category cells render server summary verbatim (opening/movement/closing/count)"
+  "category cells render server summary owner-signed via ownerSignedFromNormalSide (opening/movement/closing/count)"
 );
 ok(
   !accountCategoryView.includes("ยอดยกมารวม") &&
@@ -2081,9 +2082,9 @@ ok(
 );
 ok(
   accountCategoryView.includes("ยอดคงเหลือตามสกุล") &&
-    accountCategoryView.includes("(ยกมา {formatAmount(t.opening)}") &&
-    accountCategoryView.includes("{formatSignedAmount(t.movement)})"),
-  "per-currency totals card shows opening/movement/close labels"
+    accountCategoryView.includes("(ยกมา {formatAmount(ownerSignedFromNormalSide(type, t.opening) ?? t.opening)}") &&
+    accountCategoryView.includes("{formatSignedAmount(ownerSignedFromNormalSide(type, t.movement) ?? \"0\")})"),
+  "per-currency totals card shows opening/movement/close labels owner-signed via ownerSignedFromNormalSide"
 );
 ok(
   journalTab.includes("matchesSearch") &&
@@ -2229,7 +2230,8 @@ ok(
 );
 ok(
   (() => {
-    const at = postingEngine.indexOf("accountId: FX_VARIANCE,");
+    const fxBranch = postingEngine.indexOf("const variance = new Decimal(receivedThb).minus(sentThb)");
+    const at = postingEngine.indexOf("accountId: FX_VARIANCE,", fxBranch);
     return (
       at !== -1 &&
       postingEngine.slice(at, at + 120).includes('currency: "THB"') &&
@@ -2239,7 +2241,7 @@ ok(
   "posting-engine stamps the variance leg THB-currency with the human memo"
 );
 ok(
-  postingEngine.includes('import { moneyInThb } from "./accounting-amounts"'),
+  postingEngine.includes('import { moneyInThb, roundMoney } from "./accounting-amounts"'),
   "posting-engine derives both THB bases with the shared accounting-amounts helpers"
 );
 ok(
@@ -2270,6 +2272,81 @@ ok(
     fxReconcileScript.includes("DRY RUN (no writes)") &&
     fxReconcileScript.includes("process.exit(0)"),
   "reconcile-fx-postings.mts is a dry-run-first CLI (--apply to write) and exits cleanly"
+);
+ok(
+  ledgerService.includes("ilike(journalEntries.skipReason, \"%THB does not balance%\")") &&
+    ledgerService.includes('(row.type ?? "").trim() === "FX_CONVERSION"') &&
+    ledgerService.includes("belong exclusively to reconcileSkippedFxPostings") &&
+    ledgerService.includes("result.promotable += 1") &&
+    ledgerService.includes("Promote: replace the SKIPPED record with the same header + REAL lines"),
+  "reconcileSkippedRoundingPostings scopes to STATEMENT SKIPPED THB-imbalance rows, excludes FX rows, and promotes the SAME journal entry"
+);
+ok(
+  ledgerService.includes("THB rounding adjustment") &&
+    ledgerService.includes('l.currency === "THB" && !cashIds.has(l.accountId) && l.memo === ROUNDING_ADJUSTMENT_MEMO') &&
+    ledgerService.includes("Decimal.sum(") &&
+    ledgerService.includes("debitThb") &&
+    ledgerService.includes("creditThb"),
+  "reconcileSkippedRoundingPostings finds the THB 5020 adjustment leg and derives balanced THB totals from the validated entry"
+);
+ok(
+  roundingReconcileScript.includes("DEFAULT IS A DRY RUN: zero database writes. Pass --apply to actually promote.") &&
+    roundingReconcileScript.includes("DRY RUN (no writes)") &&
+    roundingReconcileScript.includes("process.exit(0)"),
+  "reconcile-rounding-postings.mts is a dry-run-first CLI (--apply to write) and exits cleanly"
+);
+
+// ---------------------------------------------------------------------------
+// THB rounding-adjustment leg (auto) + owner-sign presentation.
+// A <= 0.01 reporting-base difference on an otherwise-valid single-currency
+// non-THB entry posts with an extra THB 5020 leg instead of SKIPPING; the
+// owner-sign helpers flip debit-positive/normal-side balances for display.
+// ---------------------------------------------------------------------------
+ok(
+  postingEngine.includes("export function applyThbRoundingAdjustment(") &&
+    postingEngine.includes("const entry = applyThbRoundingAdjustment(result.entry)") &&
+    postingEngine.includes("if (diff.isZero() || diff.abs().gt(new Decimal(\"0.01\"))) return entry") &&
+    postingEngine.includes("ROUNDING_ADJUSTMENT_MEMO"),
+  "posting-engine: postCapitalRow appends a THB rounding-adjustment leg only for a <= 0.01 single-currency non-THB difference"
+);
+ok(
+  generalLedger.includes('export const ROUNDING_ADJUSTMENT_MEMO = "THB rounding adjustment"') &&
+    generalLedger.includes("THB rounding adjustment allows at most one line") &&
+    generalLedger.includes("THB rounding adjustment is not needed: reporting base already balances") &&
+    generalLedger.includes("must not hide a reporting-base difference larger than 0.01") &&
+    generalLedger.includes("must be THB with amount and side exactly equal to the reporting-base difference"),
+  "validator: THB rounding-adjustment branch enforces exactly one THB leg of the exact <= 0.01 difference"
+);
+ok(
+  serverApi.includes("export function ownerSignedFromDebitPositive(") &&
+    serverApi.includes('const negate = type === "EQUITY" || type === "INCOME" || type === "EXPENSE"') &&
+    serverApi.includes("export function ownerSignedFromNormalSide(") &&
+    serverApi.includes('const negate = type === "LIABILITY" || type === "EXPENSE"'),
+  "server-api: owner-sign helpers re-sign debit-positive (negate EQUITY/INCOME/EXPENSE) and normal-side (negate LIABILITY/EXPENSE)"
+);
+ok(
+  accountCategoryView.includes('ownerSignedFromDebitPositive(') &&
+    accountCategoryView.includes('l.side === "DEBIT" ? l.amount : `-${l.amount}`') &&
+    accountCategoryView.includes("ownerSignedFromNormalSide(row.type, s.netMovement)") &&
+    accountCategoryView.includes("ownerSignedFromNormalSide(type, t.closing)") &&
+    accountCategoryView.includes("แสดงตามหลักเครื่องหมายเจ้าของ") &&
+    accountCategoryView.includes("(แค่กลับเครื่องหมายเพื่อให้อ่านง่าย)"),
+  "AccountCategoryView: account table + category totals use ownerSignedFromNormalSide; detail movement/running/footer use ownerSignedFromDebitPositive; footnote rewritten"
+);
+ok(
+  overviewTab.includes('? `-${summary.totalsThb.liabilities}`') &&
+    overviewTab.includes('? `-${t.liabilities}`') &&
+    overviewTab.includes('? `-${t.liabilitiesThb}`') &&
+    overviewTab.includes("เครื่องหมายเจ้าของ") &&
+    overviewTab.includes("ไม่คำนวณใหม่"),
+  "OverviewTab: liability totals render negative (owner sign) via explicit - prefix, server-sourced footnote"
+);
+ok(
+  dashboardPage.includes('? `-${summary.totalsThb.liabilities}`') &&
+    dashboardPage.includes('? `-${t.liabilities}`') &&
+    dashboardPage.includes('? `-${t.liabilitiesThb}`') &&
+    dashboardPage.includes("เครื่องหมายเจ้าของ"),
+  "DashboardHomePage: liability totals render negative (owner sign) via explicit - prefix, server-sourced footnote"
 );
 
 console.log("\n================ SUMMARY ================");

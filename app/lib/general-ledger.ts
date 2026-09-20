@@ -63,6 +63,13 @@ export const DEFAULT_CHART_OF_ACCOUNTS: AccountDef[] = [
   { code: "5120", name: "ค่าใช้จ่าย - ขาดทุนจากการขายหลักทรัพย์", type: "EXPENSE", currency: "USD" },
 ];
 
+/** Memo carried by the auto THB rounding-adjustment leg the posting engine
+ * adds when a fully-valid single-currency non-THB entry's per-line THB bases
+ * differ by at most 0.01 (a 2-stage round-trip satang). The validator uses the
+ * exact memo to recognise the leg and validate the whole rounding shape
+ * instead of failing the entry on a THB reporting-base imbalance. */
+export const ROUNDING_ADJUSTMENT_MEMO = "THB rounding adjustment";
+
 // ---------------------------------------------------------------------------
 // Big-decimal helpers
 // ---------------------------------------------------------------------------
@@ -403,7 +410,47 @@ export function validateJournalEntry(
       }
     }
   }
-  if (!isSkipped && !isFxConversion) {
+  const roundingLines = lines.filter((l) => l.memo === ROUNDING_ADJUSTMENT_MEMO);
+  const hasRoundingAdjustment = roundingLines.length >= 1;
+  if (!isSkipped && !isFxConversion && hasRoundingAdjustment) {
+    // Automatic THB rounding-adjustment leg: the posting engine adds it ONLY to
+    // a fully-valid single-currency non-THB entry whose per-line THB reporting
+    // bases differ by <= 0.01. A THB-only leg never balances natively, so the
+    // standard per-currency check is skipped in favour of validating the exact
+    // rounding shape: one THB rounding leg of exactly the base difference.
+    if (roundingLines.length > 1) {
+      errors.push("THB rounding adjustment allows at most one line");
+    } else {
+      const rounding = roundingLines[0];
+      const nonRounding = lines.filter((l) => l.memo !== ROUNDING_ADJUSTMENT_MEMO);
+      const baseCurrencies = [...new Set(nonRounding.map((l) => l.currency))];
+      const base = baseCurrencies.length === 1 ? baseCurrencies[0] : null;
+      if (!base || base === "THB") {
+        errors.push("THB rounding adjustment requires every other leg to share one non-THB currency");
+      } else {
+        const bucket = byCurrency[base];
+        if (!bucket || !bucket.debit.equals(bucket.credit)) {
+          errors.push(`${base} does not balance: debit ${fmt(bucket ? bucket.debit : new Decimal(0))} != credit ${fmt(bucket ? bucket.credit : new Decimal(0))}`);
+        }
+        const baseDebitThb = Decimal.sum(0, ...nonRounding.filter(l => l.side === "DEBIT").map(l => l.amountThb));
+        const baseCreditThb = Decimal.sum(0, ...nonRounding.filter(l => l.side === "CREDIT").map(l => l.amountThb));
+        const diff = baseDebitThb.minus(baseCreditThb);
+        const expectedSide = diff.gt(0) ? "CREDIT" : "DEBIT";
+        if (diff.isZero()) {
+          errors.push("THB rounding adjustment is not needed: reporting base already balances");
+        } else if (diff.abs().gt(new Decimal("0.01"))) {
+          errors.push("THB rounding adjustment must not hide a reporting-base difference larger than 0.01");
+        } else if (rounding.currency !== "THB" || rounding.side !== expectedSide || rounding.amount !== roundMoney(diff.abs())) {
+          errors.push("THB rounding adjustment line must be THB with amount and side exactly equal to the reporting-base difference");
+        }
+        const debitThb = Decimal.sum(0, ...lines.filter(l => l.side === "DEBIT").map(l => l.amountThb));
+        const creditThb = Decimal.sum(0, ...lines.filter(l => l.side === "CREDIT").map(l => l.amountThb));
+        if (!debitThb.eq(creditThb)) {
+          errors.push(`THB does not balance: debit ${fmt(debitThb)} != credit ${fmt(creditThb)}`);
+        }
+      }
+    }
+  } else if (!isSkipped && !isFxConversion) {
     for (const [currency, bucket] of Object.entries(byCurrency)) {
       if (!bucket.debit.equals(bucket.credit)) {
         errors.push(
@@ -592,7 +639,10 @@ export function trialBalance(lines: ReportLine[], accounts: AccountMap, openings
     });
     const totalDebitThb = sumMoney(rows.map(r => r.debitThb)), totalCreditThb = sumMoney(rows.map(r => r.creditThb));
     return { rows, totalsByCurrency, totalDebit: totalsByCurrency.length > 1 ? null : totalsByCurrency[0]?.debit ?? "0.00", totalCredit: totalsByCurrency.length > 1 ? null : totalsByCurrency[0]?.credit ?? "0.00",
-        balanced: totalsByCurrency.every(t => t.balanced), totalDebitThb, totalCreditThb, balancedThb: totalDebitThb != null && totalDebitThb === totalCreditThb, reportingStatus: statusOf(rows.map(r => r.balanceThb)) };
+        // THB reporting base is the authoritative "balanced" signal when it is
+        // fully derivable; a multi-currency book without a THB base for any row
+        // falls back to native per-currency equality (the pre-rounding-era rule).
+        balanced: totalDebitThb != null && totalCreditThb != null ? totalDebitThb === totalCreditThb : totalsByCurrency.every(t => t.balanced), totalDebitThb, totalCreditThb, balancedThb: totalDebitThb != null && totalDebitThb === totalCreditThb, reportingStatus: statusOf(rows.map(r => r.balanceThb)) };
 }
 export type TrialBalanceResult = ReturnType<typeof trialBalance>;
 export type TrialBalanceCurrencyTotal = TrialBalanceResult["totalsByCurrency"][number];
@@ -653,7 +703,10 @@ export function balanceSheet(lines: ReportLine[], accounts: AccountMap, openings
     const native = totalsByCurrency.length <= 1, totalAssetsThb = sumMoney(assets.map(r => r.balanceThb)), totalLiabilitiesThb = sumMoney(liabilities.map(r => r.balanceThb)), totalEquityThb = sumMoney(equity.map(r => r.balanceThb));
     const totalEquityAndLiabilitiesThb = sumMoney([totalLiabilitiesThb, totalEquityThb, income.netIncomeThb]);
     return { assets, liabilities, equity, totalsByCurrency, netIncome: native ? income.netIncome : null, totalAssets: native ? sumMoney(assets.map(r => r.balance)) : null,
-        totalEquityAndLiabilities: native ? sumMoney([...liabilities, ...equity].map(r => r.balance).concat(income.netIncome ?? "0.00")) : null, balanced: totalsByCurrency.every(t => t.balanced),
+        totalEquityAndLiabilities: native ? sumMoney([...liabilities, ...equity].map(r => r.balance).concat(income.netIncome ?? "0.00")) : null,
+        // Same THB-primary rule as the trial balance: trust the fully-derivable
+        // THB base first, fall back to native per-currency equality otherwise.
+        balanced: totalAssetsThb != null && totalEquityAndLiabilitiesThb != null ? totalAssetsThb === totalEquityAndLiabilitiesThb : totalsByCurrency.every(t => t.balanced),
         netIncomeThb: income.netIncomeThb, totalAssetsThb, totalLiabilitiesThb, totalEquityThb, totalEquityAndLiabilitiesThb,
         balancedThb: totalAssetsThb != null && totalEquityAndLiabilitiesThb != null && totalAssetsThb === totalEquityAndLiabilitiesThb, reportingStatus: tb.reportingStatus };
 }

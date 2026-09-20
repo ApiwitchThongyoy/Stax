@@ -287,7 +287,12 @@ export default function DashboardHomePage({
                     <span className="text-xs text-gray-600">
                       หนี้สิน{" "}
                       <span className="font-semibold text-gray-800">
-                        {fmtBaht(summary.totalsThb.liabilities)}
+                        {fmtBaht(
+                          summary.totalsThb.liabilities != null &&
+                            Number(summary.totalsThb.liabilities) > 0
+                            ? `-${summary.totalsThb.liabilities}`
+                            : summary.totalsThb.liabilities ?? "0"
+                        )}
                       </span>
                     </span>
                     <span className="text-xs text-gray-600">
@@ -307,6 +312,10 @@ export default function DashboardHomePage({
                     </span>
                   </div>
                 )}
+                <p className="px-5 pb-1 text-xs text-gray-400">
+                  เครื่องหมายเจ้าของ: "-" หน้าหนี้สิน = ยอดที่ต้องชำระ; ตัวเลขยังมาจากเซิร์ฟเวอร์
+                  (ไม่คำนวณใหม่ เพียงกลับเครื่องหมายเพื่อให้อ่านง่าย)
+                </p>
                 <div className="p-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 {summary.totalsByCurrency.map((t) => (
                   <div
@@ -344,9 +353,11 @@ export default function DashboardHomePage({
                           หนี้สินรวม
                         </span>
                         <span className="text-sm font-semibold text-gray-800 text-right">
-                          {fmt(t.liabilities)}
+                          {fmt(Number(t.liabilities) > 0 ? `-${t.liabilities}` : t.liabilities)}
                           <span className="block text-[11px] font-normal text-gray-400">
-                            {fmtBaht(t.liabilitiesThb)}
+                            {fmtBaht(
+                              Number(t.liabilitiesThb) > 0 ? `-${t.liabilitiesThb}` : t.liabilitiesThb
+                            )}
                           </span>
                         </span>
                       </div>

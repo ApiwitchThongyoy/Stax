@@ -6,7 +6,7 @@ import { roundMoney, moneyInThb } from "./accounting-amounts";
 // is stored as a decimal string; the pure engine (general-ledger.ts) stays
 // entirely framework/DB-free so all invariants are tested without a database.
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, gte, inArray, lte, max, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, gte, ilike, inArray, lte, max, sql, type SQL } from "drizzle-orm";
 import { Decimal } from "decimal.js";
 import { db } from "./drizzle-db";
 import { assertOwnedReferences } from "./resource-ownership";
@@ -30,6 +30,7 @@ import {
   normalSideOf,
   validateJournalEntry,
   buildMonthlyClosing,
+  ROUNDING_ADJUSTMENT_MEMO,
   type AccountLedgerSummaryInput,
   type AccountLedgerSummaryLineInput,
   type AccountLedgerSummaryResult,
@@ -1643,6 +1644,202 @@ export async function reconcileSkippedFxPostings(
       lineCount: validated.entry.lines.length,
       varianceThb: varianceLine?.amount ?? null,
       varianceSide: varianceLine?.side ?? null,
+      debitThb,
+      creditThb,
+    });
+    result.promotable += 1;
+    if (dryRun) continue;
+
+    // Promote: replace the SKIPPED record with the same header + REAL lines.
+    try {
+      await db.transaction(async (tx) => {
+        await tx
+          .delete(journalEntryLines)
+          .where(
+            and(
+              eq(journalEntryLines.userId, userId),
+              eq(journalEntryLines.journalEntryId, entry.id)
+            )
+          )
+          .execute();
+        await tx
+          .update(journalEntries)
+          .set({ postingState: "POSTED", skipReason: null, updatedAt: now })
+          .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entry.id)))
+          .execute();
+        for (const line of validated.entry.lines) {
+          await tx.insert(journalEntryLines).values({
+            id: randomUUID(), userId, journalEntryId: entry.id, accountId: line.accountId,
+            currency: line.currency, debitAmount: line.side === "DEBIT" ? line.amount : null,
+            creditAmount: line.side === "CREDIT" ? line.amount : null, amountThb: line.amountThb,
+            fxRateEffective: line.fxRateEffective, fxRateStatement: line.fxRateStatement,
+            fxRateProvider: line.fxRateProvider, memo: line.memo,
+          }).execute();
+        }
+      });
+      result.promoted += 1;
+    } catch (error) {
+      safeErrorLog(error);
+      result.stillSkipped.push({
+        transactionId: row.transactionId,
+        reason: "transaction failed during promotion",
+      });
+    }
+  }
+
+  return result;
+}
+
+/** One evaluated SKIPPED STATEMENT THB-imbalance row. */
+export interface RoundingReconcileEntryReport {
+  transactionId: string;
+  transactionDate: string;
+  oldSkipReason: string | null;
+  /** Candidate line count (4 = with the 5020 THB rounding adjustment leg). */
+  lineCount: number;
+  /** THB 5020 rounding-adjustment leg amount (null when the entry needs none). */
+  adjustmentThb: string | null;
+  adjustmentSide: "DEBIT" | "CREDIT" | null;
+  /** Candidate total THB debits and credits (equal for a keepable entry). */
+  debitThb: string;
+  creditThb: string;
+}
+
+export interface ReconcileSkippedRoundingResult {
+  scanned: number;
+  /** Rows whose replay produced a keepable POSTED entry (both modes). */
+  promotable: number;
+  /** Rows actually promoted (real lines written). 0 in a dry run. */
+  promoted: number;
+  /** Rows that remain SKIPPED after the replay + why (idempotent re-run safe). */
+  stillSkipped: { transactionId: string; reason: string }[];
+  entries: RoundingReconcileEntryReport[];
+  /** True when opts.apply was NOT set: zero database writes were made. */
+  dryRun: boolean;
+}
+
+/**
+ * Deterministic reconcile of existing SKIPPED STATEMENT rows whose journal entry
+ * carries a THB reporting-base imbalance (skipReason `THB does not balance`).
+ * The auto rounding-adjustment leg now fixes otherwise-valid single-currency
+ * non-THB entries whose per-leg THB rounding drifts by <= 0.01 (e.g. a BUY
+ * whose Dr 1110 + Dr 5010 report 2733.97 against a Cr 1020 of 2733.96 posts a
+ * CREDIT 5020 0.01). Every candidate is replayed through the REAL engine
+ * (postCapitalRow -> auto rounding leg -> validate) and, when keepable, the
+ * SKIPPED record is promoted with the exact engine lines. NEVER writes by hand,
+ * NEVER mutates the source Capital_Transactions values, and NEVER touches FX
+ * conversion rows (category asset, side null, type FX_CONVERSION) — those
+ * belong exclusively to reconcileSkippedFxPostings.
+ *
+ * DEFAULT IS A DRY RUN (`opts.apply` absent/false): it only SELECTs and reports
+ * what WOULD be promoted (promoted stays 0). `apply: true` seeds the CoA (5020
+ * is a default) and promotes in per-entry transactions, preserving the existing
+ * journal entry id/entry_no and source links. Idempotent: a second apply
+ * promotes 0.
+ */
+export async function reconcileSkippedRoundingPostings(
+  userId: string,
+  opts: { apply?: boolean } = {}
+): Promise<ReconcileSkippedRoundingResult> {
+  const dryRun = opts.apply !== true;
+  // A dry run must make ZERO database writes: never seed the chart of accounts
+  // (that INSERTs). Promotion seeds first so a missing 5020 is not a blocker.
+  let lookup = await loadAccountLookup(userId);
+  if (!dryRun) {
+    const seeded = await seedDefaultChartOfAccounts(userId);
+    if (seeded > 0) lookup = await loadAccountLookup(userId);
+  }
+
+  const rows = await db
+    .select()
+    .from(capitalTransactions)
+    .where(eq(capitalTransactions.userId, userId))
+    .orderBy(capitalTransactions.transactionDate, capitalTransactions.transactionId)
+    .execute();
+  const rowById = new Map(rows.map((r) => [r.transactionId, r]));
+
+  const skippedEntries = await db
+    .select()
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.userId, userId),
+        eq(journalEntries.sourceType, "STATEMENT"),
+        eq(journalEntries.postingState, "SKIPPED"),
+        ilike(journalEntries.skipReason, "%THB does not balance%")
+      )
+    )
+    .orderBy(asc(journalEntries.entryNo))
+    .execute();
+
+  const result: ReconcileSkippedRoundingResult = {
+    scanned: 0, promotable: 0, promoted: 0, stillSkipped: [], entries: [], dryRun,
+  };
+  const now = new Date().toISOString();
+
+  for (const entry of skippedEntries) {
+    if (!entry.sourceTransactionId) continue;
+    const row = rowById.get(entry.sourceTransactionId);
+    if (!row) continue;
+    const category = (row.category ?? "").trim().toLowerCase();
+    const sideRaw = (row.side ?? "").trim();
+    const isFxRow =
+      category === "asset" &&
+      (sideRaw === "" || sideRaw === "null") &&
+      (row.type ?? "").trim() === "FX_CONVERSION";
+    if (isFxRow) continue;
+
+    result.scanned += 1;
+    // Replay ONLY through the pure engine (identical to a fresh import).
+    const [plan] = buildStatementJournalEntries([row as ValidatedCapitalRow]);
+    if (!plan || plan.postingState !== "POSTED") {
+      result.stillSkipped.push({
+        transactionId: row.transactionId,
+        reason: plan?.reason ?? entry.skipReason ?? "replay did not produce a keepable entry",
+      });
+      continue;
+    }
+
+    const resolved = resolveEntryAccountIds(plan.entry, lookup);
+    if (!resolved.ok) {
+      result.stillSkipped.push({
+        transactionId: row.transactionId,
+        reason: resolved.errors.join("; "),
+      });
+      continue;
+    }
+    const validated = validateJournalEntry({ ...plan.entry, lines: resolved.lines });
+    if (!validated.ok || currencyMismatchErrors(validated.entry, lookup).length > 0) {
+      const reason = !validated.ok
+        ? `invalid entry: ${validated.errors.join("; ")}`
+        : currencyMismatchErrors(validated.entry, lookup).join("; ");
+      result.stillSkipped.push({ transactionId: row.transactionId, reason });
+      continue;
+    }
+
+    const cashIds = new Set(
+      [...lookup.values()]
+        .filter((a) => a.type === "ASSET" && (a.code === "1010" || a.code === "1020"))
+        .map((a) => a.id)
+    );
+    const adjustmentLine = validated.entry.lines.find(
+      (l) => l.currency === "THB" && !cashIds.has(l.accountId) && l.memo === ROUNDING_ADJUSTMENT_MEMO
+    );
+    const debitThb = Decimal.sum(
+      0,
+      ...validated.entry.lines.filter((l) => l.side === "DEBIT").map((l) => l.amountThb)
+    ).toFixed(2);
+    const creditThb = Decimal.sum(
+      0,
+      ...validated.entry.lines.filter((l) => l.side === "CREDIT").map((l) => l.amountThb)
+    ).toFixed(2);
+    result.entries.push({
+      transactionId: row.transactionId,
+      transactionDate: row.transactionDate,
+      oldSkipReason: entry.skipReason,
+      lineCount: validated.entry.lines.length,
+      adjustmentThb: adjustmentLine?.amount ?? null,
+      adjustmentSide: adjustmentLine?.side ?? null,
       debitThb,
       creditThb,
     });

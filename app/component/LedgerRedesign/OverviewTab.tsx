@@ -145,7 +145,12 @@ export default function OverviewTab({
               <span className="text-xs text-gray-600">
                 หนี้สิน{" "}
                 <span className="font-semibold text-gray-800">
-                  {fmtBaht(summary.totalsThb.liabilities)}
+                  {fmtBaht(
+                    summary.totalsThb.liabilities != null &&
+                      Number(summary.totalsThb.liabilities) > 0
+                      ? `-${summary.totalsThb.liabilities}`
+                      : summary.totalsThb.liabilities ?? "0"
+                  )}
                 </span>
               </span>
               <span className="text-xs text-gray-600">
@@ -165,6 +170,10 @@ export default function OverviewTab({
               </span>
             </div>
           )}
+          <p className="text-xs text-gray-400">
+            เครื่องหมายเจ้าของ: "-" หน้าหนี้สิน = ยอดที่ต้องชำระ; ตัวเลขยังมาจากเซิร์ฟเวอร์
+            (ไม่คำนวณใหม่ เพียงกลับเครื่องหมายเพื่อให้อ่านง่าย)
+          </p>
           {/* Per-currency balance sheet totals */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {totalsBar.length === 0 && (
@@ -206,9 +215,11 @@ export default function OverviewTab({
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-gray-500">หนี้สินรวม</span>
                     <span className="text-sm font-semibold text-gray-800 text-right">
-                      {fmt(t.liabilities)}
+                      {fmt(Number(t.liabilities) > 0 ? `-${t.liabilities}` : t.liabilities)}
                       <span className="block text-[11px] font-normal text-gray-400">
-                        {fmtBaht(t.liabilitiesThb)}
+                        {fmtBaht(
+                          Number(t.liabilitiesThb) > 0 ? `-${t.liabilitiesThb}` : t.liabilitiesThb
+                        )}
                       </span>
                     </span>
                   </div>

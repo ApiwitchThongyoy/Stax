@@ -3220,6 +3220,168 @@ async function main() {
     }
   }
 
+  // ====== REG: ROUNDING RECONCILE (THB rounding-adjustment <= 0.01) ======
+  // A single-currency non-THB entry whose per-leg THB rounding drifts by <= 0.01
+  // (e.g. BUY net 86.60 @ 31.57 -> Dr 1110 86.59 + Dr 5010 0.01 report THB
+  // 2733.97 against a Cr 1020 86.60 of 2733.96) now posts a THB 5020 leg
+  // (memo "THB rounding adjustment", page of the difference). Legacy rows that
+  // were recorded SKIPPED by pre-rounding imports are replayed through the REAL
+  // engine (never hand-written lines): dry-run is zero-write, apply promotes,
+  // a second apply is a no-op, the source Capital_Transactions row is never
+  // mutated, and FX_CONVERSION rows stay untouched (owned by the FX reconcile).
+  {
+    console.log("\n=== REG: ROUNDING RECONCILE ===");
+    const { randomUUID } = await import("node:crypto");
+    const { reconcileSkippedRoundingPostings } = await import(
+      "../app/lib/ledger-service"
+    );
+
+    const rEmail = `rnd-${randomUUID()}@test.local`;
+    const rPassword = "Rounding!234";
+    const rRegRes = await registerAs(rEmail, rPassword);
+    const rRegJson = (await rRegRes.json()) as { data?: { user?: { id?: string } } };
+    const rUserId = rRegJson.data?.user?.id;
+    if (!rUserId) {
+      ok(false, "REG-RND: register failed to create the rounding user");
+    } else {
+      smokeUserIds.push(rUserId);
+      const rLogin = await loginAs(rEmail, rPassword);
+      const rToken = rLogin.data?.accessToken as string | undefined;
+      if (!rToken) {
+        ok(false, "REG-RND: registered rounding user could not log in");
+      } else {
+        // 1. Simulate the pre-rounding SKIPPED rows (production shape).
+        //    1a. Promotable BUY: net 86.60 @ 31.57, principal 86.59, fee 0.01.
+        const txRound = randomUUID();
+        await client`
+          INSERT INTO "Capital_Transactions"
+            (transaction_id, user_id, amount_foreign, currency, transaction_date,
+             amount_thb, type, source_type, source_document_id, category, section,
+             exchange, fx_rate_statement, fx_rate_effective, quantity, unit_price,
+             fees, side, is_monthly_fee_aggregate)
+          VALUES (${txRound}, ${rUserId}, '86.60', 'USD', '2026-01-15', '2733.96',
+                  'BUY', 'AI_PARSED', ${"doc-rndlegacy"}, 'asset', 'ซื้อ',
+                  NULL, '31.57', '31.57', '1', '86.59', '0.01', 'BUY', NULL)`;
+        const rEntryId = randomUUID();
+        await client`
+          INSERT INTO journal_entries
+            (id, user_id, entry_no, entry_date, description, source_type,
+             source_transaction_id, status, category, section, currency,
+             amount, amount_thb, fx_rate_effective, posting_state, skip_reason,
+             created_at, updated_at, type)
+          VALUES (${rEntryId}, ${rUserId}, 9101, '2026-01-15',
+                  'ซื้อ TSTR 1 @ 86.59 USD', 'STATEMENT', ${txRound},
+                  'POSTED', 'asset', 'ซื้อ', 'USD', '86.60', '2733.96', '31.57',
+                  'SKIPPED',
+                  'THB does not balance: debit 2733.97 != credit 2733.96',
+                  ${new Date().toISOString()}, ${new Date().toISOString()}, NULL)`;
+        //    1b. FX_CONVERSION row: same ilike-matched reason but MUST stay out
+        //        of the rounding reconcile's scope (owned by the FX reconcile).
+        const txFxScope = randomUUID();
+        await client`
+          INSERT INTO "Capital_Transactions"
+            (transaction_id, user_id, amount_foreign, currency, transaction_date,
+             amount_thb, type, source_type, source_document_id, category, section,
+             exchange, fx_rate_statement, fx_rate_effective, exchange_from_currency,
+             exchange_from_amount, exchange_rate, is_monthly_fee_aggregate)
+          VALUES (${txFxScope}, ${rUserId}, '158.60', 'USD', '2026-01-14', '5000.00',
+                  'FX_CONVERSION', 'AI_PARSED', ${"doc-rndfx"}, 'asset', 'แลกเปลี่ยนสกุลเงิน',
+                  NULL, '31.5457', '31.5457', 'THB', '5000.00', '31.5457', NULL)`;
+        const rFxEntryId = randomUUID();
+        await client`
+          INSERT INTO journal_entries
+            (id, user_id, entry_no, entry_date, description, source_type,
+             source_transaction_id, status, category, section, currency,
+             amount, amount_thb, fx_rate_effective, posting_state, skip_reason,
+             created_at, updated_at, type)
+          VALUES (${rFxEntryId}, ${rUserId}, 9102, '2026-01-14',
+                  'รายการจากงบ (legacy FX)', 'STATEMENT', ${txFxScope},
+                  'POSTED', 'asset', 'แลกเปลี่ยนสกุลเงิน', 'USD', '158.60', '5000.00',
+                  '31.5457', 'SKIPPED', 'THB does not balance at statement FX',
+                  ${new Date().toISOString()}, ${new Date().toISOString()}, NULL)`;
+
+        // 2. Dry run: zero-write diagnosis on the ONE promotable row. The FX row
+        //    is excluded (scanned stays 1), promoted stays 0, the entry still has
+        //    zero lines, and the report carries the exact +0.01 CREDIT 5020 leg.
+        const rDry = await reconcileSkippedRoundingPostings(rUserId);
+        ok(
+          rDry.dryRun === true && rDry.scanned === 1 && rDry.promotable === 1 &&
+            rDry.promoted === 0,
+          "REG-RND: dry run scans exactly 1 (FX row excluded) and promotes 0"
+        );
+        const rRep = rDry.entries.find((e) => e.transactionId === txRound);
+        ok(
+          !!rRep && rRep.lineCount === 4 && rRep.adjustmentThb === "0.01" &&
+            rRep.adjustmentSide === "CREDIT" &&
+            rRep.debitThb === "2733.97" && rRep.creditThb === "2733.97",
+          "REG-RND: dry run reports the exact +0.01 CREDIT 5020 leg (THB now balanced)"
+        );
+        const [rDryEntry] = await client`
+          SELECT posting_state, (SELECT count(*)::int FROM journal_entry_lines l WHERE l.journal_entry_id = ${rEntryId}) AS lines
+          FROM journal_entries WHERE id = ${rEntryId}`;
+        ok(
+          rDryEntry.posting_state === "SKIPPED" && rDryEntry.lines === 0,
+          "REG-RND: dry run writes nothing (entry untouched, zero lines)"
+        );
+
+        // 3. Apply: promotes the SAME journal entry id with the 4 real lines.
+        const rApply = await reconcileSkippedRoundingPostings(rUserId, { apply: true });
+        ok(rApply.promoted === 1, "REG-RND: --apply promotes the SKIPPED rounding entry");
+        const rLegs = await client`
+          SELECT a.code, l.debit_amount, l.credit_amount, l.memo
+          FROM journal_entry_lines l JOIN accounts a ON a.id = l.account_id
+          WHERE l.journal_entry_id = ${rEntryId}
+          ORDER BY a.code`;
+        const rLine = (code: string) => rLegs.find((l: any) => l.code === code);
+        const l1110 = rLine("1110");
+        const l5010 = rLine("5010");
+        const l1020 = rLine("1020");
+        const l5020 = rLine("5020");
+        ok(
+          rLegs.length === 4 &&
+            !!l1110 && Number(l1110.debit_amount) === 86.59 &&
+            !!l5010 && Number(l5010.debit_amount) === 0.01 &&
+            !!l1020 && Number(l1020.credit_amount) === 86.6 &&
+            !!l5020 && Number(l5020.credit_amount) === 0.01 &&
+            l5020.memo === "THB rounding adjustment",
+          "REG-RND: promoted entry = Dr 1110 86.59 + Dr 5010 0.01 / Cr 1020 86.60 + Cr 5020 0.01"
+        );
+        const [rPostApply] = await client`
+          SELECT posting_state, skip_reason FROM journal_entries WHERE id = ${rEntryId}`;
+        ok(
+          rPostApply.posting_state === "POSTED" && rPostApply.skip_reason === null,
+          "REG-RND: promoted entry is POSTED with a cleared skip reason"
+        );
+        const [rFxStill] = await client`
+          SELECT posting_state FROM journal_entries WHERE id = ${rFxEntryId}`;
+        ok(
+          rFxStill.posting_state === "SKIPPED",
+          "REG-RND: the FX_CONVERSION row stays SKIPPED (rounding reconcile never touches it)"
+        );
+
+        // 4. Idempotent + source integrity.
+        const rApply2 = await reconcileSkippedRoundingPostings(rUserId, { apply: true });
+        ok(rApply2.promoted === 0 && rApply2.scanned === 0,
+          "REG-RND: re-running apply is a no-op (entry already POSTED, nothing left to scan)");
+        const [keptRoundRow] = await client`
+          SELECT amount_foreign, currency, category, side, type, fx_rate_effective
+          FROM "Capital_Transactions" WHERE transaction_id = ${txRound}`;
+        ok(
+          !!keptRoundRow && Number(keptRoundRow.amount_foreign) === 86.6 &&
+            keptRoundRow.currency === "USD" && keptRoundRow.category === "asset" &&
+            keptRoundRow.side === "BUY" && keptRoundRow.type === "BUY" &&
+            Number(keptRoundRow.fx_rate_effective) === 31.57,
+          "REG-RND: reconcile never mutates the source Capital_Transactions row"
+        );
+
+        // Self-clean the simulated rows.
+        await client`DELETE FROM journal_entry_lines WHERE user_id = ${rUserId}`;
+        await client`DELETE FROM journal_entries WHERE user_id = ${rUserId}`;
+        await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${rUserId}`;
+      }
+    }
+  }
+
   // ================= REG: TRANSACTION RECORD VIEW (ledger line -> source tx) =================
   // A statement posting attaches sourceTransactionId to each journal line; the
   // account-ledger route surfaces it on every line, and GET

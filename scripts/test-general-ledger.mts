@@ -11,6 +11,8 @@ import { runReportRegressions } from "./report-regressions.mjs";
 // Run: npx tsx scripts/test-general-ledger.mts
 import "./_load-env.mjs";
 
+import { Decimal } from "decimal.js";
+
 import {
   DEFAULT_CHART_OF_ACCOUNTS,
   balanceSheet,
@@ -26,6 +28,7 @@ import {
   type JournalEntryInput,
 } from "../app/lib/general-ledger";
 import {
+  applyThbRoundingAdjustment,
   buildStatementJournalEntries,
   buildStatementPostings,
   journalDetailOf,
@@ -631,6 +634,147 @@ async function main() {
       rr.entry.lines.some((l) => l.accountId === "5020" && l.side === "DEBIT" && l.amount === "3.15"),
       "FX variance: 3-leg reversal picks cash legs by currency and validates");
   }
+
+  // THB ROUNDING ADJUSTMENT LEG (auto): a wholly-valid single-currency non-THB
+  // entry whose per-line THB reporting bases differ by <= 0.01 posts with a THB
+  // 5020 leg for the exact difference instead of SKIPPING. Source values never
+  // change — only the derived THB base gains an exact adjustment leg.
+  const roundingFrozen = (row: ValidatedCapitalRow) => {
+    const plan = buildStatementJournalEntries([row])[0];
+    if (plan.postingState !== "POSTED") return null;
+    const v = validateJournalEntry({ ...plan.entry });
+    return v.ok ? v.entry : null;
+  };
+  const roundingLeg = (entry: NonNullable<ReturnType<typeof roundingFrozen>>) =>
+    entry.lines.find((l) => l.memo === "THB rounding adjustment") ?? null;
+  // BUY: principal 10.00 + fee 10.00 vs net 20.00 @ 3.1415 -> debit THB
+  // 31.42 + 31.42 = 62.84 vs credit 62.83 -> CREDIT 5020 0.01 (4 legs POSTED).
+  const buyRound = roundingFrozen(baseRow({ category: "asset", side: "BUY",
+    amountForeign: "20.00", quantity: "10", unitPrice: "1.00",
+    fxRateEffective: "3.1415", fxRateStatement: "3.1415" }));
+  ok(!!buyRound && buyRound.lines.length === 4,
+    "rounding: non-balancing BUY posts 4 legs (principal + fee + net + THB leg)");
+  if (buyRound) {
+    const r = roundingLeg(buyRound);
+    ok(!!r && r.accountId === "5020" && r.currency === "THB" && r.side === "CREDIT" &&
+      r.amount === "0.01" && r.amountThb === "0.01" && r.fxRateEffective === "1" &&
+      r.fxRateStatement === "1",
+      "rounding: BUY CREDIT 5020 0.01 (THB debit 62.84 vs credit 62.83), THB pinned");
+    ok(buyRound.lines.some((l) => l.accountId === "1110" && l.side === "DEBIT" && l.amount === "10.00") &&
+      buyRound.lines.some((l) => l.accountId === "5010" && l.side === "DEBIT" && l.amount === "10.00") &&
+      buyRound.lines.some((l) => l.accountId === "1020" && l.side === "CREDIT" && l.amount === "20.00") &&
+      buyRound.lines.every((l) => l.memo !== "FX conversion variance"),
+      "rounding: source legs keep principal/fee/net verbatim, no mistaken FX-variance leg");
+  }
+  // SELL with gain: proceeds 100.00 vs basis 70.00 + gain 30.00 @ 1.2345 ->
+  // debit THB 123.45 vs credit 86.42 + 37.04 = 123.46 -> DEBIT 5020 0.01.
+  const sellRound = roundingFrozen(baseRow({ category: "asset", side: "SELL",
+    amountForeign: "100.00", costBasis: "70.00", realizedGainLoss: "30.00",
+    realizedGainLossThb: "37.04", fxRateEffective: "1.2345", fxRateStatement: "1.2345" }));
+  ok(!!sellRound && sellRound.lines.length === 4,
+    "rounding: non-balancing SELL posts 4 legs (proceeds + basis + gain + THB leg)");
+  if (sellRound) {
+    const r = roundingLeg(sellRound);
+    ok(!!r && r.side === "DEBIT" && r.amount === "0.01" &&
+      sellRound.lines.some((l) => l.accountId === "4020" && l.side === "CREDIT" && l.amount === "30.00"),
+      "rounding: SELL DEBIT 5020 0.01 (THB debit 123.45 vs credit 123.46), gain leg intact");
+  }
+  // Production-shaped fixtures: BUY rows at a real statement FX (31.5700) whose
+  // per-leg THB sums reproduce the exact production rounding pairs. Each MUST
+  // POST 4 legs with the exact 5020 0.01 THB leg, on the side the imbalance
+  // requires, and the reported THB totals must equal the named pair verbatim.
+  const thbTotals = (entry: NonNullable<ReturnType<typeof roundingFrozen>>) => {
+    const dr = Decimal.sum(0, ...entry.lines.filter((l) => l.side === "DEBIT").map((l) => l.amountThb)).toFixed(2);
+    const cr = Decimal.sum(0, ...entry.lines.filter((l) => l.side === "CREDIT").map((l) => l.amountThb)).toFixed(2);
+    return { dr, cr };
+  };
+  const fixturesBuy: { net: string; principal: string; fee: string; dr: string; cr: string }[] = [
+    { net: "86.60", principal: "86.59", fee: "0.01", dr: "2733.97", cr: "2733.96" },
+    { net: "108.92", principal: "108.91", fee: "0.01", dr: "3438.61", cr: "3438.60" },
+    { net: "161.57", principal: "161.56", fee: "0.01", dr: "5100.77", cr: "5100.76" },
+    { net: "166.03", principal: "165.99", fee: "0.04", dr: "5241.56", cr: "5241.57" },
+    { net: "35.59", principal: "35.57", fee: "0.02", dr: "1123.57", cr: "1123.58" },
+    { net: "417.15", principal: "417.13", fee: "0.02", dr: "13169.42", cr: "13169.43" },
+    { net: "106.92", principal: "106.91", fee: "0.01", dr: "3375.47", cr: "3375.46" },
+  ];
+  for (const f of fixturesBuy) {
+    const e = roundingFrozen(baseRow({ category: "asset", side: "BUY",
+      amountForeign: f.net, quantity: "1", unitPrice: f.principal,
+      fxRateEffective: "31.57", fxRateStatement: "31.57" }));
+    const r = e ? roundingLeg(e) : null;
+    const { dr, cr } = e ? thbTotals(e) : { dr: "", cr: "" };
+    ok(!!e && e.lines.length === 4 && !!r && r.amount === "0.01" &&
+      ((f.dr > f.cr && r.side === "CREDIT") || (f.dr < f.cr && r.side === "DEBIT")) &&
+      e.lines.some((l) => l.accountId === "1110" && l.side === "DEBIT" && l.amount === f.principal) &&
+      e.lines.some((l) => l.accountId === "5010" && l.side === "DEBIT" && l.amount === f.fee) &&
+      e.lines.some((l) => l.accountId === "1020" && l.side === "CREDIT" && l.amount === f.net),
+      `rounding fixture ${f.dr}/${f.cr} (net ${f.net}) posts 4 legs with exact 5020 0.01 ${f.dr > f.cr ? "CREDIT" : "DEBIT"}`);
+    ok(dr === cr && dr === (f.dr > f.cr ? f.dr : f.cr),
+      `rounding fixture ${f.dr}/${f.cr} balances THB after the leg (dr ${dr} = cr ${cr})`);
+  }
+  // The THB leg is never added: to THB entries, FX conversions, differences
+  // beyond 0.01, or already-balancing bases.
+  const thbCash = postCapitalRow(baseRow({ category: "equity", currency: "THB", fxRateEffective: "1" }));
+  ok(thbCash.ok && thbCash.entry.lines.every((l) => l.memo !== "THB rounding adjustment"),
+    "rounding: THB entries never gain a rounding leg");
+  const roundingEngine = applyThbRoundingAdjustment({
+    entryDate: "2026-01-15", description: "no-op",
+    lines: [
+      { accountId: "1020", currency: "USD", debit: "100.00", fxRateEffective: "35" },
+      { accountId: "3010", currency: "USD", credit: "100.00", fxRateEffective: "35.02" },
+    ],
+  });
+  ok(roundingEngine.lines.length === 2,
+    "rounding: |diff| > 0.01 (100 * 35 vs 100 * 35.02) never gains a rounding leg");
+  const roundingThbBase = applyThbRoundingAdjustment({
+    entryDate: "2026-01-15", description: "fx conv", lines: [
+      { accountId: "1020", currency: "USD", debit: "100.00", fxRateEffective: "35" },
+      { accountId: "1010", currency: "THB", credit: "3500.00", fxRateEffective: "1" },
+    ],
+  });
+  ok(roundingThbBase.lines.length === 2,
+    "rounding: two-currency FX conversion never gains a rounding leg");
+  const roundingZero = applyThbRoundingAdjustment({ entryDate: "2026-01-15", description: "bal",
+    lines: [
+      { accountId: "1020", currency: "USD", debit: "100.00", fxRateEffective: "35" },
+      { accountId: "3010", currency: "USD", credit: "100.00", fxRateEffective: "35" },
+    ],
+  });
+  ok(roundingZero.lines.length === 2, "rounding: already-balancing base gains nothing");
+  // The validator accepts the auto leg and rejects any deviation.
+  const wrongSide = validateJournalEntry({
+    entryDate: "2026-01-15", description: "wrong rounding side",
+    lines: [
+      { accountId: "1110", currency: "USD", debit: "10.00", fxRateEffective: "3.1415" },
+      { accountId: "5010", currency: "USD", debit: "10.00", fxRateEffective: "3.1415" },
+      { accountId: "1020", currency: "USD", credit: "20.00", fxRateEffective: "3.1415" },
+      { accountId: "5020", currency: "THB", debit: "0.01", memo: "THB rounding adjustment" },
+    ],
+  });
+  ok(!wrongSide.ok && wrongSide.errors.some((e) => e.includes("must be THB with amount and side")),
+    "rounding: validator rejects a rounding leg on the wrong side (expected CREDIT)");
+  const notNeeded = validateJournalEntry({
+    entryDate: "2026-01-15", description: "unneeded rounding",
+    lines: [
+      { accountId: "1020", currency: "USD", debit: "10.00", fxRateEffective: "3.1415" },
+      { accountId: "1110", currency: "USD", credit: "10.00", fxRateEffective: "3.1415" },
+      { accountId: "5020", currency: "THB", credit: "0.01", memo: "THB rounding adjustment" },
+    ],
+  });
+  ok(!notNeeded.ok && notNeeded.errors.some((e) => e.includes("not needed")),
+    "rounding: validator rejects a rounding leg when the base already balances");
+  const twoRounding = validateJournalEntry({
+    entryDate: "2026-01-15", description: "two rounding legs",
+    lines: [
+      { accountId: "1110", currency: "USD", debit: "10.00", fxRateEffective: "3.1415" },
+      { accountId: "5010", currency: "USD", debit: "10.00", fxRateEffective: "3.1415" },
+      { accountId: "1020", currency: "USD", credit: "20.00", fxRateEffective: "3.1415" },
+      { accountId: "5020", currency: "THB", credit: "0.01", memo: "THB rounding adjustment" },
+      { accountId: "5020", currency: "THB", debit: "0.02", memo: "THB rounding adjustment" },
+    ],
+  });
+  ok(!twoRounding.ok && twoRounding.errors.some((e) => e.includes("allows at most one line")),
+    "rounding: validator rejects a second rounding leg");
 
   // THB owner deposits ARE now supported: the default chart of accounts gained
   // 3020 (THB owner capital), so a THB equity CASH_IN posts Dr 1010 / Cr 3020
@@ -1915,6 +2059,43 @@ async function main() {
         `${type}: prior and period use normal-side signs, exact cents and negative balances`);
     }
   }
+
+  console.log("=== REPORTING BASE: THB-PRIMARY BALANCED + BALANCE-SHEET AS-OF ===");
+  const repAccounts: AccountMap = {
+    cash: { code: "1020", name: "USD cash", currency: "USD", type: "ASSET" },
+    thb: { code: "1010", name: "THB cash", currency: "THB", type: "ASSET" },
+    capital: { code: "3010", name: "USD capital", currency: "USD", type: "EQUITY" },
+    equity: { code: "3020", name: "THB capital", currency: "THB", type: "EQUITY" },
+  };
+  const repLine = (accountId: keyof typeof repAccounts, side: "DEBIT" | "CREDIT", amount: string, amountThb: string | null) =>
+    ({ accountId, currency: repAccounts[accountId].currency, side, amount, amountThb });
+  // A pure FX-exchange sheet (USD leg entered at 35, THB leg credited 35000):
+  // the two legs report THB 35000 each, so the THB base is the authoritative
+  // balanced signal even though the native currencies differ.
+  const repFx = [repLine("cash", "DEBIT", "1000", "35000"), repLine("thb", "CREDIT", "35000", "35000")];
+  const repTb = trialBalance(repFx, repAccounts);
+  ok(repTb.balanced && repTb.balancedThb && repTb.totalDebitThb === "35000.00" && repTb.totalCreditThb === "35000.00",
+    "TB: pure FX sheet is balanced via the THB reporting base (native currencies distinct)");
+  const repSheet = balanceSheet(repFx, repAccounts);
+  ok(repSheet.balanced && repSheet.balancedThb && repSheet.totalAssetsThb === "0.00" &&
+    repSheet.totalEquityAndLiabilitiesThb === "0.00",
+    "BS: pure FX sheet is balanced via the THB reporting base");
+  // Balance sheet is AS-OF through `to`: the reported balances are identical
+  // whether the caller passes a windowed slice (openings + in-window lines) or
+  // the full history, as long as `to` is the same. `from` never changes numbers.
+  const priorUsd = repLine("cash", "DEBIT", "100", "3500");
+  const priorCap = repLine("capital", "CREDIT", "100", "3500");
+  const windowUsd = repLine("cash", "DEBIT", "50", "1750");
+  const windowCap = repLine("capital", "CREDIT", "50", "1750");
+  const asOfWindowed = balanceSheet([windowUsd, windowCap], repAccounts, { cash: "100", capital: "100" }, { cash: "3500", capital: "3500" });
+  const asOfFull = balanceSheet([priorUsd, priorCap, windowUsd, windowCap], repAccounts);
+  ok(asOfWindowed.totalAssetsThb === "5250.00" && asOfWindowed.totalAssets === "150.00" &&
+    asOfWindowed.totalEquityAndLiabilitiesThb === "5250.00" && asOfWindowed.balanced && asOfWindowed.balancedThb,
+    "BS as-of: windowed slice (openings + in-window) totals 150.00 / 5250.00 THB");
+  ok(asOfFull.totalAssetsThb === asOfWindowed.totalAssetsThb && asOfFull.totalAssets === asOfWindowed.totalAssets &&
+    asOfFull.totalEquityAndLiabilitiesThb === asOfWindowed.totalEquityAndLiabilitiesThb &&
+    asOfFull.balanced === asOfWindowed.balanced,
+    "BS as-of: full-history run reports the SAME as-of numbers — `from` is ignored, only `to` matters");
 
   runReportRegressions(ok);
   console.log("================ SUMMARY ================");

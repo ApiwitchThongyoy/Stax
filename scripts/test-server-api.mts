@@ -17,6 +17,8 @@ import {
   type CapitalLedgerRow,
   holdingTotalCost,
   holdingCurrency,
+  ownerSignedFromDebitPositive,
+  ownerSignedFromNormalSide,
 } from "../app/lib/server-api";
 import {
   sumAuthoritativeGainThb,
@@ -358,6 +360,43 @@ function main() {
       serverApiSrc.includes("journalParams"),
     "fetchJournal targets GET /api/v1/journal and builds params from period + filters"
   );
+
+  // ---- owner-sign presentation edge cases ----
+  // The owner-sign helpers re-sign server balances for display. The 5020
+  // rounding/FX-variance expense account can carry a NET CREDIT (the DR-side
+  // accounts pay the balancing 5020 CREDIT), so a credit net must NEVER present
+  // as a negative owner amount. Six examples across the five account types.
+  // debit-positive frame (getAccountLedger detail: movement/running/footer):
+  ok(ownerSignedFromDebitPositive("EXPENSE", "3.35") === "-3.35",
+    "owner-sign: 5010 EXPENSE net debit 3.35 presents as -3.35");
+  ok(ownerSignedFromDebitPositive("LIABILITY", "-100") === "-100",
+    "owner-sign: 2010 LIABILITY net credit 100 (debit-positive -100) stays -100");
+  ok(ownerSignedFromDebitPositive("INCOME", "-20") === "20",
+    "owner-sign: 4020 INCOME net credit 20 presents as +20");
+  ok(ownerSignedFromDebitPositive("EQUITY", "-30000") === "30000",
+    "owner-sign: 3020 EQUITY net credit 30000 presents as +30000");
+  ok(ownerSignedFromDebitPositive("ASSET", "10000") === "10000",
+    "owner-sign: 1010 ASSET net debit 10000 stays +10000");
+  ok(ownerSignedFromDebitPositive("EXPENSE", "-37.87") === "37.87",
+    "owner-sign: 5020 EXPENSE NET CREDIT 37.87 (debit-positive -37.87) presents as +37.87, never -37.87");
+  // normal-side frame (summarizeAccountLedgers table + category totals):
+  ok(ownerSignedFromNormalSide("EXPENSE", "3.35") === "-3.35",
+    "owner-sign: 5010 EXPENSE normal-side 3.35 presents as -3.35");
+  ok(ownerSignedFromNormalSide("LIABILITY", "100") === "-100",
+    "owner-sign: 2010 LIABILITY normal-side 100 presents as -100");
+  ok(ownerSignedFromNormalSide("INCOME", "20") === "20",
+    "owner-sign: 4020 INCOME normal-side 20 stays +20");
+  ok(ownerSignedFromNormalSide("EQUITY", "30000") === "30000",
+    "owner-sign: 3020 EQUITY normal-side 30000 stays +30000");
+  ok(ownerSignedFromNormalSide("ASSET", "10000") === "10000",
+    "owner-sign: 1010 ASSET normal-side 10000 stays +10000");
+  ok(ownerSignedFromNormalSide("EXPENSE", "-37.87") === "37.87",
+    "owner-sign: 5020 EXPENSE normal-side net credit -37.87 presents as +37.87, never -37.87");
+  ok(ownerSignedFromDebitPositive("EXPENSE", null) === null &&
+    ownerSignedFromNormalSide("EXPENSE", "") === null,
+    "owner-sign: null/blank values stay null so the UI can render '-'");
+  ok(ownerSignedFromDebitPositive("EXPENSE", "0.00") === "0",
+    "owner-sign: zero flips sign-frame consistently (display formats magnitude)");
 
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);
