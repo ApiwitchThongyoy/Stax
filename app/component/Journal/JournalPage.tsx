@@ -7,6 +7,10 @@ import {
   ChevronUp,
   Search,
   CircleHelp,
+  Edit3,
+  Plus,
+  History,
+  CheckCircle2,
 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
 import {
@@ -14,7 +18,16 @@ import {
   reverseJournalEntry,
   type GeneralLedgerJournalEntry,
 } from "../../lib/server-api";
-import { isReferenceOnlySkip } from "../../lib/general-ledger";
+import {
+  isReferenceOnlySkip,
+  getEntryMoneyFlow,
+  classifyEntryCategory,
+} from "../../lib/general-ledger";
+import {
+  EditJournalEntryModal,
+  ManualJournalEntryModal,
+  AuditHistoryModal,
+} from "./JournalActionModals";
 import {
   PeriodFilter,
   defaultPeriod,
@@ -190,6 +203,16 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
     useState<GeneralLedgerJournalEntry | null>(null);
   const [isReversing, setIsReversing] = useState(false);
   const [actionError, setActionError] = useState("");
+  const [editingEntry, setEditingEntry] = useState<GeneralLedgerJournalEntry | null>(null);
+  const [historyEntry, setHistoryEntry] = useState<GeneralLedgerJournalEntry | null>(null);
+  const [isManualModalOpen, setIsManualModalOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState("");
+
+  const handleActionSuccess = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(""), 4000);
+    void loadAll();
+  };
 
   const loadAll = useCallback(async () => {
     if (!user?.accessToken) return;
@@ -381,6 +404,14 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
         </div>
         <button
           type="button"
+          onClick={() => setIsManualModalOpen(true)}
+          className="inline-flex items-center gap-1.5 bg-blue-900 hover:bg-blue-800 text-white text-xs font-semibold px-3 py-2 rounded-lg shadow-xs transition shrink-0"
+        >
+          <Plus className="w-3.5 h-3.5" />
+          + เพิ่มรายการเอง
+        </button>
+        <button
+          type="button"
           onClick={() => setShowLegend((s) => !s)}
           className="inline-flex items-center gap-1.5 bg-white border border-gray-200 hover:bg-gray-50 text-gray-600 text-xs font-medium px-3 py-2 rounded-lg transition"
         >
@@ -388,6 +419,13 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
           วิธีอ่านสมุดรายวัน
         </button>
       </div>
+
+      {toastMessage && (
+        <div className="mt-3 p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl flex items-center gap-2 shadow-xs transition">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+          <span className="font-medium">{toastMessage}</span>
+        </div>
+      )}
 
       {showLegend && (
         <div className="mt-3 bg-blue-50/70 border border-blue-100 rounded-xl px-4 py-3 text-xs text-gray-600 space-y-1.5">
@@ -469,6 +507,9 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
                       <th className="px-4 py-3 font-medium">วันที่</th>
                       <th className="px-4 py-3 font-medium">เลขที่</th>
                       <th className="px-4 py-3 font-medium">รายการ</th>
+                      <th className="px-4 py-3 font-medium">หมวดหมู่</th>
+                      <th className="px-4 py-3 font-medium text-right text-emerald-700">เงินเข้า</th>
+                      <th className="px-4 py-3 font-medium text-right text-red-700">เงินออก</th>
                       <th className="px-4 py-3 font-medium">แหล่ง</th>
                       <th className="px-4 py-3 font-medium">สถานะ</th>
                       <th className="px-4 py-3 font-medium">บัญชี</th>
@@ -477,7 +518,7 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
                       <th className="px-4 py-3 font-medium text-right">
                         จำนวน (THB)
                       </th>
-                      <th className="px-4 py-3 font-medium">การจัดการ</th>
+                      <th className="px-4 py-3 font-medium text-right">การจัดการ</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -493,9 +534,32 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
                       const showSubtitle = summaryText !== entry.description;
                       const expanded = expandedIds.has(entry.id);
                       const lineCount = skipped ? 1 : entry.lines.length;
+                      const catInfo = classifyEntryCategory(entry);
+                      const moneyFlow = getEntryMoneyFlow(entry);
+                      const isEdited = Boolean(entry.updatedAt && entry.updatedAt !== entry.createdAt);
 
                       const actions = (
                         <div className="flex flex-wrap items-center justify-end gap-1.5">
+                          {!reversed && (
+                            <button
+                              type="button"
+                              onClick={() => setEditingEntry(entry)}
+                              className="inline-flex items-center gap-1 text-xs font-medium text-amber-800 border border-amber-200 hover:bg-amber-50 px-2 py-1 rounded-lg transition"
+                            >
+                              <Edit3 className="w-3 h-3" />
+                              แก้ไข
+                            </button>
+                          )}
+                          {isEdited && (
+                            <button
+                              type="button"
+                              onClick={() => setHistoryEntry(entry)}
+                              className="inline-flex items-center gap-1 text-xs font-medium text-purple-700 border border-purple-200 hover:bg-purple-50 px-2 py-1 rounded-lg transition"
+                            >
+                              <History className="w-3 h-3" />
+                              ดูประวัติ
+                            </button>
+                          )}
                           {!reversed && !skipped && (
                             <button
                               type="button"
@@ -589,6 +653,26 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
                           </td>
                           <td
                             rowSpan={rowSpan}
+                            className="px-4 py-3 align-top whitespace-nowrap"
+                          >
+                            <span className="inline-flex items-center text-xs px-2 py-0.5 rounded-md font-medium bg-gray-100 text-gray-700 border border-gray-200/60">
+                              {catInfo.label}
+                            </span>
+                          </td>
+                          <td
+                            rowSpan={rowSpan}
+                            className="px-4 py-3 text-right font-medium align-top whitespace-nowrap text-emerald-600"
+                          >
+                            {moneyFlow.moneyIn ? `+ ${moneyFlow.moneyIn}` : "—"}
+                          </td>
+                          <td
+                            rowSpan={rowSpan}
+                            className="px-4 py-3 text-right font-medium align-top whitespace-nowrap text-red-600"
+                          >
+                            {moneyFlow.moneyOut ? `- ${moneyFlow.moneyOut}` : "—"}
+                          </td>
+                          <td
+                            rowSpan={rowSpan}
                             className="px-4 py-3 align-top"
                           >
                             <SourceBadge source={entry.sourceType} />
@@ -614,6 +698,16 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
                                 </span>
                               )}
                               {reversed && <ReversedBadge />}
+                              {isEdited && (
+                                <button
+                                  type="button"
+                                  onClick={() => setHistoryEntry(entry)}
+                                  className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200 transition"
+                                  title="คลิกเพื่อดูประวัติการแก้ไข"
+                                >
+                                  แก้ไขโดยผู้ใช้
+                                </button>
+                              )}
                               {!skipped && (
                                 <span
                                   className={`inline-flex items-center text-xs font-medium px-2 py-1 rounded-full ${
@@ -837,6 +931,32 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
             </div>
           </div>
         </div>
+      )}
+
+      {editingEntry && user?.accessToken && (
+        <EditJournalEntryModal
+          entry={editingEntry}
+          accessToken={user.accessToken}
+          onClose={() => setEditingEntry(null)}
+          onSuccess={handleActionSuccess}
+        />
+      )}
+
+      {isManualModalOpen && user?.accessToken && (
+        <ManualJournalEntryModal
+          isOpen={isManualModalOpen}
+          accessToken={user.accessToken}
+          onClose={() => setIsManualModalOpen(false)}
+          onSuccess={handleActionSuccess}
+        />
+      )}
+
+      {historyEntry && user?.accessToken && (
+        <AuditHistoryModal
+          entry={historyEntry}
+          accessToken={user.accessToken}
+          onClose={() => setHistoryEntry(null)}
+        />
       )}
     </>
   );

@@ -6,13 +6,15 @@ import { roundMoney, moneyInThb } from "./accounting-amounts";
 // is stored as a decimal string; the pure engine (general-ledger.ts) stays
 // entirely framework/DB-free so all invariants are tested without a database.
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, gte, ilike, inArray, lte, max, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, inArray, lte, max, sql, type SQL } from "drizzle-orm";
 import { Decimal } from "decimal.js";
 import { db } from "./drizzle-db";
 import { assertOwnedReferences } from "./resource-ownership";
 import { safeErrorLog } from "./safe-error-log";
+import { insertAuditLog, insertAuditLogStrict, AuditAction } from "./audit-log";
 import {
   accounts,
+  auditLogs,
   corporateActions,
   capitalTransactions,
   journalEntries,
@@ -50,7 +52,15 @@ import {
   buildStatementJournalEntries,
   FX_VARIANCE_MEMO,
 } from "./posting-engine";
-import { recomputeAllGainLoss, recomputeCostBasisMap, saveCostBasisState, type CostBasisActionRow, type ValidatedCapitalRow } from "./statement-pipeline";
+import {
+  recomputeAllGainLoss,
+  recomputeCostBasisMap,
+  saveCostBasisState,
+  rebuildCostBasisStateFromLedger,
+  backfillComputedGainLoss,
+  type CostBasisActionRow,
+  type ValidatedCapitalRow,
+} from "./statement-pipeline";
 
 Decimal.set({ precision: 40 });
 
@@ -188,8 +198,11 @@ export interface PersistedJournalEntry {
   sourceTransactionId: string | null;
   status: string;
   createdAt: string;
+  updatedAt?: string;
   postingState: PostingState;
   skipReason: string | null;
+  type?: string | null;
+  note?: string | null;
   detail: {
     category: string | null;
     section: string | null;
@@ -212,6 +225,9 @@ export interface PersistedJournalEntry {
     fxRateEffective: string | null;
     fxRateStatement: string | null;
     isFxConversion: boolean;
+    exchangeFromCurrency?: string | null;
+    exchangeFromAmount?: string | null;
+    exchangeRate?: string | null;
     isMonthlyFeeAggregate: boolean | null;
   };
   lines: PersistedJournalLine[];
@@ -1922,6 +1938,12 @@ interface RawLineWithEntry {
     fxRateStatement: string | null;
     isFxConversion: boolean;
     isMonthlyFeeAggregate: boolean | null;
+    exchangeFromCurrency: string | null;
+    exchangeFromAmount: string | null;
+    exchangeRate: string | null;
+    type: string | null;
+    note: string | null;
+    updatedAt: string;
   };
 }
 
@@ -1950,6 +1972,7 @@ async function selectRawLines(conditions: (SQL | undefined)[]) {
         sourceTransactionId: journalEntries.sourceTransactionId,
         status: journalEntries.status,
         createdAt: journalEntries.createdAt,
+        updatedAt: journalEntries.updatedAt,
         postingState: journalEntries.postingState,
         skipReason: journalEntries.skipReason,
         category: journalEntries.category,
@@ -1973,7 +1996,12 @@ async function selectRawLines(conditions: (SQL | undefined)[]) {
         fxRateEffective: journalEntries.fxRateEffective,
         fxRateStatement: journalEntries.fxRateStatement,
         isFxConversion: journalEntries.isFxConversion,
+        exchangeFromCurrency: journalEntries.exchangeFromCurrency,
+        exchangeFromAmount: journalEntries.exchangeFromAmount,
+        exchangeRate: journalEntries.exchangeRate,
         isMonthlyFeeAggregate: journalEntries.isMonthlyFeeAggregate,
+        type: journalEntries.type,
+        note: journalEntries.note,
       },
     })
     .from(journalEntryLines)
@@ -2010,8 +2038,11 @@ function toPersistedEntry(
       sourceTransactionId: entry.sourceTransactionId,
       status: entry.status,
       createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
       postingState: entry.postingState === "SKIPPED" ? "SKIPPED" : "POSTED",
       skipReason: entry.skipReason,
+      type: entry.type,
+      note: entry.note,
       detail: {
         category: entry.category,
         section: entry.section,
@@ -2034,6 +2065,9 @@ function toPersistedEntry(
         fxRateEffective: entry.fxRateEffective,
         fxRateStatement: entry.fxRateStatement,
         isFxConversion: entry.isFxConversion,
+        exchangeFromCurrency: entry.exchangeFromCurrency,
+        exchangeFromAmount: entry.exchangeFromAmount,
+        exchangeRate: entry.exchangeRate,
         isMonthlyFeeAggregate: entry.isMonthlyFeeAggregate,
       },
       lines: lines.map((l) => {
@@ -2122,6 +2156,7 @@ async function fetchJournalHeaders(
       sourceTransactionId: journalEntries.sourceTransactionId,
       status: journalEntries.status,
       createdAt: journalEntries.createdAt,
+      updatedAt: journalEntries.updatedAt,
       postingState: journalEntries.postingState,
       skipReason: journalEntries.skipReason,
       category: journalEntries.category,
@@ -2145,7 +2180,12 @@ async function fetchJournalHeaders(
       fxRateEffective: journalEntries.fxRateEffective,
       fxRateStatement: journalEntries.fxRateStatement,
       isFxConversion: journalEntries.isFxConversion,
+      exchangeFromCurrency: journalEntries.exchangeFromCurrency,
+      exchangeFromAmount: journalEntries.exchangeFromAmount,
+      exchangeRate: journalEntries.exchangeRate,
       isMonthlyFeeAggregate: journalEntries.isMonthlyFeeAggregate,
+      type: journalEntries.type,
+      note: journalEntries.note,
     })
     .from(journalEntries)
     .where(and(...conditions))
@@ -2596,4 +2636,895 @@ export async function reverseJournalEntry(
     console.error("reverseJournalEntry: failed to persist reversal", safeErrorLog(error));
     return { ok: false, errors: ["Failed to persist journal entry"] };
   }
+}
+
+/**
+ * Fetch a single journal entry by its UUID with its lines and account details.
+ */
+export async function getJournalEntryById(
+  userId: string,
+  entryId: string
+): Promise<PersistedJournalEntry | null> {
+  const [accountRows, headerRows, lineRows] = await Promise.all([
+    getAccounts(userId),
+    db
+      .select({
+        id: journalEntries.id,
+        entryNo: journalEntries.entryNo,
+        entryDate: journalEntries.entryDate,
+        description: journalEntries.description,
+        sourceType: journalEntries.sourceType,
+        sourceDocumentId: journalEntries.sourceDocumentId,
+        sourceTransactionId: journalEntries.sourceTransactionId,
+        status: journalEntries.status,
+        createdAt: journalEntries.createdAt,
+        updatedAt: journalEntries.updatedAt,
+        postingState: journalEntries.postingState,
+        skipReason: journalEntries.skipReason,
+        category: journalEntries.category,
+        section: journalEntries.section,
+        symbol: journalEntries.symbol,
+        side: journalEntries.side,
+        exchange: journalEntries.exchange,
+        quantity: journalEntries.quantity,
+        unitPrice: journalEntries.unitPrice,
+        grossAmount: journalEntries.grossAmount,
+        fees: journalEntries.fees,
+        netAmount: journalEntries.netAmount,
+        proceeds: journalEntries.proceeds,
+        costBasis: journalEntries.costBasis,
+        realizedGainLoss: journalEntries.realizedGainLoss,
+        realizedGainLossThb: journalEntries.realizedGainLossThb,
+        averageCost: journalEntries.averageCost,
+        currency: journalEntries.currency,
+        amount: journalEntries.amount,
+        amountThb: journalEntries.amountThb,
+        fxRateEffective: journalEntries.fxRateEffective,
+        fxRateStatement: journalEntries.fxRateStatement,
+        isFxConversion: journalEntries.isFxConversion,
+        exchangeFromCurrency: journalEntries.exchangeFromCurrency,
+        exchangeFromAmount: journalEntries.exchangeFromAmount,
+        exchangeRate: journalEntries.exchangeRate,
+        isMonthlyFeeAggregate: journalEntries.isMonthlyFeeAggregate,
+        type: journalEntries.type,
+        note: journalEntries.note,
+      })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
+      .limit(1)
+      .execute(),
+    db
+      .select({
+        id: journalEntryLines.id,
+        journalEntryId: journalEntryLines.journalEntryId,
+        accountId: journalEntryLines.accountId,
+        currency: journalEntryLines.currency,
+        debitAmount: journalEntryLines.debitAmount,
+        creditAmount: journalEntryLines.creditAmount,
+        amountThb: journalEntryLines.amountThb,
+        fxRateEffective: journalEntryLines.fxRateEffective,
+        fxRateStatement: journalEntryLines.fxRateStatement,
+        fxRateProvider: journalEntryLines.fxRateProvider,
+        memo: journalEntryLines.memo,
+      })
+      .from(journalEntryLines)
+      .where(and(eq(journalEntryLines.userId, userId), eq(journalEntryLines.journalEntryId, entryId)))
+      .orderBy(asc(journalEntryLines.id))
+      .execute(),
+  ]);
+
+  const header = headerRows[0];
+  if (!header) return null;
+  const accountMap = toAccountMap(accountRows);
+  const grouped = new Map<string, { entry: any; lines: any[] }>();
+  grouped.set(header.id, { entry: header, lines: lineRows });
+  const entries = toPersistedEntry(grouped, accountMap);
+  return entries[0] ?? null;
+}
+
+export interface JournalAuditRecord {
+  id: string;
+  action: string;
+  createdAt: string;
+  details: unknown;
+}
+
+/**
+ * Fetch audit log history for a journal entry.
+ */
+export async function getJournalEntryAuditHistory(
+  userId: string,
+  entryId: string
+): Promise<JournalAuditRecord[]> {
+  const rows = await db
+    .select({
+      id: auditLogs.id,
+      action: auditLogs.action,
+      createdAt: auditLogs.createdAt,
+      details: auditLogs.details,
+    })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.userId, userId),
+        eq(auditLogs.entityId, entryId)
+      )
+    )
+    .orderBy(desc(auditLogs.createdAt))
+    .execute();
+  return rows;
+}
+
+export interface EditJournalEntryInput {
+  entryDate?: string;
+  description?: string;
+  note?: string | null;
+  category?: string | null;
+  type?: string | null;
+  symbol?: string | null;
+  side?: string | null;
+  quantity?: string | null;
+  unitPrice?: string | null;
+  grossAmount?: string | null;
+  fees?: string | null;
+  netAmount?: string | null;
+  currency?: string | null;
+  amount?: string | null;
+  fxRateEffective?: string | null;
+  lines?: JournalLineInput[];
+}
+
+export type EditJournalEntryResult =
+  | { ok: true; entry: PersistedJournalEntry }
+  | { ok: false; status: number; errors: string[] };
+
+/**
+ * Edit a non-reversed journal entry atomically in a single transaction with
+ * cost-basis recomputation and audit logging.
+ */
+export async function editJournalEntry(
+  userId: string,
+  entryId: string,
+  updates: EditJournalEntryInput,
+  reason?: string
+): Promise<EditJournalEntryResult> {
+  const now = new Date().toISOString();
+  try {
+    return await db.transaction(async (tx) => {
+      const [header] = await tx
+        .select()
+        .from(journalEntries)
+        .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
+        .limit(1)
+        .for("update")
+        .execute();
+
+      if (!header) {
+        return { ok: false, status: 404, errors: ["Journal entry not found"] };
+      }
+      if (header.status === "REVERSED") {
+        return { ok: false, status: 400, errors: ["Cannot edit a reversed journal entry"] };
+      }
+      if (header.description.startsWith("[REVERSAL OF #")) {
+        return { ok: false, status: 400, errors: ["Cannot edit a reversing journal entry"] };
+      }
+
+      const existingLines = await tx
+        .select()
+        .from(journalEntryLines)
+        .where(and(eq(journalEntryLines.userId, userId), eq(journalEntryLines.journalEntryId, entryId)))
+        .orderBy(asc(journalEntryLines.id))
+        .execute();
+
+      const oldValues = {
+        entryDate: header.entryDate,
+        description: header.description,
+        note: header.note,
+        category: header.category,
+        symbol: header.symbol,
+        side: header.side,
+        quantity: header.quantity,
+        unitPrice: header.unitPrice,
+        grossAmount: header.grossAmount,
+        fees: header.fees,
+        netAmount: header.netAmount,
+        currency: header.currency,
+        amount: header.amount,
+        fxRateEffective: header.fxRateEffective,
+        lines: existingLines.map((l) => ({
+          accountId: l.accountId,
+          currency: l.currency,
+          side: l.debitAmount != null ? "DEBIT" : "CREDIT",
+          amount: l.debitAmount ?? l.creditAmount ?? "0",
+          memo: l.memo,
+        })),
+      };
+
+      const newEntryDate = updates.entryDate?.trim() || header.entryDate;
+      const newDescription = updates.description?.trim() || header.description;
+      const newNote = updates.note !== undefined ? (updates.note?.trim() || null) : header.note;
+      const newCategory = updates.category !== undefined ? updates.category : header.category;
+      const newSymbol = updates.symbol !== undefined ? updates.symbol : header.symbol;
+      const newSide = updates.side !== undefined ? updates.side : header.side;
+      const newQuantity = updates.quantity !== undefined ? updates.quantity : header.quantity;
+      const newUnitPrice = updates.unitPrice !== undefined ? updates.unitPrice : header.unitPrice;
+      const newGrossAmount = updates.grossAmount !== undefined ? updates.grossAmount : header.grossAmount;
+      const newFees = updates.fees !== undefined ? updates.fees : header.fees;
+      const newNetAmount = updates.netAmount !== undefined ? updates.netAmount : header.netAmount;
+      const newCurrency = updates.currency !== undefined ? updates.currency : header.currency;
+      const newAmount = updates.amount !== undefined ? updates.amount : header.amount;
+      const newFxRateEffective = updates.fxRateEffective !== undefined ? updates.fxRateEffective : header.fxRateEffective;
+
+      let updatedPostingLines: {
+        accountId: string;
+        currency: string;
+        debitAmount: string | null;
+        creditAmount: string | null;
+        amountThb: string;
+        fxRateEffective: string;
+        fxRateStatement: string | null;
+        fxRateProvider: string | null;
+        memo: string | null;
+      }[] = [];
+
+      let shouldReplaceLines = false;
+
+      // Case A: explicit lines supplied
+      if (updates.lines && updates.lines.length >= 2) {
+        const lookup = await loadAccountLookup(userId, tx);
+        const resolved = resolveEntryAccountIds(
+          {
+            entryDate: newEntryDate,
+            description: newDescription,
+            lines: updates.lines,
+          },
+          lookup
+        );
+        if (!resolved.ok) return { ok: false, status: 422, errors: resolved.errors };
+
+        const validated = validateJournalEntry({
+          entryDate: newEntryDate,
+          description: newDescription,
+          lines: resolved.lines,
+        });
+        if (!validated.ok) return { ok: false, status: 422, errors: validated.errors };
+
+        const currencyErrors: string[] = [];
+        validated.entry.lines.forEach((line, i) => {
+          const account = lookup.get(line.accountId);
+          if (!account) {
+            currencyErrors.push(`line[${i}]: unknown account ${JSON.stringify(line.accountId)}`);
+            return;
+          }
+          if (account.currency !== line.currency) {
+            currencyErrors.push(
+              `line[${i}]: account ${account.code} is ${account.currency}-denominated but the line is ${line.currency}`
+            );
+          }
+        });
+        if (currencyErrors.length > 0) return { ok: false, status: 422, errors: currencyErrors };
+
+        shouldReplaceLines = true;
+        updatedPostingLines = validated.entry.lines.map((l) => ({
+          accountId: l.accountId,
+          currency: l.currency,
+          debitAmount: l.side === "DEBIT" ? l.amount : null,
+          creditAmount: l.side === "CREDIT" ? l.amount : null,
+          amountThb: l.amountThb,
+          fxRateEffective: l.fxRateEffective,
+          fxRateStatement: l.fxRateStatement,
+          fxRateProvider: l.fxRateProvider,
+          memo: l.memo,
+        }));
+      }
+
+      // If linked to a Capital_Transactions row, update it and recompute cost basis
+      if (header.sourceTransactionId) {
+        const capUpdate: Record<string, unknown> = {};
+        if (updates.entryDate) capUpdate.transactionDate = newEntryDate;
+        if (updates.symbol !== undefined) capUpdate.symbol = newSymbol;
+        if (updates.side !== undefined) capUpdate.side = newSide;
+        if (updates.quantity !== undefined) capUpdate.quantity = newQuantity;
+        if (updates.unitPrice !== undefined) capUpdate.unitPrice = newUnitPrice;
+        if (updates.grossAmount !== undefined) capUpdate.grossAmount = newGrossAmount;
+        if (updates.fees !== undefined) capUpdate.fees = newFees;
+        if (updates.netAmount !== undefined) capUpdate.netAmount = newNetAmount;
+        if (updates.currency !== undefined) capUpdate.currency = newCurrency;
+        if (updates.amount !== undefined) capUpdate.amountForeign = newAmount;
+        if (updates.fxRateEffective !== undefined) capUpdate.fxRateEffective = newFxRateEffective;
+
+        if (Object.keys(capUpdate).length > 0) {
+          await tx
+            .update(capitalTransactions)
+            .set(capUpdate)
+            .where(
+              and(
+                eq(capitalTransactions.userId, userId),
+                eq(capitalTransactions.transactionId, header.sourceTransactionId)
+              )
+            )
+            .execute();
+
+          if (!shouldReplaceLines) {
+            const [updatedCapRow] = await tx
+              .select()
+              .from(capitalTransactions)
+              .where(
+                and(
+                  eq(capitalTransactions.userId, userId),
+                  eq(capitalTransactions.transactionId, header.sourceTransactionId)
+                )
+              )
+              .limit(1)
+              .execute();
+
+            if (updatedCapRow) {
+              const [plan] = buildStatementJournalEntries([updatedCapRow as ValidatedCapitalRow]);
+              if (plan && plan.entry.lines.length > 0) {
+                const lookup = await loadAccountLookup(userId, tx);
+                const resolved = resolveEntryAccountIds(plan.entry, lookup);
+                if (resolved.ok) {
+                  const validated = validateJournalEntry({ ...plan.entry, lines: resolved.lines });
+                  if (validated.ok && !currencyMismatchErrors(validated.entry, lookup).length) {
+                    shouldReplaceLines = true;
+                    updatedPostingLines = validated.entry.lines.map((l) => ({
+                      accountId: l.accountId,
+                      currency: l.currency,
+                      debitAmount: l.side === "DEBIT" ? l.amount : null,
+                      creditAmount: l.side === "CREDIT" ? l.amount : null,
+                      amountThb: l.amountThb,
+                      fxRateEffective: l.fxRateEffective,
+                      fxRateStatement: l.fxRateStatement,
+                      fxRateProvider: l.fxRateProvider,
+                      memo: l.memo,
+                    }));
+                  }
+                }
+              }
+            }
+          }
+
+          // Deterministic recomputation: recalculates affected SELL gains, updates GL lines and cache
+          const affectedSymbols = new Set<string>();
+          if (newSymbol) affectedSymbols.add(newSymbol);
+          if (header.symbol) affectedSymbols.add(header.symbol);
+          await reconcileStatementState(userId, affectedSymbols, tx);
+        }
+      }
+
+      // Update journalEntries header
+      await tx
+        .update(journalEntries)
+        .set({
+          entryDate: newEntryDate,
+          description: newDescription,
+          note: newNote,
+          category: newCategory,
+          symbol: newSymbol,
+          side: newSide,
+          quantity: newQuantity,
+          unitPrice: newUnitPrice,
+          grossAmount: newGrossAmount,
+          fees: newFees,
+          netAmount: newNetAmount,
+          currency: newCurrency,
+          amount: newAmount,
+          fxRateEffective: newFxRateEffective,
+          updatedAt: now,
+        })
+        .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
+        .execute();
+
+      // Replace lines if updated
+      if (shouldReplaceLines) {
+        await tx
+          .delete(journalEntryLines)
+          .where(and(eq(journalEntryLines.userId, userId), eq(journalEntryLines.journalEntryId, entryId)))
+          .execute();
+
+        for (const line of updatedPostingLines) {
+          await tx
+            .insert(journalEntryLines)
+            .values({
+              id: randomUUID(),
+              journalEntryId: entryId,
+              userId,
+              accountId: line.accountId,
+              currency: line.currency,
+              debitAmount: line.debitAmount,
+              creditAmount: line.creditAmount,
+              amountThb: line.amountThb,
+              fxRateEffective: line.fxRateEffective,
+              fxRateStatement: line.fxRateStatement,
+              fxRateProvider: line.fxRateProvider,
+              memo: line.memo,
+            })
+            .execute();
+        }
+      }
+
+      // Record audit log
+      const newValues = {
+        entryDate: newEntryDate,
+        description: newDescription,
+        note: newNote,
+        category: newCategory,
+        symbol: newSymbol,
+        side: newSide,
+        quantity: newQuantity,
+        unitPrice: newUnitPrice,
+        grossAmount: newGrossAmount,
+        fees: newFees,
+        netAmount: newNetAmount,
+        currency: newCurrency,
+        amount: newAmount,
+        fxRateEffective: newFxRateEffective,
+        lines: shouldReplaceLines ? updatedPostingLines : oldValues.lines,
+      };
+
+      await insertAuditLogStrict(
+        {
+          userId,
+          action: AuditAction.CAPITAL_TRANSACTION_UPDATE,
+          entityType: "JOURNAL_ENTRY",
+          entityId: entryId,
+          details: {
+            reason: reason || "User edited journal entry",
+            sourceType: header.sourceType,
+            entryNo: header.entryNo,
+            oldValues,
+            newValues,
+          },
+        },
+        tx
+      );
+
+      // Fetch and return the updated persisted journal entry
+      const accountRows = await getActiveAccounts(userId, tx);
+      const accountMap = toAccountMap(accountRows);
+      const [updatedHeader] = await tx
+        .select()
+        .from(journalEntries)
+        .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
+        .execute();
+      const currentLines = await tx
+        .select()
+        .from(journalEntryLines)
+        .where(and(eq(journalEntryLines.userId, userId), eq(journalEntryLines.journalEntryId, entryId)))
+        .orderBy(asc(journalEntryLines.id))
+        .execute();
+
+      const grouped = new Map<string, { entry: any; lines: any[] }>();
+      grouped.set(updatedHeader.id, { entry: updatedHeader, lines: currentLines });
+      const [persisted] = toPersistedEntry(grouped, accountMap);
+
+      return { ok: true, entry: persisted };
+    });
+  } catch (error) {
+    console.error("editJournalEntry error:", safeErrorLog(error));
+    return { ok: false, status: 500, errors: ["Internal server error while editing journal entry"] };
+  }
+}
+
+export interface StructuredManualJournalInput {
+  transactionType:
+    | "BUY"
+    | "SELL"
+    | "DEPOSIT"
+    | "WITHDRAWAL"
+    | "FX"
+    | "DIVIDEND"
+    | "INTEREST"
+    | "FEE"
+    | "TAX"
+    | "VAT"
+    | "GAIN_LOSS"
+    | "CUSTOM";
+  entryDate: string;
+  description: string;
+  currency?: string;
+  amount?: string;
+  amountThb?: string;
+  fxRateEffective?: string;
+  symbol?: string;
+  side?: string;
+  quantity?: string;
+  unitPrice?: string;
+  grossAmount?: string;
+  fees?: string;
+  netAmount?: string;
+  whtAmount?: string;
+  fromCurrency?: string;
+  fromAmount?: string;
+  toCurrency?: string;
+  toAmount?: string;
+  exchangeRate?: string;
+  cashAccountCode?: string;
+  lines?: JournalLineInput[];
+  note?: string;
+}
+
+/**
+ * Create a structured manual journal entry with automatic GAAP double-entry posting lines.
+ */
+export async function createStructuredManualJournal(
+  userId: string,
+  input: StructuredManualJournalInput
+): Promise<CreateEntryResult> {
+  const ccy = (input.currency || "THB").toUpperCase();
+  const fx = input.fxRateEffective || (ccy === "THB" ? "1" : "35");
+  let postingLines: JournalLineInput[] = [];
+  let category: string = "asset";
+  let side: string | null = null;
+  let type: string | null = null;
+
+  switch (input.transactionType) {
+    case "BUY": {
+      category = "asset";
+      side = "BUY";
+      const gross = input.grossAmount || (input.quantity && input.unitPrice ? new Decimal(input.quantity).times(input.unitPrice).toFixed(2) : input.amount || "0");
+      const fee = input.fees || "0";
+      const net = input.netAmount || (new Decimal(gross).plus(fee).toFixed(2));
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+
+      postingLines.push({
+        accountId: "1110",
+        currency: ccy,
+        debit: gross,
+        fxRateEffective: fx,
+        memo: input.symbol ? `${input.symbol} ${input.quantity ?? ""} @ ${input.unitPrice ?? ""}`.trim() : "ซื้อหุ้น",
+      });
+      if (new Decimal(fee).gt(0)) {
+        postingLines.push({
+          accountId: "5010",
+          currency: ccy,
+          debit: fee,
+          fxRateEffective: fx,
+          memo: "ค่าธรรมเนียมการซื้อ",
+        });
+      }
+      postingLines.push({
+        accountId: cashCode,
+        currency: ccy,
+        credit: net,
+        fxRateEffective: fx,
+      });
+      break;
+    }
+
+    case "SELL": {
+      category = "asset";
+      side = "SELL";
+      const gross = input.grossAmount || (input.quantity && input.unitPrice ? new Decimal(input.quantity).times(input.unitPrice).toFixed(2) : input.amount || "0");
+      const fee = input.fees || "0";
+      const net = input.netAmount || (new Decimal(gross).minus(fee).toFixed(2));
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+
+      postingLines.push({
+        accountId: cashCode,
+        currency: ccy,
+        debit: net,
+        fxRateEffective: fx,
+      });
+      if (new Decimal(fee).gt(0)) {
+        postingLines.push({
+          accountId: "5010",
+          currency: ccy,
+          debit: fee,
+          fxRateEffective: fx,
+          memo: "ค่าธรรมเนียมการขาย",
+        });
+      }
+      postingLines.push({
+        accountId: "1110",
+        currency: ccy,
+        credit: gross,
+        fxRateEffective: fx,
+        memo: input.symbol ? `${input.symbol} ${input.quantity ?? ""} @ ${input.unitPrice ?? ""}`.trim() : "ขายหุ้น",
+      });
+      break;
+    }
+
+    case "DEPOSIT": {
+      category = "equity";
+      type = "CASH_IN";
+      const amt = input.amount || input.netAmount || "0";
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+      const equityCode = ccy === "THB" ? "3020" : "3010";
+
+      postingLines.push({
+        accountId: cashCode,
+        currency: ccy,
+        debit: amt,
+        fxRateEffective: fx,
+      });
+      postingLines.push({
+        accountId: equityCode,
+        currency: ccy,
+        credit: amt,
+        fxRateEffective: fx,
+      });
+      break;
+    }
+
+    case "WITHDRAWAL": {
+      category = "equity";
+      type = "CASH_OUT";
+      const amt = input.amount || input.netAmount || "0";
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+      const equityCode = ccy === "THB" ? "3020" : "3010";
+
+      postingLines.push({
+        accountId: equityCode,
+        currency: ccy,
+        debit: amt,
+        fxRateEffective: fx,
+      });
+      postingLines.push({
+        accountId: cashCode,
+        currency: ccy,
+        credit: amt,
+        fxRateEffective: fx,
+      });
+      break;
+    }
+
+    case "DIVIDEND": {
+      category = "income";
+      const gross = input.grossAmount || input.amount || "0";
+      const wht = input.whtAmount || "0";
+      const net = input.netAmount || (new Decimal(gross).minus(wht).toFixed(2));
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+
+      postingLines.push({
+        accountId: cashCode,
+        currency: ccy,
+        debit: net,
+        fxRateEffective: fx,
+      });
+      if (new Decimal(wht).gt(0)) {
+        postingLines.push({
+          accountId: "5110",
+          currency: ccy,
+          debit: wht,
+          fxRateEffective: fx,
+          memo: "ภาษีหัก ณ ที่จ่าย",
+        });
+      }
+      postingLines.push({
+        accountId: "4010",
+        currency: ccy,
+        credit: gross,
+        fxRateEffective: fx,
+        memo: input.symbol ? `เงินปันผล ${input.symbol}` : "เงินปันผล",
+      });
+      break;
+    }
+
+    case "INTEREST": {
+      category = "income";
+      const gross = input.grossAmount || input.amount || "0";
+      const wht = input.whtAmount || "0";
+      const net = input.netAmount || (new Decimal(gross).minus(wht).toFixed(2));
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+
+      postingLines.push({
+        accountId: cashCode,
+        currency: ccy,
+        debit: net,
+        fxRateEffective: fx,
+      });
+      if (new Decimal(wht).gt(0)) {
+        postingLines.push({
+          accountId: "5110",
+          currency: ccy,
+          debit: wht,
+          fxRateEffective: fx,
+          memo: "ภาษีหัก ณ ที่จ่าย",
+        });
+      }
+      postingLines.push({
+        accountId: "4030",
+        currency: ccy,
+        credit: gross,
+        fxRateEffective: fx,
+        memo: "ดอกเบี้ยรับ",
+      });
+      break;
+    }
+
+    case "FEE": {
+      category = "expense";
+      const amt = input.amount || input.fees || "0";
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+
+      postingLines.push({
+        accountId: "5010",
+        currency: ccy,
+        debit: amt,
+        fxRateEffective: fx,
+        memo: "ค่าธรรมเนียม",
+      });
+      postingLines.push({
+        accountId: cashCode,
+        currency: ccy,
+        credit: amt,
+        fxRateEffective: fx,
+      });
+      break;
+    }
+
+    case "TAX": {
+      category = "expense";
+      const amt = input.amount || input.whtAmount || "0";
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+
+      postingLines.push({
+        accountId: "5110",
+        currency: ccy,
+        debit: amt,
+        fxRateEffective: fx,
+        memo: "ภาษีหัก ณ ที่จ่าย",
+      });
+      postingLines.push({
+        accountId: cashCode,
+        currency: ccy,
+        credit: amt,
+        fxRateEffective: fx,
+      });
+      break;
+    }
+
+    case "VAT": {
+      category = "expense";
+      const amt = input.amount || input.fees || "0";
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+
+      postingLines.push({
+        accountId: "5010",
+        currency: ccy,
+        debit: amt,
+        fxRateEffective: fx,
+        memo: "ภาษีมูลค่าเพิ่ม (VAT)",
+      });
+      postingLines.push({
+        accountId: cashCode,
+        currency: ccy,
+        credit: amt,
+        fxRateEffective: fx,
+      });
+      break;
+    }
+
+    case "GAIN_LOSS": {
+      const amt = input.amount || "0";
+      const isGain = input.side === "BUY" || input.side === "GAIN" || new Decimal(amt).gte(0);
+      const absAmt = new Decimal(amt).abs().toFixed(2);
+      const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
+
+      if (isGain) {
+        category = "income";
+        postingLines.push({
+          accountId: cashCode,
+          currency: ccy,
+          debit: absAmt,
+          fxRateEffective: fx,
+        });
+        postingLines.push({
+          accountId: "4020",
+          currency: ccy,
+          credit: absAmt,
+          fxRateEffective: fx,
+          memo: input.symbol ? `กำไรจากการลงทุน ${input.symbol}` : "กำไรจากการลงทุน",
+        });
+      } else {
+        category = "expense";
+        postingLines.push({
+          accountId: "5120",
+          currency: ccy,
+          debit: absAmt,
+          fxRateEffective: fx,
+          memo: input.symbol ? `ขาดทุนจากการลงทุน ${input.symbol}` : "ขาดทุนจากการลงทุน",
+        });
+        postingLines.push({
+          accountId: cashCode,
+          currency: ccy,
+          credit: absAmt,
+          fxRateEffective: fx,
+        });
+      }
+      break;
+    }
+
+    case "FX": {
+      category = "asset";
+      const fromCcy = (input.fromCurrency || "THB").toUpperCase();
+      const toCcy = (input.toCurrency || "USD").toUpperCase();
+      const fromAmt = input.fromAmount || input.amount || "0";
+      const toAmt = input.toAmount || input.amount || "0";
+      const rate = input.exchangeRate || fx;
+
+      const fromAccount = fromCcy === "THB" ? "1010" : "1020";
+      const toAccount = toCcy === "THB" ? "1010" : "1020";
+
+      const toEff = toCcy === "THB" ? "1" : rate;
+      const fromEff = fromCcy === "THB" ? "1" : rate;
+
+      postingLines.push({
+        accountId: toAccount,
+        currency: toCcy,
+        debit: toAmt,
+        fxRateEffective: toEff,
+        memo: `แลกเปลี่ยนเข้า ${toCcy}`,
+      });
+      postingLines.push({
+        accountId: fromAccount,
+        currency: fromCcy,
+        credit: fromAmt,
+        fxRateEffective: fromEff,
+        memo: `แลกเปลี่ยนออก ${fromCcy}`,
+      });
+
+      // FX variance leg if THB bases differ
+      const receivedThb = moneyInThb(toAmt, toEff);
+      const sentThb = moneyInThb(fromAmt, fromEff);
+      const diff = new Decimal(receivedThb).minus(new Decimal(sentThb));
+      if (!diff.isZero()) {
+        postingLines.push({
+          accountId: "5020",
+          currency: "THB",
+          ...(diff.greaterThan(0)
+            ? { credit: roundMoney(diff.abs().toString()) }
+            : { debit: roundMoney(diff.abs().toString()) }),
+          fxRateEffective: "1",
+          memo: FX_VARIANCE_MEMO,
+        });
+      }
+      break;
+    }
+
+    case "CUSTOM":
+    default: {
+      if (!input.lines || input.lines.length < 2) {
+        return { ok: false, errors: ["Custom transaction requires at least 2 lines"] };
+      }
+      postingLines = input.lines;
+      break;
+    }
+  }
+
+  const result = await createJournalEntry(userId, {
+    entryDate: input.entryDate,
+    description: input.description,
+    sourceType: "MANUAL",
+    detail: {
+      ...emptyTradeDetail(),
+      category,
+      symbol: input.symbol ?? null,
+      side,
+      quantity: input.quantity ?? null,
+      unitPrice: input.unitPrice ?? null,
+      grossAmount: input.grossAmount ?? null,
+      fees: input.fees ?? null,
+      netAmount: input.netAmount ?? null,
+      currency: ccy,
+      amount: input.amount ?? null,
+      fxRateEffective: fx,
+      isFxConversion: input.transactionType === "FX",
+      exchangeFromCurrency: input.fromCurrency ?? null,
+      exchangeFromAmount: input.fromAmount ?? null,
+      exchangeRate: input.exchangeRate ?? null,
+    },
+    lines: postingLines,
+  });
+
+  if (result.ok && input.note?.trim()) {
+    await db
+      .update(journalEntries)
+      .set({ note: input.note.trim() })
+      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, result.entryId)))
+      .execute();
+  }
+
+  return result;
 }

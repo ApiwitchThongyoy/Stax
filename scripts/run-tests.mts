@@ -5596,6 +5596,10 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
   const { runCurrencyExchangeTests } = await import("./r6-r7-db.mjs");
   await runCurrencyExchangeTests(client, ok);
 
+  console.log("\n=== REG: PROFESSOR JOURNAL, EDIT ATOMICITY & RECOMPUTE ===");
+  const { runProfessorJournalDbTests } = await import("./professor-journal-db.mjs");
+  await runProfessorJournalDbTests(client, ok);
+
   console.log("\n=== CLEANUP ===");
   const cleanIds: string[] = [];
   if (userBTxnId) cleanIds.push(userBTxnId);

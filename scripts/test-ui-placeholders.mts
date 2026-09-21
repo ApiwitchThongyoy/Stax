@@ -105,6 +105,9 @@ const postingEngine = read("app/lib/posting-engine.ts");
 const fxReconcileScript = read("scripts/reconcile-fx-postings.mts");
 const roundingReconcileScript = read("scripts/reconcile-rounding-postings.mts");
 const equityReconcileScript = read("scripts/reconcile-thb-equity-postings.mts");
+const generalLedgerNew = read("app/component/LedgerRedesign/GeneralLedgerNew.tsx");
+const journalActionModals = read("app/component/Journal/JournalActionModals.tsx");
+const journalIdRoute = read("app/routes/api/journal.$id.ts");
 
 // ---------------------------------------------------------------------------
 // 1. No stale fake placeholder values anywhere in the user UI.
@@ -2452,6 +2455,78 @@ ok(
     journalPage.includes("บันทึกในสมุดรายวันแล้ว:") &&
     journalTab.includes("บันทึกในสมุดรายวันแล้ว:"),
   "Journal renders the required reference and unposted explanation texts"
+);
+
+// ---------------------------------------------------------------------------
+// Professor Requirements: Bankbook, Edit, Manual Add, Audit, Tab De-emphasis
+// ---------------------------------------------------------------------------
+ok(
+  journalPage.includes("หมวดหมู่") &&
+    journalPage.includes("เงินเข้า") &&
+    journalPage.includes("เงินออก") &&
+    journalTab.includes("หมวดหมู่") &&
+    journalTab.includes("เงินเข้า") &&
+    journalTab.includes("เงินออก"),
+  "Journal pages display Bankbook columns: หมวดหมู่, เงินเข้า, เงินออก"
+);
+
+ok(
+  journalPage.includes("+ เพิ่มรายการเอง") &&
+    journalTab.includes("+ เพิ่มรายการเอง"),
+  "Journal pages have '+ เพิ่มรายการเอง' manual entry action button"
+);
+
+ok(
+  journalPage.includes("แก้ไข") &&
+    journalTab.includes("แก้ไข") &&
+    journalPage.includes("แก้ไขโดยผู้ใช้") &&
+    journalTab.includes("แก้ไขโดยผู้ใช้"),
+  "Journal entries feature 'แก้ไข' button and 'แก้ไขโดยผู้ใช้' badge when modified"
+);
+
+ok(
+  journalActionModals.includes("ยืนยันการแก้ไขข้อมูล") &&
+    journalActionModals.includes("ใช่") &&
+    journalActionModals.includes("ไม่") &&
+    journalActionModals.includes("เหตุผลในการแก้ไข (Audit Note)"),
+  "Edit modal includes confirmation prompt ('ยืนยันการแก้ไขข้อมูล', 'ใช่'/'ไม่') and reason requirement"
+);
+
+ok(
+  journalActionModals.includes("ยืนยันการเพิ่มรายการ") &&
+    journalActionModals.includes("ซื้อหุ้น (BUY)") &&
+    journalActionModals.includes("ขายหุ้น (SELL)") &&
+    journalActionModals.includes("ฝากเงินเข้า (Deposit)") &&
+    journalActionModals.includes("ถอนเงินออก (Withdrawal)") &&
+    journalActionModals.includes("แลกเปลี่ยนเงินตรา (FX)"),
+  "Manual journal modal supports structured transaction types and confirmation step"
+);
+
+ok(
+  journalActionModals.includes("ประวัติการแก้ไข") &&
+    journalActionModals.includes("ข้อมูลเดิมก่อนแก้ไข") &&
+    journalActionModals.includes("ข้อมูลใหม่หลังแก้ไข"),
+  "Audit history modal displays before/after comparison and audit logs"
+);
+
+ok(
+  routesFile.includes('route("api/v1/journal/:id", "routes/api/journal.$id.ts")'),
+  "routes.ts registers api/v1/journal/:id route"
+);
+
+ok(
+  journalIdRoute.includes("getJournalEntryById") &&
+    journalIdRoute.includes("getJournalEntryAuditHistory") &&
+    journalIdRoute.includes("editJournalEntry"),
+  "Journal $id route supports retrieval with audit history and atomic edits with recompute"
+);
+
+ok(
+  !generalLedgerNew.includes('{ id: "trial", label: "งบทดลอง" }') &&
+    generalLedgerNew.includes('{ id: "journal"') &&
+    generalLedgerNew.includes('{ id: "income"') &&
+    generalLedgerNew.includes('{ id: "balance"'),
+  "GeneralLedger tabs de-emphasize trial balance (removed from primary report tabs, backend preserved)"
 );
 
 console.log("\n================ SUMMARY ================");

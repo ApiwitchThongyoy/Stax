@@ -83,12 +83,17 @@ function sanitizeDetails(
   return sanitized;
 }
 
-export async function insertAuditLog(input: AuditLogInput): Promise<void> {
+type Conn = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+export async function insertAuditLog(
+  input: AuditLogInput,
+  conn: Conn = db
+): Promise<void> {
   const id = randomUUID();
   const now = new Date().toISOString();
 
   try {
-    await db
+    await conn
       .insert(auditLogs)
       .values({
         id,
@@ -107,4 +112,31 @@ export async function insertAuditLog(input: AuditLogInput): Promise<void> {
     // source of truth.
     console.error("insertAuditLog: failed to persist audit entry", safeErrorLog(error));
   }
+}
+
+/**
+ * Transaction-aware audit log insertion with STRICT atomicity.
+ * Unlike best-effort logging, this does NOT swallow errors. If the audit log
+ * fails to persist (e.g. invalid action, DB failure), it throws so that the
+ * outer transaction can rollback all source updates, journal entries, and lines.
+ */
+export async function insertAuditLogStrict(
+  input: AuditLogInput,
+  conn: Conn = db
+): Promise<void> {
+  const id = randomUUID();
+  const now = new Date().toISOString();
+
+  await conn
+    .insert(auditLogs)
+    .values({
+      id,
+      userId: input.userId ?? null,
+      action: input.action,
+      entityType: input.entityType ?? null,
+      entityId: input.entityId ?? null,
+      details: sanitizeDetails(input.details),
+      createdAt: now,
+    })
+    .execute();
 }

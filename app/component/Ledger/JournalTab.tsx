@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router";
-import { Plus, X, RotateCcw, Search } from "lucide-react";
+import { Plus, X, RotateCcw, Search, Edit3, History, CheckCircle2 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
 import {
   fetchAccounts,
@@ -9,7 +9,16 @@ import {
   type GeneralLedgerAccount,
   type GeneralLedgerJournalEntry,
 } from "../../lib/server-api";
-import { isReferenceOnlySkip } from "../../lib/general-ledger";
+import {
+  isReferenceOnlySkip,
+  getEntryMoneyFlow,
+  classifyEntryCategory,
+} from "../../lib/general-ledger";
+import {
+  EditJournalEntryModal,
+  ManualJournalEntryModal,
+  AuditHistoryModal,
+} from "../Journal/JournalActionModals";
 import JournalEntryModal from "./JournalEntryModal";
 import {
   PeriodFilter,
@@ -46,6 +55,16 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
   const [isReversing, setIsReversing] = useState(false);
   const [actionError, setActionError] = useState("");
   const [query, setQuery] = useState("");
+  const [editingEntry, setEditingEntry] = useState<GeneralLedgerJournalEntry | null>(null);
+  const [historyEntry, setHistoryEntry] = useState<GeneralLedgerJournalEntry | null>(null);
+  const [isManualModalOpen, setIsManualModalOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState("");
+
+  const handleActionSuccess = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(""), 4000);
+    void loadAll();
+  };
 
   const handleUnauthorized = useCallback(() => {
     logout();
@@ -176,14 +195,21 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
           type="button"
           onClick={() => {
             setActionError("");
-            setIsModalOpen(true);
+            setIsManualModalOpen(true);
           }}
-          className="flex items-center gap-1.5 bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium px-3 py-2 rounded-lg transition"
+          className="flex items-center gap-1.5 bg-blue-900 hover:bg-blue-800 text-white text-xs font-semibold px-3.5 py-2 rounded-lg shadow-xs transition"
         >
           <Plus className="w-3.5 h-3.5" />
-          บันทึกรายการใหม่
+          + เพิ่มรายการเอง
         </button>
       </div>
+
+      {toastMessage && (
+        <div className="mt-3 p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl flex items-center gap-2 shadow-xs transition">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+          <span className="font-medium">{toastMessage}</span>
+        </div>
+      )}
 
       <div className="mt-6 space-y-4">
         {loadState === "loading" ? (
@@ -253,6 +279,9 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                         <th className="px-4 py-3 font-medium">วันที่</th>
                         <th className="px-4 py-3 font-medium">เลขที่</th>
                         <th className="px-4 py-3 font-medium">รายการ</th>
+                        <th className="px-4 py-3 font-medium">หมวดหมู่</th>
+                        <th className="px-4 py-3 font-medium text-right text-emerald-700">เงินเข้า</th>
+                        <th className="px-4 py-3 font-medium text-right text-red-700">เงินออก</th>
                         <th className="px-4 py-3 font-medium">แหล่ง</th>
                         <th className="px-4 py-3 font-medium">สถานะ</th>
                         <th className="px-4 py-3 font-medium">บัญชี</th>
@@ -262,7 +291,7 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                         <th className="px-4 py-3 font-medium text-right">
                           จำนวน (THB)
                         </th>
-                        <th className="px-4 py-3 font-medium">การจัดการ</th>
+                        <th className="px-4 py-3 font-medium text-right">การจัดการ</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -274,6 +303,45 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                         const skipped = entry.postingState === "SKIPPED";
                         const isRef = skipped && isReferenceOnlySkip(entry.skipReason);
                         const lineCount = skipped ? 1 : entry.lines.length;
+                        const catInfo = classifyEntryCategory(entry);
+                        const moneyFlow = getEntryMoneyFlow(entry);
+                        const isEdited = Boolean(entry.updatedAt && entry.updatedAt !== entry.createdAt);
+
+                        const actions = (
+                          <div className="flex items-center justify-end gap-1.5">
+                            {!reversed && (
+                              <button
+                                type="button"
+                                onClick={() => setEditingEntry(entry)}
+                                className="inline-flex items-center gap-1 text-xs font-medium text-amber-800 border border-amber-200 hover:bg-amber-50 px-2 py-1 rounded-lg transition"
+                              >
+                                <Edit3 className="w-3 h-3" />
+                                แก้ไข
+                              </button>
+                            )}
+                            {isEdited && (
+                              <button
+                                type="button"
+                                onClick={() => setHistoryEntry(entry)}
+                                className="inline-flex items-center gap-1 text-xs font-medium text-purple-700 border border-purple-200 hover:bg-purple-50 px-2 py-1 rounded-lg transition"
+                              >
+                                <History className="w-3 h-3" />
+                                ดูประวัติ
+                              </button>
+                            )}
+                            {!reversed && !skipped && (
+                              <button
+                                type="button"
+                                onClick={() => openReverseModal(entry)}
+                                className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 border border-gray-200 hover:bg-gray-50 px-2 py-1 rounded-lg transition"
+                              >
+                                <RotateCcw className="w-3 h-3" />
+                                กลับรายการ
+                              </button>
+                            )}
+                          </div>
+                        );
+
                         const headerCells = (rowSpan: number) => (
                           <>
                             <td
@@ -319,6 +387,26 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                                 )
                               )}
                             </td>
+                            <td
+                              rowSpan={rowSpan}
+                              className="px-4 py-3 align-top whitespace-nowrap"
+                            >
+                              <span className="inline-flex items-center text-xs px-2 py-0.5 rounded-md font-medium bg-gray-100 text-gray-700 border border-gray-200/60">
+                                {catInfo.label}
+                              </span>
+                            </td>
+                            <td
+                              rowSpan={rowSpan}
+                              className="px-4 py-3 text-right font-medium align-top whitespace-nowrap text-emerald-600"
+                            >
+                              {moneyFlow.moneyIn ? `+ ${moneyFlow.moneyIn}` : "—"}
+                            </td>
+                            <td
+                              rowSpan={rowSpan}
+                              className="px-4 py-3 text-right font-medium align-top whitespace-nowrap text-red-600"
+                            >
+                              {moneyFlow.moneyOut ? `- ${moneyFlow.moneyOut}` : "—"}
+                            </td>
                             <td rowSpan={rowSpan} className="px-4 py-3 align-top">
                               <SourceBadge source={entry.sourceType} />
                             </td>
@@ -340,6 +428,16 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                                   </span>
                                 )}
                                 {reversed && <ReversedBadge />}
+                                {isEdited && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setHistoryEntry(entry)}
+                                    className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200 transition"
+                                    title="คลิกเพื่อดูประวัติการแก้ไข"
+                                  >
+                                    แก้ไขโดยผู้ใช้
+                                  </button>
+                                )}
                                 {!skipped && (
                                   <span
                                     className={`inline-flex items-center text-xs font-medium px-2 py-1 rounded-full ${
@@ -367,6 +465,9 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                               <td className="px-4 py-3 text-xs text-gray-300">
                                 -
                               </td>
+                              <td className="px-4 py-3 text-xs text-gray-300">
+                                -
+                              </td>
                               <td className="px-4 py-3 text-right text-gray-800 font-medium whitespace-nowrap">
                                 -
                               </td>
@@ -377,18 +478,7 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                                 -
                               </td>
                               <td className="px-4 py-3 align-top">
-                                <div className="flex items-center justify-end gap-1.5">
-                                  {!reversed && (
-                                    <button
-                                      type="button"
-                                      onClick={() => openReverseModal(entry)}
-                                      className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 border border-gray-200 hover:bg-gray-50 px-2 py-1 rounded-lg transition"
-                                    >
-                                      <RotateCcw className="w-3 h-3" />
-                                      กลับรายการ
-                                    </button>
-                                  )}
-                                </div>
+                                {actions}
                               </td>
                             </tr>
                           ) : (
@@ -429,18 +519,7 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                                     rowSpan={lineCount}
                                     className="px-4 py-3 align-top"
                                   >
-                                    <div className="flex items-center justify-end gap-1.5">
-                                      {!reversed && (
-                                        <button
-                                          type="button"
-                                          onClick={() => openReverseModal(entry)}
-                                          className="inline-flex items-center gap-1 text-xs font-medium text-gray-500 border border-gray-200 hover:bg-gray-50 px-2 py-1 rounded-lg transition"
-                                        >
-                                          <RotateCcw className="w-3 h-3" />
-                                          กลับรายการ
-                                        </button>
-                                      )}
-                                    </div>
+                                    {actions}
                                   </td>
                                 )}
                               </tr>
@@ -529,6 +608,38 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
             </div>
           </div>
         </div>
+      )}
+
+      {editingEntry && user?.accessToken && (
+        <EditJournalEntryModal
+          entry={editingEntry}
+          accessToken={user.accessToken}
+          onClose={() => setEditingEntry(null)}
+          onSuccess={(msg) => {
+            setEditingEntry(null);
+            handleActionSuccess(msg);
+          }}
+        />
+      )}
+
+      {isManualModalOpen && user?.accessToken && (
+        <ManualJournalEntryModal
+          isOpen={isManualModalOpen}
+          accessToken={user.accessToken}
+          onClose={() => setIsManualModalOpen(false)}
+          onSuccess={(msg) => {
+            setIsManualModalOpen(false);
+            handleActionSuccess(msg);
+          }}
+        />
+      )}
+
+      {historyEntry && user?.accessToken && (
+        <AuditHistoryModal
+          entry={historyEntry}
+          accessToken={user.accessToken}
+          onClose={() => setHistoryEntry(null)}
+        />
       )}
     </>
   );
