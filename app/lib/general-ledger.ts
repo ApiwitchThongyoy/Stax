@@ -458,6 +458,85 @@ export function classifyEntryCategory(entry: {
   return { categoryId: "ASSET", label: "สินทรัพย์" };
 }
 
+export interface EntryExplanation {
+  /** True when the entry has an explanation that should display a note/info icon. */
+  hasExplanation: boolean;
+  /** True if this is an intentional reference-only row (monthly fee summary, duplicate gain). */
+  isReference: boolean;
+  /** True if the entry is an unposted/non-computable row. */
+  isUnposted: boolean;
+  /** Thai summary explanation. */
+  explanation: string;
+  /** Raw skip reason or system diagnostic note, if any. */
+  rawReason: string | null;
+  /** Optional user-written note. */
+  userNote: string | null;
+}
+
+/**
+ * Pure helper providing structured explanations for journal entries.
+ * Distinguishes intentional reference-only rows from unposted/non-computable rows,
+ * and detects user notes, keeping rows clean and scannable by hiding long
+ * explanations behind a note/info icon.
+ */
+export function getEntryExplanation(entry: {
+  postingState?: string | null;
+  skipReason?: string | null;
+  note?: string | null;
+}): EntryExplanation {
+  const isRef = entry.postingState === "SKIPPED" && isReferenceOnlySkip(entry.skipReason);
+  const isUnposted = entry.postingState === "SKIPPED" && !isRef;
+  const userNote = entry.note?.trim() || null;
+
+  if (isRef) {
+    return {
+      hasExplanation: true,
+      isReference: true,
+      isUnposted: false,
+      explanation: "บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ",
+      rawReason: entry.skipReason ?? null,
+      userNote,
+    };
+  }
+
+  if (isUnposted) {
+    let exp = "ยังไม่มีคู่รายการเดบิต/เครดิต";
+    if (entry.skipReason === "backfilled-record-only") {
+      exp = "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่";
+    } else if (entry.skipReason) {
+      exp = entry.skipReason;
+    }
+    return {
+      hasExplanation: true,
+      isReference: false,
+      isUnposted: true,
+      explanation: exp,
+      rawReason: entry.skipReason ?? null,
+      userNote,
+    };
+  }
+
+  if (userNote) {
+    return {
+      hasExplanation: true,
+      isReference: false,
+      isUnposted: false,
+      explanation: userNote,
+      rawReason: null,
+      userNote,
+    };
+  }
+
+  return {
+    hasExplanation: false,
+    isReference: false,
+    isUnposted: false,
+    explanation: "",
+    rawReason: null,
+    userNote: null,
+  };
+}
+
 /**
  * Validate an entry and normalize its lines. Pure. Returns structured errors
  * instead of throwing so callers (API + posting engine) can report them in a

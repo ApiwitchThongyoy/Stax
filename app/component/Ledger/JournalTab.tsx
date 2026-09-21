@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router";
-import { Plus, X, RotateCcw, Search, Edit3, History, CheckCircle2 } from "lucide-react";
+import { Plus, X, RotateCcw, Search, Edit3, History, CheckCircle2, FileText } from "lucide-react";
 import { useAuth } from "../../lib/auth";
 import {
   fetchAccounts,
@@ -13,11 +13,13 @@ import {
   isReferenceOnlySkip,
   getEntryMoneyFlow,
   classifyEntryCategory,
+  getEntryExplanation,
 } from "../../lib/general-ledger";
 import {
   EditJournalEntryModal,
   ManualJournalEntryModal,
   AuditHistoryModal,
+  JournalNoteModal,
 } from "../Journal/JournalActionModals";
 import JournalEntryModal from "./JournalEntryModal";
 import {
@@ -57,6 +59,7 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
   const [query, setQuery] = useState("");
   const [editingEntry, setEditingEntry] = useState<GeneralLedgerJournalEntry | null>(null);
   const [historyEntry, setHistoryEntry] = useState<GeneralLedgerJournalEntry | null>(null);
+  const [noteEntry, setNoteEntry] = useState<GeneralLedgerJournalEntry | null>(null);
   const [isManualModalOpen, setIsManualModalOpen] = useState(false);
   const [toastMessage, setToastMessage] = useState("");
 
@@ -306,9 +309,22 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                         const catInfo = classifyEntryCategory(entry);
                         const moneyFlow = getEntryMoneyFlow(entry);
                         const isEdited = Boolean(entry.updatedAt && entry.updatedAt !== entry.createdAt);
+                        const noteInfo = getEntryExplanation(entry);
 
                         const actions = (
                           <div className="flex items-center justify-end gap-1.5">
+                            {noteInfo.hasExplanation && (
+                              <button
+                                type="button"
+                                onClick={() => setNoteEntry(entry)}
+                                title="ดูหมายเหตุ"
+                                aria-label="ดูหมายเหตุ"
+                                className="inline-flex items-center gap-1 text-xs font-medium text-amber-800 border border-amber-200 hover:bg-amber-50 px-2 py-1 rounded-lg transition"
+                              >
+                                <FileText className="w-3 h-3" />
+                                หมายเหตุ
+                              </button>
+                            )}
                             {!reversed && (
                               <button
                                 type="button"
@@ -360,32 +376,28 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                               rowSpan={rowSpan}
                               className="px-4 py-3 align-top min-w-[200px]"
                             >
-                              <p
-                                className={`text-sm font-medium ${
-                                  reversed
-                                    ? "text-gray-400 line-through"
-                                    : "text-gray-800"
-                                }`}
-                              >
-                                {entry.description}
-                              </p>
-                              {skipped && (
-                                isRef ? (
-                                  <p className="mt-1 text-xs text-blue-700">
-                                    บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ
-                                  </p>
-                                ) : (
-                                  <p className="mt-1 text-xs text-amber-700">
-                                    <span className="font-medium">
-                                      บันทึกในสมุดรายวันแล้ว:
-                                    </span>{" "}
-                                    {entry.skipReason === "backfilled-record-only"
-                                      ? "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่"
-                                      : entry.skipReason ||
-                                        "ยังไม่มีคู่รายการเดบิต/เครดิต"}
-                                  </p>
-                                )
-                              )}
+                              <div className="flex items-center gap-1.5">
+                                <p
+                                  className={`text-sm font-medium ${
+                                    reversed
+                                      ? "text-gray-400 line-through"
+                                      : "text-gray-800"
+                                  }`}
+                                >
+                                  {entry.description}
+                                </p>
+                                {noteInfo.hasExplanation && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setNoteEntry(entry)}
+                                    title="ดูหมายเหตุ"
+                                    aria-label="ดูหมายเหตุ"
+                                    className="inline-flex items-center justify-center p-1 rounded-md text-amber-700 hover:text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200/80 transition shrink-0"
+                                  >
+                                    <FileText className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+                              </div>
                             </td>
                             <td
                               rowSpan={rowSpan}
@@ -418,9 +430,14 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                                       บันทึกแล้ว (รายการอ้างอิง)
                                     </span>
                                   ) : (
-                                    <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-700">
-                                      บันทึกแล้ว (ยังไม่มีคู่บัญชี)
-                                    </span>
+                                    <>
+                                      <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-700">
+                                        บันทึกแล้ว (ยังไม่มีคู่บัญชี)
+                                      </span>
+                                      <span className="inline-flex items-center text-xs font-medium px-1.5 py-0.5 rounded-md bg-amber-100/70 text-amber-800 border border-amber-200">
+                                        ต้องตรวจสอบ
+                                      </span>
+                                    </>
                                   )
                                 ) : (
                                   <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-blue-50 text-blue-700">
@@ -639,6 +656,13 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
           entry={historyEntry}
           accessToken={user.accessToken}
           onClose={() => setHistoryEntry(null)}
+        />
+      )}
+
+      {noteEntry && (
+        <JournalNoteModal
+          entry={noteEntry}
+          onClose={() => setNoteEntry(null)}
         />
       )}
     </>

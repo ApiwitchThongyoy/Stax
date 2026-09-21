@@ -8,6 +8,7 @@ import {
   AlertTriangle,
   ArrowRight,
   Info,
+  FileText,
 } from "lucide-react";
 import {
   createStructuredJournalEntry,
@@ -19,6 +20,11 @@ import {
   type EditJournalInput,
 } from "../../lib/server-api";
 import { formatAmount, formatBaht } from "../Ledger/shared";
+import {
+  isReferenceOnlySkip,
+  classifyEntryCategory,
+  getEntryExplanation,
+} from "../../lib/general-ledger";
 
 function today(): string {
   return new Date().toISOString().slice(0, 10);
@@ -1033,6 +1039,155 @@ export function ManualJournalEntryModal({
               </button>
             </>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Journal Note Modal ("หมายเหตุรายการ")
+// ---------------------------------------------------------------------------
+export function JournalNoteModal({
+  entry,
+  onClose,
+}: {
+  entry: GeneralLedgerJournalEntry | null;
+  onClose: () => void;
+}) {
+  if (!entry) return null;
+
+  const noteInfo = getEntryExplanation(entry);
+  const catInfo = classifyEntryCategory(entry);
+  const isRef = entry.postingState === "SKIPPED" && isReferenceOnlySkip(entry.skipReason);
+  const isSkipped = entry.postingState === "SKIPPED";
+  const userNote = noteInfo.userNote || entry.note?.trim() || null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/50 backdrop-blur-sm"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <div className="w-full max-w-lg bg-white rounded-2xl shadow-xl overflow-hidden flex flex-col max-h-[85vh]">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 shrink-0 bg-gray-50/50">
+          <div className="flex items-center gap-2">
+            <FileText className="w-4 h-4 text-amber-700" />
+            <h3 className="text-sm font-semibold text-gray-800">
+              หมายเหตุรายการ #{entry.entryNo}
+            </h3>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="ปิด"
+            className="text-gray-400 hover:text-gray-600 p-1 rounded-lg hover:bg-gray-100 transition"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-5 overflow-y-auto space-y-4 flex-1">
+          {/* Metadata Card */}
+          <div className="bg-gray-50 border border-gray-200/70 rounded-xl p-3 text-xs space-y-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-semibold text-gray-800 text-sm">
+                {entry.description}
+              </span>
+              <span className="inline-flex items-center text-xs px-2 py-0.5 rounded-md font-medium bg-white text-gray-700 border border-gray-200">
+                {catInfo.label}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-gray-500 pt-1 border-t border-gray-200/50">
+              <span>วันที่: <strong className="text-gray-700 font-medium">{entry.entryDate}</strong></span>
+              <span>แหล่งที่มา: <strong className="text-gray-700 font-medium">{entry.sourceType}</strong></span>
+              {entry.detail?.symbol && (
+                <span>หุ้น/สินทรัพย์: <strong className="text-gray-700 font-medium">{entry.detail.symbol}</strong></span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5 pt-1">
+              <span className="text-gray-500">สถานะ:</span>
+              {isSkipped ? (
+                isRef ? (
+                  <span className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-purple-50 text-purple-700 border border-purple-200">
+                    บันทึกแล้ว (รายการอ้างอิง)
+                  </span>
+                ) : (
+                  <>
+                    <span className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+                      บันทึกแล้ว (ยังไม่มีคู่บัญชี)
+                    </span>
+                    <span className="inline-flex items-center text-xs font-medium px-1.5 py-0.5 rounded-md bg-amber-100/70 text-amber-800 border border-amber-200">
+                      ต้องตรวจสอบ
+                    </span>
+                  </>
+                )
+              ) : (
+                <span className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                  ลงบัญชีแล้ว
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Detailed Explanations */}
+          {isRef && (
+            <div className="bg-blue-50/70 border border-blue-200 rounded-xl p-4 space-y-2 text-xs text-blue-900">
+              <div className="flex items-center gap-1.5 font-semibold text-blue-800">
+                <Info className="w-4 h-4 text-blue-700 shrink-0" />
+                <span>คำอธิบายรายการอ้างอิง (Reference-Only)</span>
+              </div>
+              <p className="font-medium text-blue-800 leading-relaxed">
+                บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ
+              </p>
+              <p className="text-blue-700 leading-relaxed">
+                รายการนี้ถูกบันทึกไว้ในสมุดรายวันเพื่อเป็นหลักฐานอ้างอิงที่สอดคล้องกับเอกสาร Statement ครบถ้วน โดยไม่มีการลงบัญชีคู่ซ้ำซ้อน เพื่อป้องกันไม่ให้กระทบยอดเงินและกำไรขาดทุนซ้ำ
+              </p>
+              {entry.skipReason && (
+                <div className="mt-2 pt-2 border-t border-blue-200/60 text-[11px] text-blue-700/80">
+                  <span className="font-medium text-blue-800">รายละเอียดระบบ: </span>
+                  {entry.skipReason}
+                </div>
+              )}
+            </div>
+          )}
+
+          {isSkipped && !isRef && (
+            <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-4 space-y-2 text-xs text-amber-900">
+              <div className="flex items-center gap-1.5 font-semibold text-amber-800">
+                <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+                <span>คำอธิบายทางบัญชี / ข้อมูลการลงบัญชี</span>
+              </div>
+              <p className="leading-relaxed">
+                <span className="font-semibold text-amber-800">บันทึกในสมุดรายวันแล้ว:</span>{" "}
+                {entry.skipReason === "backfilled-record-only"
+                  ? "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่"
+                  : entry.skipReason || "ยังไม่มีคู่รายการเดบิต/เครดิต"}
+              </p>
+              <p className="text-amber-700/90 leading-relaxed">
+                รายการนี้ถูกบันทึกในระบบเรียบร้อยแล้ว แต่ยังไม่สามารถลงเดบิต/เครดิตอัตโนมัติได้ (เช่น ต้องคำนวณต้นทุนหรือจับคู่รายการก่อน)
+              </p>
+            </div>
+          )}
+
+          {userNote && (
+            <div className="bg-purple-50/60 border border-purple-200 rounded-xl p-3.5 space-y-1 text-xs text-purple-900">
+              <span className="font-semibold text-purple-800">บันทึกช่วยจำ (User Note):</span>
+              <p className="whitespace-pre-wrap leading-relaxed">{userNote}</p>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-end px-5 py-3 border-t border-gray-100 bg-gray-50/50">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-xs font-medium text-gray-700 bg-white border border-gray-200 hover:bg-gray-50 rounded-lg transition"
+          >
+            ปิด
+          </button>
         </div>
       </div>
     </div>
