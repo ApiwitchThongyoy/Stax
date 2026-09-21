@@ -16,6 +16,18 @@ import {
 const VALID_TRANSACTION_TYPES = ["CASH_IN", "CASH_OUT"];
 const VALID_SOURCE_TYPES = ["MANUAL", "AI_PARSED"];
 
+/** Thrown inside the POST transaction when the journal cannot represent a
+ *  manual row; mapped to 422 with the journal's errors (rolled back, so no
+ *  un-journaled capital row is ever committed). */
+class JournalRejectionError extends Error {
+  errors: string[];
+  constructor(errors: string[]) {
+    super(errors.join("; "));
+    this.name = "JournalRejectionError";
+    this.errors = errors;
+  }
+}
+
 function isAuthError(result: unknown): result is { status: number; message: string } {
   return (
     typeof result === "object" &&
@@ -166,53 +178,59 @@ async function handleCreate(
   const transactionId = randomUUID();
 
   try {
-    await db
-      .insert(capitalTransactions)
-      .values({
-        transactionId,
-        userId: auth.userId,
-        amountForeign: String(amountForeign),
-        currency: currency.trim(),
-        transactionDate: transactionDate.trim(),
-        fxRateBot: String(fxRateBot),
-        // Manual entries carry the user-entered rate as the effective rate so
-        // consumers read fxRateEffective uniformly (imported rows use the
-        // statement/provider rate there; fxRateBot is a legacy compatibility
-        // column and stays null for imported rows).
-        fxRateEffective: String(fxRateBot),
-        amountThb: String(amountThb),
-        type,
-        sourceType,
-        // Manual cash entries (CASH_IN/CASH_OUT) are money entering/leaving the
-        // account's equity pool, so they are classified as equity for the
-        // general-ledger posting engine and the cash in/out summary aggregator.
-        category: "equity",
-      })
-      .execute();
-
-    // Journal as SSOT: mirror manual rows in the journal too, or they would
-    // disappear from the journal-backed ledger/cash views. AI_PARSED manual-type
-    // rows come from statements and are already journaled by the import path.
+    // The capital row and its MANUAL journal mirror commit in ONE transaction:
+    // a journal that cannot represent the row rolls the whole insert back
+    // (422 with the journal errors) instead of leaving an un-journaled orphan
+    // row that silently vanishes from the journal-backed ledger/cash views.
     let entryNo: number | undefined;
-    if (sourceType === "MANUAL") {
-      const journaled = await insertManualCashJournal(auth.userId, {
-        transactionId,
-        type: type as "CASH_IN" | "CASH_OUT",
-        amountForeign: String(amountForeign),
-        currency: currency.trim(),
-        transactionDate: transactionDate.trim(),
-        fxRateEffective: String(fxRateBot),
-        amountThb: String(amountThb),
-      });
-      if (journaled.ok) {
-        entryNo = journaled.entryNo;
-      } else {
-        console.error(
-          `CapitalLedgers POST: manual row ${transactionId} inserted but journal failed`,
-          journaled.errors
+    await db.transaction(async (tx) => {
+      await tx
+        .insert(capitalTransactions)
+        .values({
+          transactionId,
+          userId: auth.userId,
+          amountForeign: String(amountForeign),
+          currency: currency.trim(),
+          transactionDate: transactionDate.trim(),
+          fxRateBot: String(fxRateBot),
+          // Manual entries carry the user-entered rate as the effective rate so
+          // consumers read fxRateEffective uniformly (imported rows use the
+          // statement/provider rate there; fxRateBot is a legacy compatibility
+          // column and stays null for imported rows).
+          fxRateEffective: String(fxRateBot),
+          amountThb: String(amountThb),
+          type,
+          sourceType,
+          // Manual cash entries (CASH_IN/CASH_OUT) are money entering/leaving the
+          // account's equity pool, so they are classified as equity for the
+          // general-ledger posting engine and the cash in/out summary aggregator.
+          category: "equity",
+        })
+        .execute();
+
+      // Journal as SSOT: mirror manual rows in the journal too, or they would
+      // disappear from the journal-backed ledger/cash views. AI_PARSED manual-type
+      // rows come from statements and are already journaled by the import path.
+      if (sourceType === "MANUAL") {
+        const journaled = await insertManualCashJournal(
+          auth.userId,
+          {
+            transactionId,
+            type: type as "CASH_IN" | "CASH_OUT",
+            amountForeign: String(amountForeign),
+            currency: currency.trim(),
+            transactionDate: transactionDate.trim(),
+            fxRateEffective: String(fxRateBot),
+            amountThb: String(amountThb),
+          },
+          tx
         );
+        if (!journaled.ok) {
+          throw new JournalRejectionError(journaled.errors);
+        }
+        entryNo = journaled.entryNo;
       }
-    }
+    });
 
     await insertAuditLog({
       userId: auth.userId,
@@ -252,6 +270,12 @@ async function handleCreate(
       { status: 201 }
     );
   } catch (error) {
+    if (error instanceof JournalRejectionError) {
+      return Response.json(
+        { success: false, message: error.errors.join("; ") },
+        { status: 422 }
+      );
+    }
     console.error("CapitalLedgers POST: failed to insert", error);
     return Response.json(
       { success: false, message: "Internal server error" },

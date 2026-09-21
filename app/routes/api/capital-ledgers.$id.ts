@@ -210,72 +210,80 @@ async function handleUpdate(
   }
 
   try {
-    const existingRows = await db
-      .select()
-      .from(capitalTransactions)
-      .where(
-        and(
-          eq(capitalTransactions.transactionId, transactionId),
-          eq(capitalTransactions.userId, userId)
+    // The capital-row update AND the journal mirror sync commit (or roll back)
+    // together. syncing the MANUAL entry inside the same transaction means an
+    // edited row can never be left with a stale journal, and a journal that
+    // cannot represent the edited row rolls the whole update back (500) rather
+    // than committing an inconsistent pair.
+    const updated = await db.transaction(async (tx) => {
+      const existingRows = await tx
+        .select()
+        .from(capitalTransactions)
+        .where(
+          and(
+            eq(capitalTransactions.transactionId, transactionId),
+            eq(capitalTransactions.userId, userId)
+          )
         )
-      )
-      .limit(1);
+        .limit(1);
 
-    if (existingRows.length === 0) {
+      if (existingRows.length === 0) {
+        return null;
+      }
+
+      await tx
+        .update(capitalTransactions)
+        .set(setValues)
+        .where(
+          and(
+            eq(capitalTransactions.transactionId, transactionId),
+            eq(capitalTransactions.userId, userId)
+          )
+        )
+        .execute();
+
+      const updatedRows = await tx
+        .select()
+        .from(capitalTransactions)
+        .where(
+          and(
+            eq(capitalTransactions.transactionId, transactionId),
+            eq(capitalTransactions.userId, userId)
+          )
+        )
+        .limit(1);
+
+      const updatedRow = updatedRows[0];
+
+      // Journal as SSOT: keep the mirrored journal entry fresh so journal-backed
+      // reads never show stale values. Only cash rows (CASH_IN/CASH_OUT) get the
+      // two-leg equity entry rebuilt; statement trade rows keep their original
+      // posting lines untouched (sync no-ops for non-MANUAL linked entries).
+      if (
+        updatedRow &&
+        (updatedRow.type === "CASH_IN" || updatedRow.type === "CASH_OUT")
+      ) {
+        await syncCapitalLedgerJournal(userId, transactionId, {
+          transactionId,
+          type: updatedRow.type,
+          amountForeign: String(updatedRow.amountForeign ?? ""),
+          currency: String(updatedRow.currency ?? ""),
+          transactionDate: String(updatedRow.transactionDate ?? ""),
+          fxRateEffective: String(
+            updatedRow.fxRateEffective ?? updatedRow.fxRateBot ?? "1"
+          ),
+          amountThb: String(updatedRow.amountThb ?? ""),
+        }, tx);
+      }
+
+      return updatedRow;
+    });
+
+    if (!updated) {
       return Response.json(
         { success: false, message: "Record not found" },
         { status: 404 }
       );
-    }
-
-    await db
-      .update(capitalTransactions)
-      .set(setValues)
-      .where(
-        and(
-          eq(capitalTransactions.transactionId, transactionId),
-          eq(capitalTransactions.userId, userId)
-        )
-      )
-      .execute();
-
-    const updatedRows = await db
-      .select()
-      .from(capitalTransactions)
-      .where(
-        and(
-          eq(capitalTransactions.transactionId, transactionId),
-          eq(capitalTransactions.userId, userId)
-        )
-      )
-      .limit(1);
-
-    const updated = updatedRows[0];
-
-    // Journal as SSOT: keep the mirrored journal entry fresh so journal-backed
-    // reads never show stale values. Only cash rows (CASH_IN/CASH_OUT) get the
-    // two-leg equity entry rebuilt; statement trade rows keep their original
-    // posting lines untouched. Best-effort — a failed sync must not 500 a
-    // successful update.
-    if (
-      updated &&
-      (updated.type === "CASH_IN" || updated.type === "CASH_OUT")
-    ) {
-      try {
-        await syncCapitalLedgerJournal(userId, transactionId, {
-          transactionId,
-          type: updated.type,
-          amountForeign: String(updated.amountForeign ?? ""),
-          currency: String(updated.currency ?? ""),
-          transactionDate: String(updated.transactionDate ?? ""),
-          fxRateEffective: String(
-            updated.fxRateEffective ?? updated.fxRateBot ?? "1"
-          ),
-          amountThb: String(updated.amountThb ?? ""),
-        });
-      } catch (error) {
-        console.warn("CapitalLedgers PUT: journal sync failed", error);
-      }
     }
 
     await insertAuditLog({
@@ -316,43 +324,48 @@ async function handleDelete(
   transactionId: string
 ): Promise<Response> {
   try {
-    const existingRows = await db
-      .select()
-      .from(capitalTransactions)
-      .where(
-        and(
-          eq(capitalTransactions.transactionId, transactionId),
-          eq(capitalTransactions.userId, userId)
+    // Journal as SSOT: delete the capital row AND its mirrored journal entry in
+    // ONE transaction — a mirrored entry is never left pointing at a deleted
+    // transaction (journal-backed views would then show a phantom row). Purely
+    // recursive cleanup — the entry itself is not reversed, because reversal
+    // would re-show the movement in the account ledger.
+    const deleted = await db.transaction(async (tx) => {
+      const existingRows = await tx
+        .select()
+        .from(capitalTransactions)
+        .where(
+          and(
+            eq(capitalTransactions.transactionId, transactionId),
+            eq(capitalTransactions.userId, userId)
+          )
         )
-      )
-      .limit(1);
+        .limit(1);
 
-    if (existingRows.length === 0) {
+      if (existingRows.length === 0) {
+        return false;
+      }
+
+      await removeCapitalLedgerJournal(userId, transactionId, tx);
+
+      await tx
+        .delete(capitalTransactions)
+        .where(
+          and(
+            eq(capitalTransactions.transactionId, transactionId),
+            eq(capitalTransactions.userId, userId)
+          )
+        )
+        .execute();
+
+      return true;
+    });
+
+    if (!deleted) {
       return Response.json(
         { success: false, message: "Record not found" },
         { status: 404 }
       );
     }
-
-    // Journal as SSOT: drop the mirrored journal entry (and its lines) so the
-    // journal-backed ledger/cash views stop showing the deleted row. Purely
-    // recursive cleanup — the entry itself is not reversed, because reversal
-    // would re-show the movement in the account ledger.
-    try {
-      await removeCapitalLedgerJournal(userId, transactionId);
-    } catch (error) {
-      console.warn("CapitalLedgers DELETE: journal remove failed", error);
-    }
-
-    await db
-      .delete(capitalTransactions)
-      .where(
-        and(
-          eq(capitalTransactions.transactionId, transactionId),
-          eq(capitalTransactions.userId, userId)
-        )
-      )
-      .execute();
 
     // Reconcile the derived cost-basis cache with the rows that remain, so a
     // deleted BUY/SELL can never leave a double-counted cache for re-imports.

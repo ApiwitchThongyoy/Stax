@@ -75,6 +75,7 @@ const journalPage = read("app/component/Journal/JournalPage.tsx");
 const journalTab = read("app/component/Ledger/JournalTab.tsx");
 const trialBalanceTab = read("app/component/Ledger/TrialBalanceTab.tsx");
 const balanceSheetTab = read("app/component/Ledger/BalanceSheetTab.tsx");
+const balanceSheetShared = read("app/component/Ledger/shared.tsx");
 const monthlyClosingTab = read("app/component/Ledger/MonthlyClosingTab.tsx");
 const monthlyClosingRoute = read(
   "app/routes/api/reports/monthly-closing.ts"
@@ -102,6 +103,7 @@ const tradingJournalPage = read(
 const postingEngine = read("app/lib/posting-engine.ts");
 const fxReconcileScript = read("scripts/reconcile-fx-postings.mts");
 const roundingReconcileScript = read("scripts/reconcile-rounding-postings.mts");
+const equityReconcileScript = read("scripts/reconcile-thb-equity-postings.mts");
 
 // ---------------------------------------------------------------------------
 // 1. No stale fake placeholder values anywhere in the user UI.
@@ -913,6 +915,26 @@ ok(
     corporateActionRoute.includes("parentFmvPerShare") &&
     corporateActionRoute.includes("needsReview"),
   "Spin-off FMV pair flows engine -> service -> route, with both-or-neither validation and a derived needsReview flag"
+);
+ok(
+  balanceSheetShared.includes("{!asOf && (") &&
+    balanceSheetShared.includes("asOf = false") &&
+    balanceSheetShared.includes("ถึงวันที่") &&
+    balanceSheetShared.includes('value={to}') &&
+    balanceSheetShared.includes('onChange={(e) => onToChange(e.target.value)}') &&
+    !balanceSheetShared.includes("disabled={asOf}") &&
+    !balanceSheetShared.includes("disabled"),
+  "Balance-sheet PeriodFilter in as-of mode renders a single EDITABLE YYYY-MM-DD 'ถึงวันที่' input bound to 'to' (no disabled field)"
+);
+ok(
+  balanceSheetTab.includes('asOf') &&
+    balanceSheetTab.includes("onToChange={(v) => setPeriod((p) => ({ ...p, to: v }))}") &&
+    balanceSheetTab.includes("onApply={() => setAppliedTo(period.to)}") &&
+    balanceSheetTab.includes("setAppliedTo(d.to)") &&
+    balanceSheetTab.includes("fetchBalanceSheet(user.accessToken, appliedTo)") &&
+    !balanceSheetTab.includes("setAppliedTo(period.from)") &&
+    !balanceSheetTab.includes("fetchBalanceSheet(user.accessToken, period.from)"),
+  "BalanceSheetTab wires the editable as-of date into local period.to -> Search stores period.to in appliedTo -> fetch uses appliedTo; nothing auto-overwrites a manual selection"
 );
 ok(
   journalPage.includes("AccountTypeBadge") &&
@@ -2294,6 +2316,20 @@ ok(
     roundingReconcileScript.includes("DRY RUN (no writes)") &&
     roundingReconcileScript.includes("process.exit(0)"),
   "reconcile-rounding-postings.mts is a dry-run-first CLI (--apply to write) and exits cleanly"
+);
+ok(
+  ledgerService.includes("const dryRun = opts.apply !== true") &&
+    ledgerService.includes("if (dryRun) continue") &&
+    ledgerService.includes("result.promotable += 1") &&
+    ledgerService.includes("Dry run: report what WOULD be promoted; zero database writes."),
+  "reconcileSkippedEquityPostings is dry-run-by-default, counts promotable, and gates promotion behind --apply"
+);
+ok(
+  equityReconcileScript.includes("[--apply]") &&
+    equityReconcileScript.includes("DRY RUN BY DEFAULT: without --apply it only reports what WOULD be promoted") &&
+    equityReconcileScript.includes("promotable") &&
+    equityReconcileScript.includes("process.exit(0)"),
+  "reconcile-thb-equity-postings.mts is a dry-run-first CLI (--apply to write) and exits cleanly"
 );
 
 // ---------------------------------------------------------------------------
