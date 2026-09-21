@@ -54,6 +54,12 @@ import { recomputeAllGainLoss, recomputeCostBasisMap, saveCostBasisState, type C
 
 Decimal.set({ precision: 40 });
 
+/** The database client or an open transaction client (both expose the same
+ *  insert/select/update/delete/execute surface used below). */
+type DbClient = typeof db;
+type TxClient = Parameters<Parameters<typeof db.transaction>[0]>[0];
+type Conn = DbClient | TxClient;
+
 // ---------------------------------------------------------------------------
 // Chart of accounts
 // ---------------------------------------------------------------------------
@@ -62,10 +68,13 @@ Decimal.set({ precision: 40 });
  * leaving every existing row (incl. custom accounts) untouched. Grows the CoA
  * for pre-existing users when a new default (e.g. 3020 THB owner capital) is
  * introduced, exactly once per code — repeated calls are no-ops. */
-export async function seedDefaultChartOfAccounts(userId: string): Promise<number> {
+export async function seedDefaultChartOfAccounts(
+  userId: string,
+  conn: Conn = db
+): Promise<number> {
   const existingCodes = new Set(
     (
-      await db
+      await conn
         .select({ code: accounts.code })
         .from(accounts)
         .where(eq(accounts.userId, userId))
@@ -91,7 +100,7 @@ export async function seedDefaultChartOfAccounts(userId: string): Promise<number
     updatedAt: now,
   }));
   if (values.length === 0) return 0;
-  await db.insert(accounts).values(values).execute();
+  await conn.insert(accounts).values(values).execute();
   return values.length;
 }
 
@@ -136,8 +145,11 @@ export async function getAccounts(userId: string): Promise<AccountRow[]> {
     .execute()) as AccountRow[];
 }
 
-export async function getActiveAccounts(userId: string): Promise<AccountRow[]> {
-  return (await db
+export async function getActiveAccounts(
+  userId: string,
+  conn: Conn = db
+): Promise<AccountRow[]> {
+  return (await conn
     .select()
     .from(accounts)
     .where(and(eq(accounts.userId, userId), eq(accounts.isActive, true)))
@@ -222,8 +234,11 @@ interface ResolvedAccount {
  * engine is pure/DB-free), manual entries reference them by id; this one map
  * accepts either and normalizes to the UUID `account_id` the schema requires.
  */
-async function loadAccountLookup(userId: string): Promise<Map<string, ResolvedAccount>> {
-  const rows = await getActiveAccounts(userId);
+async function loadAccountLookup(
+  userId: string,
+  conn: Conn = db
+): Promise<Map<string, ResolvedAccount>> {
+  const rows = await getActiveAccounts(userId, conn);
   const map = new Map<string, ResolvedAccount>();
   for (const r of rows) {
     const resolved = { id: r.id, code: r.code, currency: r.currency, type: r.type };
@@ -281,14 +296,100 @@ function resolveEntryAccountIds(
 
 async function nextEntryNo(
   userId: string,
-  conn: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0] = db,
+  conn: Conn = db,
 ): Promise<number> {
+  // Serialize concurrent entry-number allocation for this user BEFORE reading
+  // MAX(entry_no). Two simultaneous creates could otherwise both compute the
+  // same next number and one would lose deterministically at write time (the
+  // (user_id, entry_no) UNIQUE index still backstops integrity). The advisory
+  // xact lock is scoped to the surrounding transaction (callers always allocate
+  // inside one) and is released automatically at commit/rollback.
+  await conn.execute(sql`select pg_advisory_xact_lock(hashtext(${userId}))`);
   const [{ value }] = await conn
     .select({ value: max(journalEntries.entryNo) })
     .from(journalEntries)
     .where(eq(journalEntries.userId, userId))
     .execute();
   return (value ?? 0) + 1;
+}
+
+/** Persist one already-validated entry (header + lines) inside a transaction.
+ *  Returns the allocated entry_no. Centralizes the header/line insert shape so
+ *  the manual, backfill, reversal and statement paths cannot drift. */
+async function persistJournalEntry(
+  tx: TxClient,
+  userId: string,
+  entry: ValidatedJournalEntry,
+  entryId: string,
+  typeValue: string | null | undefined,
+  now: string,
+): Promise<number> {
+  await assertOwnedReferences(tx, userId, entry);
+  const entryNo = await nextEntryNo(userId, tx);
+  await tx
+    .insert(journalEntries)
+    .values({
+      id: entryId,
+      userId,
+      entryNo,
+      entryDate: entry.entryDate,
+      description: entry.description,
+      sourceType: entry.sourceType,
+      sourceDocumentId: entry.sourceDocumentId,
+      sourceTransactionId: entry.sourceTransactionId,
+      status: "POSTED",
+      category: entry.detail.category,
+      section: entry.detail.section,
+      symbol: entry.detail.symbol,
+      side: entry.detail.side,
+      exchange: entry.detail.exchange,
+      quantity: entry.detail.quantity,
+      unitPrice: entry.detail.unitPrice,
+      grossAmount: entry.detail.grossAmount,
+      fees: entry.detail.fees,
+      netAmount: entry.detail.netAmount,
+      proceeds: entry.detail.proceeds,
+      costBasis: entry.detail.costBasis,
+      realizedGainLoss: entry.detail.realizedGainLoss,
+      realizedGainLossThb: entry.detail.realizedGainLossThb,
+      averageCost: entry.detail.averageCost,
+      currency: entry.detail.currency,
+      amount: entry.detail.amount,
+      amountThb: entry.detail.amountThb,
+      fxRateEffective: entry.detail.fxRateEffective,
+      fxRateStatement: entry.detail.fxRateStatement,
+      isFxConversion: entry.detail.isFxConversion,
+      exchangeFromCurrency: entry.detail.exchangeFromCurrency,
+      exchangeFromAmount: entry.detail.exchangeFromAmount,
+      exchangeRate: entry.detail.exchangeRate,
+      isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
+      postingState: entry.postingState,
+      skipReason: entry.skipReason,
+      type: entry.detail.isFxConversion ? null : (typeValue ?? null),
+      createdAt: now,
+      updatedAt: now,
+    })
+    .execute();
+  for (const line of entry.lines) {
+    await tx
+      .insert(journalEntryLines)
+      .values({
+        id: randomUUID(),
+        journalEntryId: entryId,
+        userId,
+        accountId: line.accountId,
+        currency: line.currency,
+        debitAmount: line.side === "DEBIT" ? line.amount : null,
+        creditAmount: line.side === "CREDIT" ? line.amount : null,
+        amountThb: line.amountThb,
+        fxRateEffective: line.fxRateEffective,
+        fxRateStatement: line.fxRateStatement,
+        fxRateProvider: line.fxRateProvider,
+        memo: line.memo,
+      })
+      .execute();
+  }
+  return entryNo;
 }
 
 /** Persist one validated entry with its lines inside a transaction. */
@@ -348,85 +449,14 @@ export async function createJournalEntry(
   const now = new Date().toISOString();
 
   try {
-    await db.transaction(async (tx) => {
-      await assertOwnedReferences(tx, userId, entry);
-      const entryNo = await nextEntryNo(userId, tx);
-      await tx
-        .insert(journalEntries)
-        .values({
-          id: entryId,
-          userId,
-          entryNo,
-          entryDate: entry.entryDate,
-          description: entry.description,
-          sourceType: entry.sourceType,
-          sourceDocumentId: entry.sourceDocumentId,
-          sourceTransactionId: entry.sourceTransactionId,
-          status: "POSTED",
-          category: entry.detail.category,
-          section: entry.detail.section,
-          symbol: entry.detail.symbol,
-          side: entry.detail.side,
-          exchange: entry.detail.exchange,
-          quantity: entry.detail.quantity,
-          unitPrice: entry.detail.unitPrice,
-          grossAmount: entry.detail.grossAmount,
-          fees: entry.detail.fees,
-          netAmount: entry.detail.netAmount,
-          proceeds: entry.detail.proceeds,
-          costBasis: entry.detail.costBasis,
-          realizedGainLoss: entry.detail.realizedGainLoss,
-          realizedGainLossThb: entry.detail.realizedGainLossThb,
-          averageCost: entry.detail.averageCost,
-          currency: entry.detail.currency,
-          amount: entry.detail.amount,
-          amountThb: entry.detail.amountThb,
-          fxRateEffective: entry.detail.fxRateEffective,
-          fxRateStatement: entry.detail.fxRateStatement,
-          isFxConversion: entry.detail.isFxConversion,
-          exchangeFromCurrency: entry.detail.exchangeFromCurrency,
-          exchangeFromAmount: entry.detail.exchangeFromAmount,
-          exchangeRate: entry.detail.exchangeRate,
-          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
-          postingState: entry.postingState,
-          skipReason: entry.skipReason,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .execute();
-      for (const line of entry.lines) {
-        await tx
-          .insert(journalEntryLines)
-          .values({
-            id: randomUUID(),
-            journalEntryId: entryId,
-            userId,
-            accountId: line.accountId,
-            currency: line.currency,
-            debitAmount: line.side === "DEBIT" ? line.amount : null,
-            creditAmount: line.side === "CREDIT" ? line.amount : null,
-            amountThb: line.amountThb,
-            fxRateEffective: line.fxRateEffective,
-            fxRateStatement: line.fxRateStatement,
-            fxRateProvider: line.fxRateProvider,
-            memo: line.memo,
-          })
-          .execute();
-      }
-    });
+    const entryNo = await db.transaction(async (tx) =>
+      persistJournalEntry(tx, userId, entry, entryId, null, now)
+    );
+    return { ok: true, entryId, entryNo };
   } catch (error) {
     console.error("createJournalEntry: failed to persist entry", safeErrorLog(error));
     return { ok: false, errors: ["Failed to persist journal entry"] };
   }
-
-  const entryNo =
-    (await db
-      .select({ entryNo: journalEntries.entryNo })
-      .from(journalEntries)
-      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
-      .execute())[0]?.entryNo ?? 0;
-
-  return { ok: true, entryId, entryNo };
 }
 
 /** Bulk-persist already-validated entries (statement import). Best-effort: a
@@ -547,15 +577,16 @@ function manualCashDetail(
  */
 export async function insertManualCashJournal(
   userId: string,
-  input: ManualCashJournalInput
+  input: ManualCashJournalInput,
+  conn: Conn = db
 ): Promise<CreateEntryResult> {
-  let lookup = await loadAccountLookup(userId);
+  let lookup = await loadAccountLookup(userId, conn);
   if (lookup.size === 0) {
-    const seeded = await seedDefaultChartOfAccounts(userId);
-    if (seeded > 0) lookup = await loadAccountLookup(userId);
+    const seeded = await seedDefaultChartOfAccounts(userId, conn);
+    if (seeded > 0) lookup = await loadAccountLookup(userId, conn);
   } else if (!lookup.has("3020")) {
-    const seeded = await seedDefaultChartOfAccounts(userId);
-    if (seeded > 0) lookup = await loadAccountLookup(userId);
+    const seeded = await seedDefaultChartOfAccounts(userId, conn);
+    if (seeded > 0) lookup = await loadAccountLookup(userId, conn);
   }
   const entryInput: JournalEntryInput = {
     entryDate: input.transactionDate,
@@ -570,12 +601,16 @@ export async function insertManualCashJournal(
   };
   const resolved = resolveEntryAccountIds(entryInput, lookup);
   if (!resolved.ok) {
-    return insertBackfilledJournalEntry(userId, {
-      ...entryInput, sourceType: "MANUAL", sourceDocumentId: null,
-      sourceTransactionId: input.transactionId, type: input.type,
-      postingState: "SKIPPED", skipReason: resolved.errors.join("; "),
-      detail: manualCashDetail(input),
-    });
+    return insertBackfilledJournalEntry(
+      userId,
+      {
+        ...entryInput, sourceType: "MANUAL", sourceDocumentId: null,
+        sourceTransactionId: input.transactionId, type: input.type,
+        postingState: "SKIPPED", skipReason: resolved.errors.join("; "),
+        detail: manualCashDetail(input),
+      },
+      conn,
+    );
   }
   const validated = validateJournalEntry({
     ...entryInput,
@@ -585,88 +620,29 @@ export async function insertManualCashJournal(
     return { ok: false, errors: validated.errors };
   }
 
-  const entry = validated.entry;
   const entryId = randomUUID();
   const now = new Date().toISOString();
   try {
-    await db.transaction(async (tx) => {
-      await assertOwnedReferences(tx, userId, entry);
-      const entryNo = await nextEntryNo(userId, tx);
-      await tx
-        .insert(journalEntries)
-        .values({
-          id: entryId,
-          userId,
-          entryNo,
-          entryDate: entry.entryDate,
-          description: entry.description,
-          sourceType: entry.sourceType,
-          sourceDocumentId: entry.sourceDocumentId,
-          sourceTransactionId: entry.sourceTransactionId,
-          status: "POSTED",
-          category: entry.detail.category,
-          section: entry.detail.section,
-          symbol: entry.detail.symbol,
-          side: entry.detail.side,
-          exchange: entry.detail.exchange,
-          quantity: entry.detail.quantity,
-          unitPrice: entry.detail.unitPrice,
-          grossAmount: entry.detail.grossAmount,
-          fees: entry.detail.fees,
-          netAmount: entry.detail.netAmount,
-          proceeds: entry.detail.proceeds,
-          costBasis: entry.detail.costBasis,
-          realizedGainLoss: entry.detail.realizedGainLoss,
-          realizedGainLossThb: entry.detail.realizedGainLossThb,
-          averageCost: entry.detail.averageCost,
-          currency: entry.detail.currency,
-          amount: entry.detail.amount,
-          amountThb: entry.detail.amountThb,
-          fxRateEffective: entry.detail.fxRateEffective,
-          fxRateStatement: entry.detail.fxRateStatement,
-          isFxConversion: entry.detail.isFxConversion,
-          exchangeFromCurrency: entry.detail.exchangeFromCurrency,
-          exchangeFromAmount: entry.detail.exchangeFromAmount,
-          exchangeRate: entry.detail.exchangeRate,
-          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
-          postingState: entry.postingState,
-          skipReason: entry.skipReason,
-          type: entry.detail.isFxConversion ? null : input.type,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .execute();
-      for (const line of entry.lines) {
-        await tx
-          .insert(journalEntryLines)
-          .values({
-            id: randomUUID(),
-            journalEntryId: entryId,
-            userId,
-            accountId: line.accountId,
-            currency: line.currency,
-            debitAmount: line.side === "DEBIT" ? line.amount : null,
-            creditAmount: line.side === "CREDIT" ? line.amount : null,
-            amountThb: line.amountThb,
-            fxRateEffective: line.fxRateEffective,
-            fxRateStatement: line.fxRateStatement,
-            fxRateProvider: line.fxRateProvider,
-            memo: line.memo,
-          })
-          .execute();
-      }
-    });
+    let entryNo: number;
+    if (conn === db) {
+      entryNo = await db.transaction(async (tx) =>
+        persistJournalEntry(tx, userId, validated.entry, entryId, input.type, now)
+      );
+    } else {
+      entryNo = await persistJournalEntry(
+        conn as TxClient,
+        userId,
+        validated.entry,
+        entryId,
+        input.type,
+        now
+      );
+    }
+    return { ok: true, entryId, entryNo };
   } catch (error) {
     console.error("insertManualCashJournal: failed to persist entry", safeErrorLog(error));
     return { ok: false, errors: ["Failed to persist journal entry"] };
   }
-  const entryNo =
-    (await db
-      .select({ entryNo: journalEntries.entryNo })
-      .from(journalEntries)
-      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
-      .execute())[0]?.entryNo ?? 0;
-  return { ok: true, entryId, entryNo };
 }
 
 export interface BackfilledJournalEntryInput {
@@ -692,7 +668,8 @@ export interface BackfilledJournalEntryInput {
  */
 export async function insertBackfilledJournalEntry(
   userId: string,
-  input: BackfilledJournalEntryInput
+  input: BackfilledJournalEntryInput,
+  conn: Conn = db
 ): Promise<CreateEntryResult> {
   const validated = validateJournalEntry({
     entryDate: input.entryDate,
@@ -709,69 +686,29 @@ export async function insertBackfilledJournalEntry(
     return { ok: false, errors: validated.errors };
   }
 
-  const entry = validated.entry;
   const entryId = randomUUID();
   const now = new Date().toISOString();
   try {
-    await db.transaction(async (tx) => {
-      await assertOwnedReferences(tx, userId, entry);
-      const entryNo = await nextEntryNo(userId, tx);
-      await tx
-        .insert(journalEntries)
-        .values({
-          id: entryId,
-          userId,
-          entryNo,
-          entryDate: entry.entryDate,
-          description: entry.description,
-          sourceType: entry.sourceType,
-          sourceDocumentId: entry.sourceDocumentId,
-          sourceTransactionId: entry.sourceTransactionId,
-          status: "POSTED",
-          category: entry.detail.category,
-          section: entry.detail.section,
-          symbol: entry.detail.symbol,
-          side: entry.detail.side,
-          exchange: entry.detail.exchange,
-          quantity: entry.detail.quantity,
-          unitPrice: entry.detail.unitPrice,
-          grossAmount: entry.detail.grossAmount,
-          fees: entry.detail.fees,
-          netAmount: entry.detail.netAmount,
-          proceeds: entry.detail.proceeds,
-          costBasis: entry.detail.costBasis,
-          realizedGainLoss: entry.detail.realizedGainLoss,
-          realizedGainLossThb: entry.detail.realizedGainLossThb,
-          averageCost: entry.detail.averageCost,
-          currency: entry.detail.currency,
-          amount: entry.detail.amount,
-          amountThb: entry.detail.amountThb,
-          fxRateEffective: entry.detail.fxRateEffective,
-          fxRateStatement: entry.detail.fxRateStatement,
-          isFxConversion: entry.detail.isFxConversion,
-          exchangeFromCurrency: entry.detail.exchangeFromCurrency,
-          exchangeFromAmount: entry.detail.exchangeFromAmount,
-          exchangeRate: entry.detail.exchangeRate,
-          isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
-          postingState: entry.postingState,
-          skipReason: entry.skipReason,
-          type: entry.detail.isFxConversion ? null : input.type,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .execute();
-    });
+    let entryNo: number;
+    if (conn === db) {
+      entryNo = await db.transaction(async (tx) =>
+        persistJournalEntry(tx, userId, validated.entry, entryId, input.type, now)
+      );
+    } else {
+      entryNo = await persistJournalEntry(
+        conn as TxClient,
+        userId,
+        validated.entry,
+        entryId,
+        input.type,
+        now
+      );
+    }
+    return { ok: true, entryId, entryNo };
   } catch (error) {
     console.error("insertBackfilledJournalEntry: failed to persist entry", safeErrorLog(error));
     return { ok: false, errors: ["Failed to persist journal entry"] };
   }
-  const entryNo =
-    (await db
-      .select({ entryNo: journalEntries.entryNo })
-      .from(journalEntries)
-      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
-      .execute())[0]?.entryNo ?? 0;
-  return { ok: true, entryId, entryNo };
 }
 
 /**
@@ -785,24 +722,33 @@ export async function insertBackfilledJournalEntry(
 export async function syncCapitalLedgerJournal(
   userId: string,
   transactionId: string,
-  current: ManualCashJournalInput
+  current: ManualCashJournalInput,
+  conn: Conn = db
 ): Promise<void> {
-  try {
-    const entries = await db
+  const now = new Date().toISOString();
+  // Only MANUAL two-leg equity entries are rebuilt; statement-linked entries
+  // (created by insertStatementImport) keep their original posting lines.
+  // When called with an explicit conn (the PUT route's atomic transaction), a
+  // MANUAL entry that cannot represent the edited row is a real inconsistency
+  // and is rethrown so the caller's transaction rolls back; the legacy
+  // best-effort path (conn === db) swallows failures exactly as before.
+  const runSync = async (c: DbClient | TxClient, strict: boolean) => {
+    const [owned] = await c
       .select({ id: journalEntries.id, entryNo: journalEntries.entryNo })
       .from(journalEntries)
       .where(
         and(
           eq(journalEntries.userId, userId),
-          eq(journalEntries.sourceTransactionId, transactionId)
+          eq(journalEntries.sourceTransactionId, transactionId),
+          eq(journalEntries.sourceType, "MANUAL")
         )
       )
       .limit(1)
+      .for("update")
       .execute();
-    if (entries.length === 0) return;
+    if (!owned) return;
 
-    const { id: entryId } = entries[0];
-    const lookup = await loadAccountLookup(userId);
+    const lookup = await loadAccountLookup(userId, c);
     const candidate: JournalEntryInput = {
       entryDate: current.transactionDate,
       description: current.type === "CASH_IN" ? "ฝากเงินเข้าบัญชี" : "ถอนเงินจากบัญชี",
@@ -814,47 +760,58 @@ export async function syncCapitalLedgerJournal(
       ? validateJournalEntry({ ...candidate, lines: resolved.lines })
       : validateJournalEntry({ ...candidate, lines: [], postingState: "SKIPPED",
           skipReason: resolved.errors.join("; ") });
-    if (!validated.ok) return;
-    const entry = validated.entry;
-    // Resolve/validate first, then atomically replace headers and UUID-backed lines.
-    await db.transaction(async tx => {
-      const [owned] = await tx.select({ id: journalEntries.id }).from(journalEntries)
-        .where(and(eq(journalEntries.id, entryId), eq(journalEntries.userId, userId),
-          eq(journalEntries.sourceType, "MANUAL"))).for("update");
-      if (!owned) return;
-      await tx.update(journalEntries).set({
-        ...entry.detail, entryDate: entry.entryDate, description: entry.description,
-        type: current.type, postingState: entry.postingState, skipReason: entry.skipReason,
-        updatedAt: new Date().toISOString(),
-      }).where(and(eq(journalEntries.id, entryId), eq(journalEntries.userId, userId)));
-      await tx.delete(journalEntryLines)
-        .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.userId, userId)));
-      for (const line of entry.lines) {
-        await tx.insert(journalEntryLines).values({
-          id: randomUUID(), journalEntryId: entryId, userId, accountId: line.accountId,
-          currency: line.currency, debitAmount: line.side === "DEBIT" ? line.amount : null,
-          creditAmount: line.side === "CREDIT" ? line.amount : null, amountThb: line.amountThb,
-          fxRateEffective: line.fxRateEffective, fxRateStatement: line.fxRateStatement,
-          fxRateProvider: line.fxRateProvider, memo: line.memo,
-        });
+    if (!validated.ok) {
+      if (strict) {
+        throw new Error(
+          `syncCapitalLedgerJournal: cannot represent edited row in journal: ${validated.errors.join("; ")}`
+        );
       }
-    });
+      return;
+    }
+    const entry = validated.entry;
+    await c.update(journalEntries).set({
+      ...entry.detail, entryDate: entry.entryDate, description: entry.description,
+      type: current.type, postingState: entry.postingState, skipReason: entry.skipReason,
+      updatedAt: now,
+    }).where(and(eq(journalEntries.id, owned.id), eq(journalEntries.userId, userId)));
+    await c.delete(journalEntryLines)
+      .where(and(eq(journalEntryLines.journalEntryId, owned.id), eq(journalEntryLines.userId, userId)));
+    for (const line of entry.lines) {
+      await c.insert(journalEntryLines).values({
+        id: randomUUID(), journalEntryId: owned.id, userId, accountId: line.accountId,
+        currency: line.currency, debitAmount: line.side === "DEBIT" ? line.amount : null,
+        creditAmount: line.side === "CREDIT" ? line.amount : null, amountThb: line.amountThb,
+        fxRateEffective: line.fxRateEffective, fxRateStatement: line.fxRateStatement,
+        fxRateProvider: line.fxRateProvider, memo: line.memo,
+      });
+    }
+  };
+
+  try {
+    if (conn === db) {
+      await db.transaction((tx) => runSync(tx, false));
+    } else {
+      await runSync(conn, true);
+    }
   } catch (error) {
     console.error("syncCapitalLedgerJournal: failed to sync entry", safeErrorLog(error));
+    if (conn !== db) throw error;
   }
 }
 
 /**
  * Remove the linked journal entry (and its lines) when a capital-ledger row is
  * deleted (DELETE), so journal-based reads stop showing the deleted row.
- * Best-effort: never throws — a deletion must not fail because of it.
+ * Best-effort: never throws — a deletion must not fail because of it. With an
+ * explicit conn the enclosing transaction owns atomicity with the capital row.
  */
 export async function removeCapitalLedgerJournal(
   userId: string,
-  transactionId: string
+  transactionId: string,
+  conn: Conn = db
 ): Promise<void> {
   try {
-    const entries = await db
+    const entries = await conn
       .select({ id: journalEntries.id })
       .from(journalEntries)
       .where(
@@ -866,14 +823,21 @@ export async function removeCapitalLedgerJournal(
       .limit(1)
       .execute();
     for (const { id } of entries) {
-      await db
+      await conn
         .delete(journalEntryLines)
         .where(and(eq(journalEntryLines.journalEntryId, id), eq(journalEntryLines.userId, userId)))
         .execute();
-      await db.delete(journalEntries).where(and(eq(journalEntries.id, id), eq(journalEntries.userId, userId))).execute();
+      await conn
+        .delete(journalEntries)
+        .where(and(eq(journalEntries.id, id), eq(journalEntries.userId, userId)))
+        .execute();
     }
   } catch (error) {
     console.error("removeCapitalLedgerJournal: failed to remove entry", safeErrorLog(error));
+    // Inside the caller's transaction a commit-visible failure must abort the
+    // whole DELETE (journal mirror + capital row together); the legacy
+    // best-effort path keeps swallowing exactly as before.
+    if (conn !== db) throw error;
   }
 }
 
@@ -1366,10 +1330,14 @@ async function reconcileStatementState(
 export interface ReconcileSkippedEquityResult {
   /** Journal entries whose linked source row was re-evaluated. */
   scanned: number;
-  /** SKIPPED entries the replay promoted to POSTED (real lines written). */
+  /** SKIPPED entries whose replay produced a keepable POSTED entry (both modes). */
+  promotable: number;
+  /** SKIPPED entries the replay promoted to POSTED (real lines written). 0 in a dry run. */
   promoted: number;
   /** Rows that remain SKIPPED after the replay + why (idempotent re-run safe). */
   stillSkipped: { transactionId: string; reason: string }[];
+  /** True when opts.apply was NOT set: zero database writes were made. */
+  dryRun: boolean;
 }
 
 /**
@@ -1383,12 +1351,24 @@ export interface ReconcileSkippedEquityResult {
  * and NO mutation of the source Capital_Transactions values: a re-import of the
  * same statement produces the identical entry. Non-equity SKIPPED rows (SELL
  * without basis, FX-only, standalone-fee ambiguity) are never touched.
+ *
+ * DEFAULT IS A DRY RUN (`opts.apply` absent/false): it only SELECTs and reports
+ * what WOULD be promoted (promoted stays 0). `apply: true` seeds the CoA (3020
+ * is a default) and promotes in per-entry transactions. Idempotent: a second
+ * apply promotes 0.
  */
 export async function reconcileSkippedEquityPostings(
-  userId: string
+  userId: string,
+  opts: { apply?: boolean } = {}
 ): Promise<ReconcileSkippedEquityResult> {
-  await seedDefaultChartOfAccounts(userId);
-  const lookup = await loadAccountLookup(userId);
+  const dryRun = opts.apply !== true;
+  // A dry run must make ZERO database writes: never seed the chart of accounts
+  // (that INSERTs). Promotion seeds first so a missing 3020 is not a blocker.
+  let lookup = await loadAccountLookup(userId);
+  if (!dryRun) {
+    const seeded = await seedDefaultChartOfAccounts(userId);
+    if (seeded > 0) lookup = await loadAccountLookup(userId);
+  }
 
   const rows = await db
     .select()
@@ -1411,7 +1391,9 @@ export async function reconcileSkippedEquityPostings(
     .orderBy(asc(journalEntries.entryNo))
     .execute();
 
-  const result: ReconcileSkippedEquityResult = { scanned: 0, promoted: 0, stillSkipped: [] };
+  const result: ReconcileSkippedEquityResult = {
+    scanned: 0, promotable: 0, promoted: 0, stillSkipped: [], dryRun,
+  };
   const now = new Date().toISOString();
 
   for (const entry of skippedEntries) {
@@ -1447,6 +1429,10 @@ export async function reconcileSkippedEquityPostings(
       result.stillSkipped.push({ transactionId: row.transactionId, reason });
       continue;
     }
+
+    result.promotable += 1;
+    // Dry run: report what WOULD be promoted; zero database writes.
+    if (dryRun) continue;
 
     // Promote: replace the SKIPPED record with the same header + REAL lines.
     try {
@@ -2493,85 +2479,121 @@ export type ReversalResult =
 /**
  * Reverse a POSTED entry: marks the original REVERSED and posts an inverted
  * mirror with a new entry number (reversals are real events, not deletes).
+ * Both the reversal entry AND the original's REVERSED flip commit in ONE
+ * transaction, and the original row is locked FOR UPDATE so two concurrent
+ * reversal requests serialize: the second one deterministically sees
+ * "already reversed" instead of racing to post a duplicate mirror.
  */
 export async function reverseJournalEntry(
   userId: string,
   entryId: string
 ): Promise<ReversalResult> {
-  const rows = await db
-    .select()
-    .from(journalEntries)
-    .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
-    .limit(1)
-    .execute();
-  const header = rows[0];
-  if (!header) return { ok: false, errors: ["Journal entry not found"] };
-  if (header.status === "REVERSED") {
-    return { ok: false, errors: ["Journal entry is already reversed"] };
-  }
-
-  const lineRows = await db
-    .select()
-    .from(journalEntryLines)
-    .where(and(eq(journalEntryLines.userId, userId), eq(journalEntryLines.journalEntryId, entryId)))
-    .execute();
-  if (lineRows.length < 2) {
-    return { ok: false, errors: ["Journal entry has no valid lines to reverse"] };
-  }
-
-  const validated: ValidatedJournalEntry = {
-    entryDate: header.entryDate,
-    description: header.description,
-    sourceType: header.sourceType === "STATEMENT" ? "STATEMENT" : "MANUAL",
-    sourceDocumentId: header.sourceDocumentId,
-    sourceTransactionId: header.sourceTransactionId,
-    postingState: "POSTED",
-    skipReason: null,
-    detail: { ...emptyTradeDetail(), isFxConversion: header.isFxConversion,
-      category: header.category, currency: header.currency, amount: header.amount,
-      exchangeFromCurrency: header.exchangeFromCurrency, exchangeFromAmount: header.exchangeFromAmount },
-    lines: lineRows.map((l) => ({
-      accountId: l.accountId,
-      currency: l.currency,
-      side: l.debitAmount != null ? "DEBIT" : "CREDIT",
-      amount: l.debitAmount ?? l.creditAmount ?? "0",
-      amountThb: l.amountThb,
-      fxRateEffective: l.fxRateEffective,
-      fxRateStatement: l.fxRateStatement,
-      fxRateProvider: l.fxRateProvider,
-      memo: l.memo,
-    })),
-  };
-
-  const candidate = buildReversal(validated);
-  const created = await createJournalEntry(userId, {
-    entryDate: candidate.entryDate,
-    description: candidate.description,
-    sourceType: "MANUAL",
-    sourceTransactionId: candidate.sourceTransactionId,
-    detail: candidate.detail,
-    lines: candidate.lines.map((l) => ({
-      accountId: l.accountId,
-      currency: l.currency,
-      debit: l.side === "DEBIT" ? l.amount : null,
-      credit: l.side === "CREDIT" ? l.amount : null,
-      fxRateEffective: l.fxRateEffective,
-      fxRateStatement: l.fxRateStatement,
-      fxRateProvider: l.fxRateProvider,
-      memo: l.memo,
-    })),
-  });
-  if (!created.ok) return created;
-
+  const now = new Date().toISOString();
   try {
-    await db
-      .update(journalEntries)
-      .set({ status: "REVERSED", updatedAt: new Date().toISOString() })
-      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
-      .execute();
-  } catch (error) {
-    console.error("reverseJournalEntry: failed to mark original reversed", safeErrorLog(error));
-  }
+    return await db.transaction(async (tx) => {
+      const [header] = await tx
+        .select()
+        .from(journalEntries)
+        .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
+        .limit(1)
+        .for("update")
+        .execute();
+      if (!header) return { ok: false, errors: ["Journal entry not found"] };
+      if (header.status === "REVERSED") {
+        return { ok: false, errors: ["Journal entry is already reversed"] };
+      }
 
-  return { ok: true, reversalEntryId: created.entryId, reversalEntryNo: created.entryNo };
+      const lineRows = await tx
+        .select()
+        .from(journalEntryLines)
+        .where(and(eq(journalEntryLines.userId, userId), eq(journalEntryLines.journalEntryId, entryId)))
+        .execute();
+      if (lineRows.length < 2) {
+        return { ok: false, errors: ["Journal entry has no valid lines to reverse"] };
+      }
+
+      const validated: ValidatedJournalEntry = {
+        entryDate: header.entryDate,
+        description: header.description,
+        sourceType: header.sourceType === "STATEMENT" ? "STATEMENT" : "MANUAL",
+        sourceDocumentId: header.sourceDocumentId,
+        sourceTransactionId: header.sourceTransactionId,
+        postingState: "POSTED",
+        skipReason: null,
+        detail: { ...emptyTradeDetail(), isFxConversion: header.isFxConversion,
+          category: header.category, currency: header.currency, amount: header.amount,
+          exchangeFromCurrency: header.exchangeFromCurrency, exchangeFromAmount: header.exchangeFromAmount },
+        lines: lineRows.map((l) => ({
+          accountId: l.accountId,
+          currency: l.currency,
+          side: l.debitAmount != null ? "DEBIT" : "CREDIT",
+          amount: l.debitAmount ?? l.creditAmount ?? "0",
+          amountThb: l.amountThb,
+          fxRateEffective: l.fxRateEffective,
+          fxRateStatement: l.fxRateStatement,
+          fxRateProvider: l.fxRateProvider,
+          memo: l.memo,
+        })),
+      };
+
+      const candidate = buildReversal(validated);
+
+      // Create the reversal with the same resolve/validate chain as
+      // createJournalEntry (lazy CoA seed not needed — a reversed entry by
+      // definition already had resolvable accounts).
+      const lookup = await loadAccountLookup(userId, tx);
+      const resolved = resolveEntryAccountIds(
+        {
+          entryDate: candidate.entryDate,
+          description: candidate.description,
+          sourceType: "MANUAL",
+          sourceTransactionId: candidate.sourceTransactionId,
+          detail: candidate.detail,
+          lines: candidate.lines.map((l) => ({
+            accountId: l.accountId,
+            currency: l.currency,
+            debit: l.side === "DEBIT" ? l.amount : null,
+            credit: l.side === "CREDIT" ? l.amount : null,
+            fxRateEffective: l.fxRateEffective,
+            fxRateStatement: l.fxRateStatement,
+            fxRateProvider: l.fxRateProvider,
+            memo: l.memo,
+          })),
+        },
+        lookup
+      );
+      if (!resolved.ok) return { ok: false, errors: resolved.errors };
+
+      const validatedReversal = validateJournalEntry({
+        entryDate: candidate.entryDate,
+        description: candidate.description,
+        sourceType: "MANUAL",
+        sourceTransactionId: candidate.sourceTransactionId,
+        detail: candidate.detail,
+        lines: resolved.lines,
+      });
+      if (!validatedReversal.ok) return { ok: false, errors: validatedReversal.errors };
+
+      const reversalEntryId = randomUUID();
+      const reversalEntryNo = await persistJournalEntry(
+        tx,
+        userId,
+        validatedReversal.entry,
+        reversalEntryId,
+        null,
+        now
+      );
+
+      await tx
+        .update(journalEntries)
+        .set({ status: "REVERSED", updatedAt: now })
+        .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
+        .execute();
+
+      return { ok: true, reversalEntryId, reversalEntryNo };
+    });
+  } catch (error) {
+    console.error("reverseJournalEntry: failed to persist reversal", safeErrorLog(error));
+    return { ok: false, errors: ["Failed to persist journal entry"] };
+  }
 }

@@ -462,8 +462,10 @@ export function validateJournalEntry(
 
   if (errors.length > 0) return { ok: false, errors };
 
-  // Confirmed exchange entries balance in reporting currency, not native units.
-  if (!isSkipped && (isFxConversion || Object.keys(byCurrency).length === 1)) {
+  // Every posted entry must balance in the THB reporting base. Native-currency
+  // balance alone is insufficient when debit and credit legs use different FX
+  // rates; adding another balanced currency must not bypass this invariant.
+  if (!isSkipped) {
     const debitThb = Decimal.sum(0, ...lines.filter(l => l.side === "DEBIT").map(l => l.amountThb));
     const creditThb = Decimal.sum(0, ...lines.filter(l => l.side === "CREDIT").map(l => l.amountThb));
     if (!debitThb.eq(creditThb)) errors.push("THB does not balance: debit " + debitThb + " != credit " + creditThb);

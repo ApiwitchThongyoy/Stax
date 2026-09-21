@@ -277,7 +277,7 @@ async function main() {
     "ledger-service: reverse/remove journal entry is scoped by userId + id"
   );
   ok(
-    /and\(eq\(journalEntryLines\.journalEntryId, entryId\), eq\(journalEntryLines\.userId, userId\)\)/.test(ledgerService),
+    /and\(eq\(journalEntryLines\.journalEntryId, (?:entryId|owned\.id|id)\), eq\(journalEntryLines\.userId, userId\)\)/.test(ledgerService),
     "ledger-service: journal line mutation is scoped by entryId + userId"
   );
 

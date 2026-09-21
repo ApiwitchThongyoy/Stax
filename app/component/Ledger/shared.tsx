@@ -230,31 +230,30 @@ export function PeriodFilter({
 }: PeriodFilterProps) {
   return (
     <div className="flex flex-wrap items-end gap-3">
-      <label className="block">
-        <span className="block text-xs font-medium text-gray-500 mb-1.5">
-          {asOf ? "ถึงวันที่" : "จากวันที่"}
-        </span>
-        <input
-          type="date"
-          value={from}
-          onChange={(e) => onFromChange(e.target.value)}
-          className={inputClass}
-          disabled={asOf}
-        />
-      </label>
       {!asOf && (
         <label className="block">
           <span className="block text-xs font-medium text-gray-500 mb-1.5">
-            ถึงวันที่
+            จากวันที่
           </span>
           <input
             type="date"
-            value={to}
-            onChange={(e) => onToChange(e.target.value)}
+            value={from}
+            onChange={(e) => onFromChange(e.target.value)}
             className={inputClass}
           />
         </label>
       )}
+      <label className="block">
+        <span className="block text-xs font-medium text-gray-500 mb-1.5">
+          ถึงวันที่
+        </span>
+        <input
+          type="date"
+          value={to}
+          onChange={(e) => onToChange(e.target.value)}
+          className={inputClass}
+        />
+      </label>
       <button
         type="button"
         onClick={onApply}

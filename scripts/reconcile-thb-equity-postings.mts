@@ -19,29 +19,44 @@
 // mutated. Deterministic + idempotent: already-POSTED rows are no-ops and a
 // re-run reports promoted=0.
 //
-// Run:  npx tsx scripts/reconcile-thb-equity-postings.mts [userId]
+// Run:  npx tsx scripts/reconcile-thb-equity-postings.mts [userId] [--apply]
+// DRY RUN BY DEFAULT: without --apply it only reports what WOULD be promoted.
 import "dotenv/config";
 import { db } from "../app/lib/drizzle-db";
 import { users } from "../app/db/schema";
 import { reconcileSkippedEquityPostings } from "../app/lib/ledger-service";
 
 async function main() {
-  const filterUserId = process.argv[2];
+  const args = process.argv.slice(2);
+  const apply = args.includes("--apply");
+  const filterUserId = args.find((a) => !a.startsWith("--"));
 
   const rows = filterUserId
     ? [{ id: filterUserId }]
     : await db.select({ id: users.id }).from(users).execute();
 
-  const summary = { scanned: 0, promoted: 0, stillSkipped: 0 };
+  const summary = {
+    scanned: 0,
+    promotable: 0,
+    promoted: 0,
+    stillSkipped: 0,
+  };
+
+  console.log(
+    apply
+      ? "[reconcile] MODE: APPLY (rows WILL be promoted)"
+      : "[reconcile] MODE: DRY RUN (report only, NO writes — use --apply to promote)"
+  );
 
   for (const { id } of rows) {
     try {
-      const result = await reconcileSkippedEquityPostings(id);
+      const result = await reconcileSkippedEquityPostings(id, { apply });
       summary.scanned += result.scanned;
+      summary.promotable += result.promotable;
       summary.promoted += result.promoted;
       summary.stillSkipped += result.stillSkipped.length;
       console.log(
-        `[reconcile] user=${id} scanned=${result.scanned} promoted=${result.promoted} stillSkipped=${result.stillSkipped.length}`
+        `[reconcile] user=${id} scanned=${result.scanned} promotable=${result.promotable} promoted=${result.promoted} stillSkipped=${result.stillSkipped.length} (dryRun=${result.dryRun})`
       );
       for (const s of result.stillSkipped) {
         console.log(`    still SKIPPED ${s.transactionId}: ${s.reason}`);
@@ -52,7 +67,7 @@ async function main() {
   }
 
   console.log(
-    `\n[reconcile] done. scanned=${summary.scanned} promoted=${summary.promoted} stillSkipped=${summary.stillSkipped}`
+    `\n[reconcile] done. scanned=${summary.scanned} promotable=${summary.promotable} promoted=${summary.promoted} stillSkipped=${summary.stillSkipped}`
   );
   process.exit(0);
 }

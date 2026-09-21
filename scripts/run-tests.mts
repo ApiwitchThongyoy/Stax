@@ -2448,6 +2448,178 @@ async function main() {
     }
   }
 
+  // ================= REG: ACCOUNTING CONCURRENCY (reversal / entry_no / manual cash) =================
+  // The refactor made three paths atomic against real concurrent load:
+  //   (a) REVERSAL — the original row is locked FOR UPDATE inside the reversal
+  //       transaction, so N simultaneous reversal requests produce EXACTLY ONE
+  //       reversal entry; the rest deterministically see "already reversed".
+  //   (b) entry_no — pg_advisory_xact_lock(hashtext(user)) serializes MAX+1 so N
+  //       concurrent manual entries get distinct sequential entry numbers
+  //       (backstopped by the unique index journal_entries_user_entry_no_idx).
+  //   (c) MANUAL cash POST — the capital row + its journal mirror commit in one
+  //       transaction, so a concurrent burst cannot leave an un-journaled orphan.
+  {
+    console.log("\n=== REG: ACCOUNTING CONCURRENCY ===");
+    const { randomUUID } = await import("node:crypto");
+    const concEmail = `conc-${randomUUID()}@test.local`;
+    const concPassword = "Conc!23456";
+    const concReg = await registerAs(concEmail, concPassword);
+    const concJson = (await concReg.json()) as {
+      data?: { user?: { id?: string } };
+    };
+    const concUserId = concJson.data?.user?.id;
+    if (!concUserId) {
+      ok(false, "REG-ACCTCONC: register failed to create the concurrency user");
+    } else {
+      smokeUserIds.push(concUserId);
+      const concLogin = await loginAs(concEmail, concPassword);
+      const concToken = concLogin.data?.accessToken as string | undefined;
+      if (!concToken) {
+        ok(false, "REG-ACCTCONC: registered user could not log in");
+      } else {
+        // ---- (a) REVERSAL CONCURRENCY: one original, N concurrent reversals.
+        const jRes = await journalRoute.action({
+          request: jsonBody(
+            {
+              entryDate: "2026-03-01",
+              description: "ฝากเงินเข้าบัญชี (concurrency fixture)",
+              lines: [
+                { accountId: "1020", currency: "USD", debit: "500.00", fxRateEffective: "35.0" },
+                { accountId: "3010", currency: "USD", credit: "500.00", fxRateEffective: "35.0" },
+              ],
+            },
+            "POST",
+            concToken
+          ),
+        } as never);
+        const concEntry = (await jRes.json()) as {
+          data?: { entryId?: string };
+        };
+        const concEntryId = concEntry.data?.entryId;
+        if (!concEntryId) {
+          ok(false, "REG-ACCTCONC: fixture entry not created for reversal race");
+        } else {
+          const race = await Promise.all(
+            Array.from({ length: 6 }, () =>
+              journalReverseRoute.action({
+                request: authedRequest("POST", concToken),
+                params: { id: concEntryId },
+              } as never)
+            )
+          );
+          const statuses = await Promise.all(race.map((r) => r.status));
+          const bodies = (await Promise.all(
+            race.map((r) => r.json())
+          )) as { success?: boolean; message?: string }[];
+          const okCount = race.filter((r) => r.status === 200).length;
+          const reversed = bodies.filter((b) => b.success === true).length;
+          const alreadyReversed = bodies.filter(
+            (b) => b.success === false && (b.message ?? "").includes("already reversed")
+          ).length;
+          ok(
+            okCount === 1 && reversed === 1 && alreadyReversed === statuses.length - 1,
+            `REG-ACCTCONC: 6 concurrent reversals → exactly 1 success + 5 "already reversed" (got ok=${okCount} success=${reversed} already=${alreadyReversed})`
+          );
+          const revRows = await client`
+            SELECT count(*)::int AS c
+            FROM journal_entries
+            WHERE description = 'กลับรายการ: ฝากเงินเข้าบัญชี (concurrency fixture)'
+              AND user_id = ${concUserId}`;
+          const origRow = await client`
+            SELECT status FROM journal_entries WHERE id = ${concEntryId} AND user_id = ${concUserId}`;
+          ok(
+            revRows[0].c === 1 && origRow[0].status === "REVERSED",
+            "REG-ACCTCONC: exactly one reversal entry exists and the original is REVERSED"
+          );
+        }
+
+        // ---- (b) entry_no CONCURRENCY: 8 simultaneous manual entries all get
+        //      distinct sequential entry numbers (unique backstop holds).
+        const burst = await Promise.all(
+          Array.from({ length: 8 }, (_, i) =>
+            journalRoute.action({
+              request: jsonBody(
+                {
+                  entryDate: `2026-03-${String((i % 27) + 1).padStart(2, "0")}`,
+                  description: `burst-entry-${i}`,
+                  lines: [
+                    { accountId: "1010", currency: "THB", debit: "10.00", fxRateEffective: "1" },
+                    { accountId: "3020", currency: "THB", credit: "10.00", fxRateEffective: "1" },
+                  ],
+                },
+                "POST",
+                concToken
+              ),
+            } as never)
+          )
+        );
+        const burstStatuses = await Promise.all(burst.map((b) => b.status));
+        const burstBodies = (await Promise.all(
+          burst.map((b) => b.json())
+        )) as { data?: { entryNo?: number } }[];
+        const burstNums = burstBodies
+          .filter((b) => typeof b.data?.entryNo === "number")
+          .map((b) => b.data!.entryNo as number);
+        const distinct = new Set(burstNums);
+        ok(
+          burstStatuses.every((s) => s === 201) &&
+            burstNums.length === 8 &&
+            distinct.size === 8 &&
+            Math.max(...burstNums) - Math.min(...burstNums) === 7,
+          "REG-ACCTCONC: 8 concurrent entries → all 201 with 8 distinct sequential entry numbers"
+        );
+
+        // ---- (c) MANUAL cash POST ATOMICITY: 6 concurrent CASH_INs each get
+        //      a capital row AND a matching journal mirror (no orphan).
+        const cashBurst = await Promise.all(
+          Array.from({ length: 6 }, (_, i) =>
+            ledgersRoute.action({
+              request: jsonBody(
+                {
+                  amountForeign: `${i + 1}50.00`,
+                  currency: "USD",
+                  transactionDate: `2026-03-${String((i % 27) + 1).padStart(2, "0")}`,
+                  fxRateBot: "35.00",
+                  amountThb: `${(i + 1) * 3500}.00`,
+                  type: "CASH_IN",
+                  sourceType: "MANUAL",
+                },
+                "POST",
+                concToken
+              ),
+            } as never)
+          )
+        );
+        const cashStatuses = await Promise.all(cashBurst.map((c) => c.status));
+        const cashBodies = (await Promise.all(
+          cashBurst.map((c) => c.json())
+        )) as { data?: { transactionId?: string; journalEntryNo?: number | null } }[];
+        const orphanCount = await client`
+          SELECT count(*)::int AS c
+          FROM "Capital_Transactions" ct
+          WHERE ct.user_id = ${concUserId}
+            AND NOT EXISTS (
+              SELECT 1 FROM journal_entries j
+              WHERE j.source_transaction_id = ct.transaction_id AND j.user_id = ${concUserId}
+            )`;
+        const mirrorLineOk = await client`
+          SELECT count(*)::int AS c
+          FROM journal_entries j
+          JOIN journal_entry_lines l ON l.journal_entry_id = j.id
+          WHERE j.user_id = ${concUserId}
+            AND j.source_transaction_id IS NOT NULL
+            AND j.description IN ('ฝากเงินเข้าบัญชี')`;
+        ok(
+          cashStatuses.every((s) => s === 201) &&
+            cashBodies.every((b) => typeof b.data?.journalEntryNo === "number") &&
+            orphanCount[0].c === 0 &&
+            mirrorLineOk[0].c === 12,
+          `REG-ACCTCONC: 6 concurrent manual CASH_INs → all 201, all journaled (orphans=${orphanCount[0].c}, mirror lines=${mirrorLineOk[0].c})`
+        );
+      }
+    }
+  }
+
   // ================= REG: MONTHLY CLOSING =================
   // The งบปิดเดือน report is an AS-OF book closing: every month's opening is
   // recomputed from the stored opening balance plus the FULL prior history, so
@@ -3006,12 +3178,34 @@ async function main() {
                   'no compatible THB account for 3010',
                   ${new Date().toISOString()}, ${new Date().toISOString()}, 'CASH_IN')`;
 
-        const recon1 = await reconcileSkippedEquityPostings(thbUserId);
+        // 4a. Dry run first: reports promotable but writes NOTHING (the entry
+        //     must remain SKIPPED with zero lines).
+        const reconDry = await reconcileSkippedEquityPostings(thbUserId);
+        const [afterDry] = await client`
+          SELECT posting_state, skip_reason FROM journal_entries WHERE id = ${entryId}`;
+        const [dryLineCount] = await client`
+          SELECT count(*)::int AS n FROM journal_entry_lines WHERE journal_entry_id = ${entryId}`;
         ok(
-          recon1.scanned >= 1 &&
+          reconDry.dryRun === true &&
+            reconDry.promotable >= 1 &&
+            reconDry.promoted === 0 &&
+            afterDry.posting_state === "SKIPPED" &&
+            afterDry.skip_reason === "no compatible THB account for 3010" &&
+            dryLineCount.n === 0,
+          "REG-EQUITY: reconcile dry-run is zero-write (still SKIPPED, no lines)"
+        );
+
+        // 4b. Apply really promotes the SKIPPED THB equity entry.
+        const recon1 = await reconcileSkippedEquityPostings(thbUserId, {
+          apply: true,
+        });
+        ok(
+          recon1.dryRun === false &&
+            recon1.scanned >= 1 &&
             recon1.stillSkipped.length === 0 &&
+            recon1.promotable >= 1 &&
             recon1.promoted >= 1,
-          "REG-EQUITY: reconcile promotes the SKIPPED THB equity entry"
+          "REG-EQUITY: reconcile (apply) promotes the SKIPPED THB equity entry"
         );
         const [postRecon] = await client`
           SELECT posting_state, skip_reason FROM journal_entries WHERE id = ${entryId}`;
@@ -3031,8 +3225,10 @@ async function main() {
           "REG-EQUITY: reconciled entry posts real Dr 1010 / Cr 3020 lines"
         );
 
-        // 5. Idempotent: a second reconcile touches nothing.
-        const recon2 = await reconcileSkippedEquityPostings(thbUserId);
+        // 5. Idempotent: a second reconcile (apply) touches nothing.
+        const recon2 = await reconcileSkippedEquityPostings(thbUserId, {
+          apply: true,
+        });
         ok(recon2.promoted === 0, "REG-EQUITY: re-running reconcile is a no-op");
 
         // 6. The replay produces the identical entry as a fresh import of the
@@ -5429,9 +5625,21 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
     await client`DELETE FROM accounts WHERE user_id = ${userARow.id}`;
   }
   for (const sid of smokeUserIds) {
+    // Delete every FK-referencing user-owned row in dependency order so the
+    // User delete never trips a constraint. Journal lines ref entries, so lines
+    // go first; accounts/journal_entries/capital rows are leaf-owned.
     await client`DELETE FROM journal_entry_lines WHERE user_id = ${sid}`;
     await client`DELETE FROM journal_entries WHERE user_id = ${sid}`;
     await client`DELETE FROM accounts WHERE user_id = ${sid}`;
+    await client`DELETE FROM "Capital_Transactions" WHERE user_id = ${sid}`;
+    await client`DELETE FROM cost_basis_state WHERE user_id = ${sid}`;
+    await client`DELETE FROM corporate_actions WHERE user_id = ${sid}`;
+    await client`DELETE FROM daily_tax_summaries WHERE user_id = ${sid}`;
+    await client`DELETE FROM csv_import_rows WHERE user_id = ${sid}`;
+    await client`DELETE FROM documents WHERE user_id = ${sid}`;
+    await client`DELETE FROM user_settings WHERE user_id = ${sid}`;
+    await client`DELETE FROM notifications WHERE user_id = ${sid}`;
+    await client`DELETE FROM audit_logs WHERE user_id = ${sid}`;
     await client`DELETE FROM "User" WHERE id = ${sid}`;
   }
   console.log("  Removed test audit rows, transient records, and smoke-test users.");

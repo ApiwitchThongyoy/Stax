@@ -112,6 +112,47 @@ async function main() {
   });
   ok(!multiCcyUnbalanced.ok && multiCcyUnbalanced.errors.some((e) => e.includes("USD")), "USD bucket unbalanced globally (per-currency rule)");
 
+  // A balanced second currency must never bypass the reporting-base invariant.
+  const mixedBase: JournalEntryInput = {
+    entryDate: "2026-01-15",
+    description: "Mixed-currency reporting-base validation",
+    lines: [
+      { accountId: CASH, currency: "USD", debit: "100", fxRateEffective: "35" },
+      { accountId: EQUITY, currency: "USD", credit: "100", fxRateEffective: "34" },
+      { accountId: "acc-1010", currency: "THB", debit: "10" },
+      { accountId: "acc-3020", currency: "THB", credit: "10" },
+    ],
+  };
+  const mixedRejected = validateJournalEntry(mixedBase);
+  ok(!mixedRejected.ok && mixedRejected.errors.some(e => e.includes("THB does not balance")),
+    "native-balanced USD + THB entry with unequal THB bases is rejected");
+  const mixedPenny = validateJournalEntry({ ...mixedBase, lines: mixedBase.lines.map((l, i) =>
+    i === 1 ? { ...l, fxRateEffective: "34.9999" } : l) });
+  ok(!mixedPenny.ok && mixedPenny.errors.some(e => e.includes("THB does not balance")),
+    "mixed-currency THB imbalance of exactly 0.01 is rejected, never silently tolerated");
+  const foreignOnly = validateJournalEntry({ ...mixedBase, lines: [
+    ...mixedBase.lines.slice(0, 2),
+    { accountId: "eur-cash", currency: "EUR", debit: "10", fxRateEffective: "40" },
+    { accountId: "eur-capital", currency: "EUR", credit: "10", fxRateEffective: "40" },
+  ] });
+  ok(!foreignOnly.ok && foreignOnly.errors.some(e => e.includes("THB does not balance")),
+    "native-balanced USD + EUR entry also enforces the THB reporting base");
+  const mixedAccepted = validateJournalEntry({ ...mixedBase, lines: mixedBase.lines.map((l, i) =>
+    i === 1 ? { ...l, fxRateEffective: "35" } : l) });
+  ok(mixedAccepted.ok, "mixed-currency entry balanced natively and in THB remains accepted");
+  if (mixedAccepted.ok) {
+    const mixedReport = trialBalance(mixedAccepted.entry.lines, ACCOUNTS);
+    ok(mixedReport.balancedThb === true && mixedReport.totalDebitThb === "3510.00" &&
+      mixedReport.totalCreditThb === "3510.00",
+      "accepted mixed entry reaches trial balance with equal 3510.00 THB totals");
+    const reversed = buildReversal(mixedAccepted.entry);
+    const checkedReversal = validateJournalEntry({ ...reversed, lines: reversed.lines.map(l => ({
+      ...l, debit: l.side === "DEBIT" ? l.amount : null,
+      credit: l.side === "CREDIT" ? l.amount : null,
+    })) });
+    ok(checkedReversal.ok, "balanced mixed-currency reversal remains valid");
+  }
+
   const bothLegs = validateJournalEntry({
     entryDate: "2026-01-15",
     description: "สองด้าน",
