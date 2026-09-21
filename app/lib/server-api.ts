@@ -401,6 +401,9 @@ export interface GeneralLedgerJournalTradeDetail {
   fxRateEffective: string | null;
   fxRateStatement: string | null;
   isFxConversion: boolean;
+  exchangeFromCurrency?: string | null;
+  exchangeFromAmount?: string | null;
+  exchangeRate?: string | null;
   // R4: monthly-fee-aggregate provenance, tri-state (true = parser monthly
   // aggregate -> SKIPPED, false = confirmed standalone, null = legacy/unknown
   // pre-0027 provenance, never fabricated).
@@ -418,8 +421,11 @@ export interface GeneralLedgerJournalEntry {
   sourceTransactionId: string | null;
   status: string;
   createdAt: string;
+  updatedAt?: string;
   postingState: "POSTED" | "SKIPPED";
   skipReason: string | null;
+  type?: string | null;
+  note?: string | null;
   detail: GeneralLedgerJournalTradeDetail;
   lines: GeneralLedgerJournalLine[];
 }
@@ -745,6 +751,166 @@ export async function reverseJournalEntry(
     throw new Error(out.message || "ไม่สามารถกลับรายการได้");
   }
   return { reversalEntryNo: out.data.reversalEntryNo };
+}
+
+export interface EditJournalInput {
+  entryDate?: string;
+  description?: string;
+  note?: string | null;
+  category?: string | null;
+  type?: string | null;
+  symbol?: string | null;
+  side?: string | null;
+  quantity?: string | null;
+  unitPrice?: string | null;
+  grossAmount?: string | null;
+  fees?: string | null;
+  netAmount?: string | null;
+  currency?: string | null;
+  amount?: string | null;
+  fxRateEffective?: string | null;
+  lines?: ManualJournalLineInput[];
+  reason?: string;
+}
+
+export interface StructuredJournalEntryInput {
+  transactionType:
+    | "BUY"
+    | "SELL"
+    | "DEPOSIT"
+    | "WITHDRAWAL"
+    | "FX"
+    | "DIVIDEND"
+    | "INTEREST"
+    | "FEE"
+    | "TAX"
+    | "VAT"
+    | "GAIN_LOSS"
+    | "CUSTOM";
+  entryDate: string;
+  description: string;
+  currency?: string;
+  amount?: string;
+  amountThb?: string;
+  fxRateEffective?: string;
+  symbol?: string;
+  side?: string;
+  quantity?: string;
+  unitPrice?: string;
+  grossAmount?: string;
+  fees?: string;
+  netAmount?: string;
+  whtAmount?: string;
+  fromCurrency?: string;
+  fromAmount?: string;
+  toCurrency?: string;
+  toAmount?: string;
+  exchangeRate?: string;
+  cashAccountCode?: string;
+  lines?: ManualJournalLineInput[];
+  note?: string;
+}
+
+/** Create a structured manual journal entry (BUY, SELL, Deposit, etc.). */
+export async function createStructuredJournalEntry(
+  accessToken: string,
+  input: StructuredJournalEntryInput
+): Promise<CreateJournalOutcome> {
+  let res: Response;
+  try {
+    res = await fetch("/api/v1/journal", {
+      method: "POST",
+      headers: {
+        ...authHeaders(accessToken),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+  } catch {
+    return { ok: false, message: "ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ กรุณาลองใหม่อีกครั้ง", errors: [] };
+  }
+
+  let body: {
+    success?: boolean;
+    message?: string;
+    errors?: string[];
+    data?: { entryId?: string; entryNo?: number };
+  };
+  try {
+    body = await res.json();
+  } catch {
+    body = {};
+  }
+
+  if (res.ok && body.success === true && body.data?.entryId) {
+    return {
+      ok: true,
+      entryId: body.data.entryId,
+      entryNo: body.data.entryNo ?? 0,
+    };
+  }
+  return {
+    ok: false,
+    message: body.message ?? "บันทึกรายการไม่สำเร็จ กรุณาลองใหม่อีกครั้ง",
+    errors: Array.isArray(body.errors) ? body.errors : [],
+  };
+}
+
+/** Update a journal entry by ID. */
+export async function updateJournalEntry(
+  accessToken: string,
+  entryId: string,
+  input: EditJournalInput
+): Promise<{ ok: true; data: GeneralLedgerJournalEntry } | { ok: false; message: string; errors: string[] }> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/v1/journal/${entryId}`, {
+      method: "PUT",
+      headers: {
+        ...authHeaders(accessToken),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+  } catch {
+    return { ok: false, message: "ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้ กรุณาลองใหม่อีกครั้ง", errors: [] };
+  }
+
+  let body: {
+    success?: boolean;
+    message?: string;
+    errors?: string[];
+    data?: GeneralLedgerJournalEntry;
+  };
+  try {
+    body = await res.json();
+  } catch {
+    body = {};
+  }
+
+  if (res.ok && body.success === true && body.data) {
+    return { ok: true, data: body.data };
+  }
+  return {
+    ok: false,
+    message: body.message ?? "แก้ไขข้อมูลไม่สำเร็จ กรุณาลองใหม่อีกครั้ง",
+    errors: Array.isArray(body.errors) ? body.errors : [],
+  };
+}
+
+/** Fetch a single journal entry detail along with its audit log history. */
+export async function fetchJournalEntryDetail(
+  accessToken: string,
+  entryId: string
+): Promise<{ entry: GeneralLedgerJournalEntry; history: Array<{ id: string; action: string; createdAt: string; details: any }> }> {
+  const res = await fetch(`/api/v1/journal/${entryId}`, {
+    headers: authHeaders(accessToken),
+  });
+  const out = await okJson<{ entry: GeneralLedgerJournalEntry; history: any[] }>(res);
+  if (!out.ok || !out.data) {
+    throw new Error(out.message || "Failed to load journal entry detail");
+  }
+  return out.data;
 }
 
 /** Fetch one account's ledger with a signed running balance. */

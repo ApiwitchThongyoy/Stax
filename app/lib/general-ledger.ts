@@ -293,6 +293,171 @@ export function isReferenceOnlySkip(skipReason?: string | null): boolean {
   return isMonthlyFeeSummary || isRealizedGainDuplicate;
 }
 
+export interface EntryMoneyFlow {
+  /** Authoritative money coming into user's account (null if no inflow or reference-only). */
+  moneyIn: string | null;
+  /** Authoritative money going out of user's account (null if no outflow or reference-only). */
+  moneyOut: string | null;
+  /** Currency of the cash movement (e.g. "USD", "THB"). */
+  currency: string;
+  /** Special note/label for FX pairs if currencies differ. */
+  flowLabel?: string;
+}
+
+/**
+ * Pure helper deriving exact Money In / Money Out according to real cash semantics:
+ * - Reference-only rows (e.g. monthly fee/VAT summaries, duplicate realized gain summaries) have NO independent cash movement -> null ("—").
+ * - WHT already withheld from dividend/interest does not fabricate a second independent cash-out.
+ * - BUY -> Money Out (net acquisition cost).
+ * - SELL -> Money In (net sale proceeds).
+ * - FX -> Out (exchangeFromAmount) and In (amount).
+ * - Deposit -> Money In; Withdrawal -> Money Out.
+ * - Standalone fee/expense (not aggregate) -> Money Out.
+ */
+export function getEntryMoneyFlow(entry: {
+  postingState?: string | null;
+  skipReason?: string | null;
+  type?: string | null;
+  detail?: Partial<JournalTradeDetail> | null;
+  lines?: { side: "DEBIT" | "CREDIT"; amount: string; currency: string; accountCode?: string }[];
+}): EntryMoneyFlow {
+  const d = entry.detail ?? {};
+  const ccy = d.currency ?? entry.lines?.[0]?.currency ?? "THB";
+
+  // 1. Reference-only rows: NO independent cash movement (already inside primary trade or duplicate P/L).
+  if (isReferenceOnlySkip(entry.skipReason)) {
+    return { moneyIn: null, moneyOut: null, currency: ccy };
+  }
+
+  // 2. Confirmed FX Conversion:
+  if (d.isFxConversion || (d.exchangeFromCurrency && d.exchangeFromAmount)) {
+    const fromAmt = d.exchangeFromAmount ?? null;
+    const fromCcy = d.exchangeFromCurrency ?? "";
+    const toAmt = d.amount ?? null;
+    const toCcy = d.currency ?? "";
+    return {
+      moneyIn: toAmt ? `${toAmt} ${toCcy}`.trim() : null,
+      moneyOut: fromAmt ? `${fromAmt} ${fromCcy}`.trim() : null,
+      currency: toCcy || fromCcy || ccy,
+      flowLabel: fromCcy && toCcy ? `${fromCcy} → ${toCcy}` : undefined,
+    };
+  }
+
+  // 3. Trade BUY: Money Out = netAmount (acquisition cost). Money In = null.
+  if (d.side === "BUY") {
+    let outAmt: string | null = d.netAmount ?? d.amount ?? null;
+    if (!outAmt && d.grossAmount) {
+      outAmt = d.fees ? new Decimal(d.grossAmount).plus(new Decimal(d.fees)).toFixed(2) : d.grossAmount;
+    }
+    return { moneyIn: null, moneyOut: outAmt ? String(outAmt) : null, currency: ccy };
+  }
+
+  // 4. Trade SELL: Money In = netAmount / proceeds. Money Out = null.
+  if (d.side === "SELL") {
+    let inAmt: string | null = d.netAmount ?? d.proceeds ?? d.amount ?? null;
+    if (!inAmt && d.grossAmount) {
+      inAmt = d.fees ? new Decimal(d.grossAmount).minus(new Decimal(d.fees)).toFixed(2) : d.grossAmount;
+    }
+    return { moneyIn: inAmt ? String(inAmt) : null, moneyOut: null, currency: ccy };
+  }
+
+  // 5. Explicit Capital Cash Movement (CASH_IN / CASH_OUT):
+  if (entry.type === "CASH_IN" || (d.category === "equity" && d.amount && entry.type !== "CASH_OUT")) {
+    return { moneyIn: d.amount ? String(d.amount) : null, moneyOut: null, currency: ccy };
+  }
+  if (entry.type === "CASH_OUT") {
+    return { moneyIn: null, moneyOut: d.amount ? String(d.amount) : null, currency: ccy };
+  }
+
+  // 6. Dividend & Interest (Income):
+  if (d.category === "income") {
+    return { moneyIn: d.amount ? String(d.amount) : null, moneyOut: null, currency: ccy };
+  }
+
+  // 7. Standalone Expense (Fee / VAT):
+  if (d.category === "expense") {
+    if (d.isMonthlyFeeAggregate === true) {
+      return { moneyIn: null, moneyOut: null, currency: ccy };
+    }
+    const outAmt = d.amount ?? d.fees;
+    return { moneyIn: null, moneyOut: outAmt ? String(outAmt) : null, currency: ccy };
+  }
+
+  // 8. Lines fallback: Cash accounts 1010/1020 debit = Money In, credit = Money Out
+  if (entry.lines && entry.lines.length > 0) {
+    const cashDebit = entry.lines.find(
+      (l) => (l.accountCode === "1010" || l.accountCode === "1020") && l.side === "DEBIT"
+    );
+    const cashCredit = entry.lines.find(
+      (l) => (l.accountCode === "1010" || l.accountCode === "1020") && l.side === "CREDIT"
+    );
+    if (cashDebit && cashCredit && cashDebit.currency !== cashCredit.currency) {
+      return {
+        moneyIn: `${cashDebit.amount} ${cashDebit.currency}`.trim(),
+        moneyOut: `${cashCredit.amount} ${cashCredit.currency}`.trim(),
+        currency: cashDebit.currency,
+        flowLabel: `${cashCredit.currency} → ${cashDebit.currency}`,
+      };
+    }
+    if (cashDebit && !cashCredit) {
+      return { moneyIn: cashDebit.amount, moneyOut: null, currency: cashDebit.currency };
+    }
+    if (cashCredit && !cashDebit) {
+      return { moneyIn: null, moneyOut: cashCredit.amount, currency: cashCredit.currency };
+    }
+  }
+
+  return { moneyIn: null, moneyOut: null, currency: ccy };
+}
+
+export function classifyEntryCategory(entry: {
+  category?: string | null;
+  detail?: Partial<JournalTradeDetail> | null;
+  lines?: { accountType?: string; accountCode?: string }[];
+}): { categoryId: AccountType; label: string } {
+  const d = entry.detail ?? {};
+  const cat = (d.category ?? entry.category ?? "").toLowerCase();
+
+  if (cat === "asset" || d.side === "BUY" || d.side === "SELL" || d.isFxConversion) {
+    return { categoryId: "ASSET", label: "สินทรัพย์" };
+  }
+  if (cat === "income" || d.section?.includes("ปันผล") || d.section?.includes("ดอกเบี้ย")) {
+    return { categoryId: "INCOME", label: "รายได้" };
+  }
+  if (cat === "expense" || d.section?.includes("ค่าธรรมเนียม") || d.section?.includes("ภาษี") || d.isMonthlyFeeAggregate) {
+    return { categoryId: "EXPENSE", label: "ค่าใช้จ่าย" };
+  }
+  if (cat === "equity") {
+    return { categoryId: "EQUITY", label: "ส่วนทุน" };
+  }
+  if (entry.lines && entry.lines.length > 0) {
+    const priorityNonCash = entry.lines.find(
+      (l) => l.accountCode && !["1010", "1020"].includes(l.accountCode)
+    );
+    const targetLine = priorityNonCash ?? entry.lines[0];
+    let resolvedType: AccountType | undefined = targetLine?.accountType as AccountType | undefined;
+    if (!resolvedType && targetLine?.accountCode) {
+      const firstDigit = targetLine.accountCode.charAt(0);
+      if (firstDigit === "1") resolvedType = "ASSET";
+      else if (firstDigit === "2") resolvedType = "LIABILITY";
+      else if (firstDigit === "3") resolvedType = "EQUITY";
+      else if (firstDigit === "4") resolvedType = "INCOME";
+      else if (firstDigit === "5") resolvedType = "EXPENSE";
+    }
+    if (resolvedType) {
+      const labels: Record<AccountType, string> = {
+        ASSET: "สินทรัพย์",
+        LIABILITY: "หนี้สิน",
+        EQUITY: "ส่วนทุน",
+        INCOME: "รายได้",
+        EXPENSE: "ค่าใช้จ่าย",
+      };
+      return { categoryId: resolvedType, label: labels[resolvedType] ?? resolvedType };
+    }
+  }
+  return { categoryId: "ASSET", label: "สินทรัพย์" };
+}
+
 /**
  * Validate an entry and normalize its lines. Pure. Returns structured errors
  * instead of throwing so callers (API + posting engine) can report them in a

@@ -73,7 +73,6 @@ const CATEGORY_TABS: { id: CategoryId; label: string }[] = CATEGORIES.map(
 
 const REPORT_TABS: { id: GlTab; label: string }[] = [
   { id: "journal", label: "บันทึกรายการ" },
-  { id: "trial", label: "งบทดลอง" },
   { id: "income", label: "งบกำไรขาดทุน" },
   { id: "balance", label: "งบดุล" },
 ];

@@ -3,9 +3,11 @@ import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 import {
   createJournalEntry,
+  createStructuredManualJournal,
   listJournalEntries,
+  type StructuredManualJournalInput,
 } from "~/lib/ledger-service";
-import type { JournalEntryInput, JournalLineInput } from "~/lib/general-ledger";
+import type { JournalLineInput, JournalEntryInput } from "~/lib/general-ledger";
 
 function isAuthError(result: unknown): result is { status: number; message: string } {
   return (
@@ -129,10 +131,11 @@ async function handleCreate(
     );
   }
 
-  const { entryDate, description, lines } = (body ?? {}) as {
+  const { entryDate, description, lines, transactionType } = (body ?? {}) as {
     entryDate?: unknown;
     description?: unknown;
     lines?: unknown;
+    transactionType?: unknown;
   };
 
   if (typeof entryDate !== "string" || !isValidIsoDate(entryDate)) {
@@ -147,6 +150,48 @@ async function handleCreate(
       { status: 400 }
     );
   }
+
+  // Support structured manual transactions from "+ เพิ่มรายการเอง" modal
+  if (typeof transactionType === "string" && transactionType.trim() !== "") {
+    const structuredResult = await createStructuredManualJournal(
+      auth.userId,
+      body as StructuredManualJournalInput
+    );
+    if (!structuredResult.ok) {
+      return Response.json(
+        { success: false, message: "Invalid journal entry", errors: structuredResult.errors },
+        { status: 422 }
+      );
+    }
+
+    await insertAuditLog({
+      userId: auth.userId,
+      action: AuditAction.JOURNAL_ENTRY_CREATE,
+      entityType: "journal_entries",
+      entityId: structuredResult.entryId,
+      details: {
+        method: "POST",
+        route: "/api/v1/journal",
+        transactionType: transactionType.trim(),
+        description: (description as string).trim(),
+        entryDate: (entryDate as string).trim(),
+      },
+    });
+
+    return Response.json(
+      {
+        success: true,
+        data: {
+          entryId: structuredResult.entryId,
+          entryNo: structuredResult.entryNo,
+          description: (description as string).trim(),
+          entryDate: (entryDate as string).trim(),
+        },
+      },
+      { status: 201 }
+    );
+  }
+
   if (!Array.isArray(lines) || lines.length < 2) {
     return Response.json(
       { success: false, message: "at least 2 lines are required" },

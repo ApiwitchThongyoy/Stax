@@ -17,6 +17,8 @@ import {
   DEFAULT_CHART_OF_ACCOUNTS,
   balanceSheet,
   buildReversal,
+  classifyEntryCategory,
+  getEntryMoneyFlow,
   incomeStatement,
   isReferenceOnlySkip,
   summarizeAccountLedgers,
@@ -2172,6 +2174,142 @@ async function main() {
       isReferenceOnlySkip(undefined) === false &&
       isReferenceOnlySkip("") === false,
     "isReferenceOnlySkip: real unposted / invalid / null rows are NOT classified reference-only"
+  );
+
+  // ---------------------------------------------------------------------------
+  // Bankbook cash flow & GAAP classification semantics
+  // ---------------------------------------------------------------------------
+  const refSkipEntry = {
+    skipReason: "monthly fee/VAT summary row - fees already inside the BUY acquisition cost",
+    lines: [],
+  };
+  const refFlow = getEntryMoneyFlow(refSkipEntry);
+  ok(
+    refFlow.moneyIn === null && refFlow.moneyOut === null,
+    "getEntryMoneyFlow: reference-only skip row has no fabricated cash in/out (both null)"
+  );
+
+  const buyEntry = {
+    skipReason: null,
+    lines: [
+      { accountCode: "1110", side: "DEBIT" as const, amount: "100.00", currency: "USD", amountThb: "3500.00" },
+      { accountCode: "1020", side: "CREDIT" as const, amount: "100.00", currency: "USD", amountThb: "3500.00" },
+    ],
+  };
+  const buyFlow = getEntryMoneyFlow(buyEntry);
+  ok(
+    buyFlow.moneyIn === null && buyFlow.moneyOut === "100.00" && buyFlow.currency === "USD",
+    "getEntryMoneyFlow: BUY with cash account credit returns money out"
+  );
+  ok(
+    classifyEntryCategory(buyEntry).categoryId === "ASSET",
+    "classifyEntryCategory: BUY investment is classified as ASSET"
+  );
+
+  const sellEntry = {
+    skipReason: null,
+    lines: [
+      { accountCode: "1020", side: "DEBIT" as const, amount: "150.00", currency: "USD", amountThb: "5250.00" },
+      { accountCode: "1110", side: "CREDIT" as const, amount: "100.00", currency: "USD", amountThb: "3500.00" },
+      { accountCode: "4020", side: "CREDIT" as const, amount: "50.00", currency: "USD", amountThb: "1750.00" },
+    ],
+  };
+  const sellFlow = getEntryMoneyFlow(sellEntry);
+  ok(
+    sellFlow.moneyIn === "150.00" && sellFlow.moneyOut === null && sellFlow.currency === "USD",
+    "getEntryMoneyFlow: SELL with cash account debit returns money in"
+  );
+  ok(
+    classifyEntryCategory(sellEntry).categoryId === "ASSET",
+    "classifyEntryCategory: SELL stock trade with investment asset (1110) is classified as ASSET"
+  );
+
+  const depositEntry = {
+    skipReason: null,
+    lines: [
+      { accountCode: "1010", side: "DEBIT" as const, amount: "50000.00", currency: "THB", amountThb: "50000.00" },
+      { accountCode: "3020", side: "CREDIT" as const, amount: "50000.00", currency: "THB", amountThb: "50000.00" },
+    ],
+  };
+  const depFlow = getEntryMoneyFlow(depositEntry);
+  ok(
+    depFlow.moneyIn === "50000.00" && depFlow.moneyOut === null && depFlow.currency === "THB",
+    "getEntryMoneyFlow: DEPOSIT / CASH_IN returns money in"
+  );
+  ok(
+    classifyEntryCategory(depositEntry).categoryId === "EQUITY",
+    "classifyEntryCategory: Capital deposit (3020) is classified as EQUITY"
+  );
+
+  const withdrawEntry = {
+    skipReason: null,
+    lines: [
+      { accountCode: "3020", side: "DEBIT" as const, amount: "10000.00", currency: "THB", amountThb: "10000.00" },
+      { accountCode: "1010", side: "CREDIT" as const, amount: "10000.00", currency: "THB", amountThb: "10000.00" },
+    ],
+  };
+  const wdFlow = getEntryMoneyFlow(withdrawEntry);
+  ok(
+    wdFlow.moneyIn === null && wdFlow.moneyOut === "10000.00" && wdFlow.currency === "THB",
+    "getEntryMoneyFlow: WITHDRAWAL / CASH_OUT returns money out"
+  );
+  ok(
+    classifyEntryCategory(withdrawEntry).categoryId === "EQUITY",
+    "classifyEntryCategory: Capital withdrawal (3020) is classified as EQUITY"
+  );
+
+  const fxEntry = {
+    skipReason: null,
+    lines: [
+      { accountCode: "1020", side: "DEBIT" as const, amount: "100.00", currency: "USD", amountThb: "3500.00" },
+      { accountCode: "1010", side: "CREDIT" as const, amount: "3500.00", currency: "THB", amountThb: "3500.00" },
+    ],
+  };
+  const fxFlow = getEntryMoneyFlow(fxEntry);
+  ok(
+    fxFlow.moneyIn === "100.00 USD" &&
+    fxFlow.moneyOut === "3500.00 THB",
+    "getEntryMoneyFlow: FX conversion returns both money in and money out in their respective currencies"
+  );
+  ok(
+    classifyEntryCategory(fxEntry).categoryId === "ASSET",
+    "classifyEntryCategory: FX cash exchange (1020/1010) is classified as ASSET"
+  );
+
+  const feeEntry = {
+    skipReason: null,
+    lines: [
+      { accountCode: "5010", side: "DEBIT" as const, amount: "5.00", currency: "USD", amountThb: "175.00" },
+      { accountCode: "1020", side: "CREDIT" as const, amount: "5.00", currency: "USD", amountThb: "175.00" },
+    ],
+  };
+  const feeFlow = getEntryMoneyFlow(feeEntry);
+  ok(
+    feeFlow.moneyIn === null && feeFlow.moneyOut === "5.00" && feeFlow.currency === "USD",
+    "getEntryMoneyFlow: Fee expense returns money out"
+  );
+  ok(
+    classifyEntryCategory(feeEntry).categoryId === "EXPENSE",
+    "classifyEntryCategory: Fee expense (5010) is classified as EXPENSE"
+  );
+
+  const divEntry = {
+    skipReason: null,
+    detail: { category: "income", amount: "13.50", currency: "USD" },
+    lines: [
+      { accountCode: "1020", side: "DEBIT" as const, amount: "13.50", currency: "USD", amountThb: "472.50" },
+      { accountCode: "4010", side: "CREDIT" as const, amount: "15.00", currency: "USD", amountThb: "525.00" },
+      { accountCode: "1030", side: "DEBIT" as const, amount: "1.50", currency: "USD", amountThb: "52.50" },
+    ],
+  };
+  const divFlow = getEntryMoneyFlow(divEntry);
+  ok(
+    divFlow.moneyIn === "13.50" && divFlow.moneyOut === null && divFlow.currency === "USD",
+    "getEntryMoneyFlow: DIVIDEND with withheld tax shows net cash in, does NOT fabricate cash out"
+  );
+  ok(
+    classifyEntryCategory(divEntry).categoryId === "INCOME",
+    "classifyEntryCategory: DIVIDEND (4010) is classified as INCOME"
   );
 
   runReportRegressions(ok);

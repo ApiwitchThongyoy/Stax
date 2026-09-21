@@ -414,19 +414,23 @@ export async function loadCostBasisState(userId: string): Promise<CostBasisMap> 
  * Persist the user's running-average cost basis (replace-all semantics, matching
  * the parser's full recompute of the working map per import).
  */
+type Conn = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
+type TxClient = Parameters<Parameters<typeof db.transaction>[0]>[0];
+type DbClient = typeof db;
+
 export async function saveCostBasisState(
   userId: string,
   map: CostBasisMap,
-  connection: typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0] = db,
+  connection: Conn = db,
 ): Promise<void> {
-  await connection.transaction(async (tx) => {
-    await tx
+  const runSave = async (client: TxClient | DbClient) => {
+    await client
       .delete(costBasisState)
       .where(eq(costBasisState.userId, userId))
       .execute();
     for (const [symbol, entry] of Object.entries(map)) {
       if (entry.quantity <= 0) continue;
-      await tx
+      await client
         .insert(costBasisState)
         .values({
           id: randomUUID(),
@@ -440,7 +444,13 @@ export async function saveCostBasisState(
         })
         .execute();
     }
-  });
+  };
+
+  if (connection === db) {
+    await db.transaction(async (tx) => runSave(tx));
+  } else {
+    await runSave(connection as TxClient);
+  }
 }
 
 /**
@@ -614,9 +624,10 @@ export function recomputeCostBasisMap(
  * half-deleted statement.
  */
 export async function rebuildCostBasisStateFromLedger(
-  userId: string
+  userId: string,
+  conn: Conn = db
 ): Promise<void> {
-  const rows = await db
+  const rows = await conn
     .select({
       symbol: capitalTransactions.symbol,
       transactionDate: capitalTransactions.transactionDate,
@@ -626,6 +637,7 @@ export async function rebuildCostBasisStateFromLedger(
       grossAmount: capitalTransactions.grossAmount,
       fees: capitalTransactions.fees,
       netAmount: capitalTransactions.netAmount,
+      transactionId: capitalTransactions.transactionId,
     })
     .from(capitalTransactions)
     .where(eq(capitalTransactions.userId, userId))
@@ -640,7 +652,7 @@ export async function rebuildCostBasisStateFromLedger(
   // (A deployment missing only the 0023 FMV columns falls back the same way;
   // its spin-offs replay with the legacy valuation until 0023 is applied.)
   try {
-    const actionRows = await db
+    const actionRows = await conn
       .select({
         id: corporateActions.id,
         symbol: corporateActions.symbol,
@@ -681,7 +693,7 @@ export async function rebuildCostBasisStateFromLedger(
     if (!/does not exist/i.test(msg)) throw error;
   }
 
-  await saveCostBasisState(userId, recomputeCostBasisMap(rows, actions));
+  await saveCostBasisState(userId, recomputeCostBasisMap(rows, actions), conn);
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,9 +1048,10 @@ export function recomputeAllGainLoss(
  * (import / delete handlers) treat a failure as non-fatal.
  */
 export async function backfillComputedGainLoss(
-  userId: string
+  userId: string,
+  conn: Conn = db
 ): Promise<GainLossBackfillStats> {
-  const rows = await db
+  const rows = await conn
     .select({
       transactionId: capitalTransactions.transactionId,
       sourceType: capitalTransactions.sourceType,
@@ -1066,7 +1079,7 @@ export async function backfillComputedGainLoss(
   // table must never block a backfill — fall back to trade-history-only replay.
   // (A deployment missing only the 0023 FMV columns falls back the same way.)
   try {
-    const actionRows = await db
+    const actionRows = await conn
       .select({
         id: corporateActions.id,
         symbol: corporateActions.symbol,
@@ -1115,9 +1128,9 @@ export async function backfillComputedGainLoss(
 
   const { updates, stats } = computeGainLossBackfill(rows, actions);
   if (updates.length > 0) {
-    await db.transaction(async (tx) => {
+    const applyUpdates = async (c: DbClient | TxClient) => {
       for (const u of updates) {
-        await tx
+        await c
           .update(capitalTransactions)
           .set({
             costBasis: u.update.costBasis,
@@ -1133,7 +1146,13 @@ export async function backfillComputedGainLoss(
           )
           .execute();
       }
-    });
+    };
+
+    if (conn === db) {
+      await db.transaction(async (tx) => applyUpdates(tx));
+    } else {
+      await applyUpdates(conn as TxClient);
+    }
   }
 
   return stats;
