@@ -14,6 +14,7 @@ import {
   reverseJournalEntry,
   type GeneralLedgerJournalEntry,
 } from "../../lib/server-api";
+import { isReferenceOnlySkip } from "../../lib/general-ledger";
 import {
   PeriodFilter,
   defaultPeriod,
@@ -80,7 +81,7 @@ function tradeSummary(entry: GeneralLedgerJournalEntry): string {
   return entry.description;
 }
 
-/** Client-side search across description/symbol/accounts/memo/entry no. */
+/** Client-side search across description/symbol/accounts/memo/entry no./skipReason. */
 function matchesSearch(
   entry: GeneralLedgerJournalEntry,
   query: string
@@ -91,6 +92,7 @@ function matchesSearch(
     String(entry.entryNo),
     entry.description,
     entry.entryDate,
+    entry.skipReason ?? "",
     entry.detail?.symbol ?? "",
     entry.detail?.side ?? "",
     entry.detail?.section ?? "",
@@ -109,11 +111,22 @@ function matchesSearch(
 
 /** Count the journal visibility counters from the loaded entries. */
 function summaryOf(entries: GeneralLedgerJournalEntry[]) {
+  const posted = entries.filter((e) => e.postingState === "POSTED").length;
+  const reference = entries.filter(
+    (e) => e.postingState === "SKIPPED" && isReferenceOnlySkip(e.skipReason)
+  ).length;
+  const unposted = entries.filter(
+    (e) => e.postingState === "SKIPPED" && !isReferenceOnlySkip(e.skipReason)
+  ).length;
+  const reversed = entries.filter(
+    (e) => e.status.toUpperCase() === "REVERSED"
+  ).length;
   return {
     total: entries.length,
-    posted: entries.filter((e) => e.postingState === "POSTED").length,
-    skipped: entries.filter((e) => e.postingState === "SKIPPED").length,
-    reversed: entries.filter((e) => e.status.toUpperCase() === "REVERSED").length,
+    posted,
+    reference,
+    unposted,
+    reversed,
   };
 }
 
@@ -273,13 +286,12 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
         <p className="text-xs text-blue-300 mb-1">Journal (สมุดรายวัน)</p>
         <h1 className="text-xl font-semibold mb-1.5">สมุดรายวัน (Journal)</h1>
         <p className="text-sm text-blue-200">
-          บันทึกรายการทั้งหมดจาก Statement และรายการที่บันทึกด้วยมือ — ทุก
-          รายการใน Statement ลงในสมุดรายวัน (รวมรายการที่ข้ามไม่ลงบัญชี)
+          บันทึกรายการทั้งหมดจาก Statement และรายการที่บันทึกด้วยมือ — ทุกรายการใน Statement ถูกบันทึกครบถ้วน (รวมถึงรายการอ้างอิงที่ไม่ลงเดบิต/เครดิตซ้ำ)
         </p>
       </div>
 
       {/* Counters */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-6">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mt-6">
         <div className="bg-white rounded-xl border border-gray-100 px-4 py-3">
           <p className="text-xs text-gray-400">รายการทั้งหมด</p>
           <p className="text-2xl font-semibold text-gray-800 mt-1">
@@ -293,9 +305,15 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
           </p>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 px-4 py-3">
-          <p className="text-xs text-gray-400">ข้าม (ไม่ลงบัญชี)</p>
+          <p className="text-xs text-gray-400">บันทึกอ้างอิง</p>
+          <p className="text-2xl font-semibold text-purple-700 mt-1">
+            {summary.reference}
+          </p>
+        </div>
+        <div className="bg-white rounded-xl border border-gray-100 px-4 py-3">
+          <p className="text-xs text-gray-400">ยังไม่มีคู่บัญชี</p>
           <p className="text-2xl font-semibold text-amber-600 mt-1">
-            {summary.skipped}
+            {summary.unposted}
           </p>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 px-4 py-3">
@@ -345,7 +363,7 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
           >
             <option value="">ทั้งหมด</option>
             <option value="POSTED">ลงบัญชีแล้ว</option>
-            <option value="SKIPPED">ข้าม (ไม่ลงบัญชี)</option>
+            <option value="SKIPPED">บันทึกแล้ว (ไม่มีคู่เดบิต/เครดิต)</option>
           </select>
         </label>
       </div>
@@ -386,9 +404,10 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
             ลงบัญชีแยกประเภทแล้ว (มีคู่เดบิต/เครดิต)
           </p>
           <p>
-            • <span className="font-medium">ข้าม (ไม่ลงบัญชี)</span> = บันทึกใน
-            สมุดรายวันครบถ้วนแต่ไม่มีรายการบัญชีคู่ (เช่น รายการที่ระบบไม่คำนวณ
-            กำไร/ขาดทุน)
+            • <span className="font-medium">บันทึกแล้ว (รายการอ้างอิง)</span> = บันทึกในสมุดรายวันครบถ้วน ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ (เช่น สรุปค่าธรรมเนียม/VAT รายเดือน, กำไรจากการขายที่ลงคู่กับรายการขายแล้ว)
+          </p>
+          <p>
+            • <span className="font-medium">บันทึกแล้ว (ยังไม่มีคู่บัญชี)</span> = บันทึกในสมุดรายวันครบถ้วนแล้ว แต่ยังไม่มีรายการบัญชีคู่เดบิต/เครดิต
           </p>
           <p>
             • <span className="font-medium">ข้อมูลเก่า (backfilled)</span> =
@@ -468,6 +487,7 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
                       const balanced =
                         Math.abs(totals.debit - totals.credit) < 0.005;
                       const skipped = entry.postingState === "SKIPPED";
+                      const isRef = skipped && isReferenceOnlySkip(entry.skipReason);
                       const detail = detailRows(entry);
                       const summaryText = tradeSummary(entry);
                       const showSubtitle = summaryText !== entry.description;
@@ -552,13 +572,19 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
                               </p>
                             )}
                             {skipped && (
-                              <p className="mt-1 text-xs text-amber-700">
-                                <span className="font-medium">ไม่ลงบัญชี:</span>{" "}
-                                {entry.skipReason === "backfilled-record-only"
-                                  ? "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่"
-                                  : entry.skipReason ||
-                                    "รายการนี้ถูกข้ามการลงบัญชี"}
-                              </p>
+                              isRef ? (
+                                <p className="mt-1 text-xs text-blue-700">
+                                  บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ
+                                </p>
+                              ) : (
+                                <p className="mt-1 text-xs text-amber-700">
+                                  <span className="font-medium">บันทึกในสมุดรายวันแล้ว:</span>{" "}
+                                  {entry.skipReason === "backfilled-record-only"
+                                    ? "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่"
+                                    : entry.skipReason ||
+                                      "ยังไม่มีคู่รายการเดบิต/เครดิต"}
+                                </p>
+                              )
                             )}
                           </td>
                           <td
@@ -573,9 +599,15 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
                           >
                             <div className="flex flex-wrap items-center gap-1.5">
                               {skipped ? (
-                                <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-600">
-                                  ข้ามไม่ลงบัญชี
-                                </span>
+                                isRef ? (
+                                  <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-purple-50 text-purple-700">
+                                    บันทึกแล้ว (รายการอ้างอิง)
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-700">
+                                    บันทึกแล้ว (ยังไม่มีคู่บัญชี)
+                                  </span>
+                                )
                               ) : (
                                 <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-blue-50 text-blue-700">
                                   ลงบัญชีแล้ว

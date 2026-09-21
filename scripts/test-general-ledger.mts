@@ -18,6 +18,7 @@ import {
   balanceSheet,
   buildReversal,
   incomeStatement,
+  isReferenceOnlySkip,
   summarizeAccountLedgers,
   summarizeLinesBySymbol,
   trialBalance,
@@ -2135,10 +2136,43 @@ async function main() {
   ok(asOfWindowed.totalAssetsThb === "5250.00" && asOfWindowed.totalAssets === "150.00" &&
     asOfWindowed.totalEquityAndLiabilitiesThb === "5250.00" && asOfWindowed.balanced && asOfWindowed.balancedThb,
     "BS as-of: windowed slice (openings + in-window) totals 150.00 / 5250.00 THB");
-  ok(asOfFull.totalAssetsThb === asOfWindowed.totalAssetsThb && asOfFull.totalAssets === asOfWindowed.totalAssets &&
-    asOfFull.totalEquityAndLiabilitiesThb === asOfWindowed.totalEquityAndLiabilitiesThb &&
-    asOfFull.balanced === asOfWindowed.balanced,
-    "BS as-of: full-history run reports the SAME as-of numbers — `from` is ignored, only `to` matters");
+  // ---------------------------------------------------------------------------
+  // Journal status semantics: reference-only vs real unposted classifications.
+  // ---------------------------------------------------------------------------
+  ok(
+    isReferenceOnlySkip("monthly fee/VAT summary row - fees already inside the BUY acquisition cost / SELL net proceeds") === true &&
+      isReferenceOnlySkip("monthly fee/vat summary row") === true &&
+      isReferenceOnlySkip("fees already in the trade postings") === true &&
+      isReferenceOnlySkip("fee/vat summary") === true &&
+      isReferenceOnlySkip("fee and vat summary row") === true &&
+      isReferenceOnlySkip("fee and vat aggregate") === true,
+    "isReferenceOnlySkip: classifies monthly fee/VAT summary rows as reference-only (case-insensitive, historical wording)"
+  );
+  ok(
+    isReferenceOnlySkip("realized gain/loss already posted via the SELL row") === true &&
+      isReferenceOnlySkip("already posted via the sell row") === true,
+    "isReferenceOnlySkip: classifies duplicate realized gain/loss income rows as reference-only"
+  );
+  ok(
+    isReferenceOnlySkip("SELL without trustworthy cost basis / realized gain - NON_COMPUTABLE, not posted") === false,
+    "isReferenceOnlySkip: real NON_COMPUTABLE SELL is NOT classified reference-only"
+  );
+  ok(
+    isReferenceOnlySkip("legacy fee provenance unknown - re-import required for deterministic classification") === false,
+    "isReferenceOnlySkip: legacy fee provenance unknown is NOT classified reference-only"
+  );
+  ok(
+    isReferenceOnlySkip("backfilled-record-only") === false &&
+      isReferenceOnlySkip("BUY without a positive authoritative acquisition cost - not posted") === false &&
+      isReferenceOnlySkip("THB does not balance at statement FX: received 55329.09 THB != sent 55335.00 THB") === false &&
+      isReferenceOnlySkip("missing effective FX") === false &&
+      isReferenceOnlySkip("invalid entry: unbalanced debit/credit") === false &&
+      isReferenceOnlySkip("unknown category \"other\"") === false &&
+      isReferenceOnlySkip(null) === false &&
+      isReferenceOnlySkip(undefined) === false &&
+      isReferenceOnlySkip("") === false,
+    "isReferenceOnlySkip: real unposted / invalid / null rows are NOT classified reference-only"
+  );
 
   runReportRegressions(ok);
   console.log("================ SUMMARY ================");

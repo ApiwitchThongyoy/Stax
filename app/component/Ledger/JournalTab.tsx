@@ -9,6 +9,7 @@ import {
   type GeneralLedgerAccount,
   type GeneralLedgerJournalEntry,
 } from "../../lib/server-api";
+import { isReferenceOnlySkip } from "../../lib/general-ledger";
 import JournalEntryModal from "./JournalEntryModal";
 import {
   PeriodFilter,
@@ -112,7 +113,7 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
   const isReversed = (entry: GeneralLedgerJournalEntry) =>
     entry.status.toUpperCase() === "REVERSED";
 
-  /** Client-side search across description/symbol/accounts/memo/entry no. */
+  /** Client-side search across description/symbol/accounts/memo/entry no./skipReason. */
   const matchesSearch = (entry: GeneralLedgerJournalEntry, q: string) => {
     const needle = q.trim().toLowerCase();
     if (!needle) return true;
@@ -120,6 +121,7 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
       String(entry.entryNo),
       entry.description,
       entry.entryDate,
+      entry.skipReason ?? "",
       entry.detail?.symbol ?? "",
       entry.detail?.side ?? "",
       entry.detail?.section ?? "",
@@ -149,8 +151,7 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
           บันทึกรายการบัญชี (Journal)
         </h1>
         <p className="text-sm text-blue-200">
-          รายการที่ลงบัญชีแบบคู่ทั้งหมด — ทั้งรายการอัตโนมัติจาก Statement และ
-          รายการที่บันทึกด้วยมือ
+          บันทึกรายการทั้งหมดจาก Statement และรายการที่บันทึกด้วยมือ — ทุกรายการใน Statement ถูกบันทึกครบถ้วน (รวมถึงรายการอ้างอิงที่ไม่ลงเดบิต/เครดิตซ้ำ)
         </p>
       </div>
 
@@ -271,6 +272,7 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                         const balanced =
                           Math.abs(totals.debit - totals.credit) < 0.005;
                         const skipped = entry.postingState === "SKIPPED";
+                        const isRef = skipped && isReferenceOnlySkip(entry.skipReason);
                         const lineCount = skipped ? 1 : entry.lines.length;
                         const headerCells = (rowSpan: number) => (
                           <>
@@ -300,15 +302,21 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                                 {entry.description}
                               </p>
                               {skipped && (
-                                <p className="mt-1 text-xs text-amber-700">
-                                  <span className="font-medium">
-                                    ไม่ลงบัญชี:
-                                  </span>{" "}
-                                  {entry.skipReason === "backfilled-record-only"
-                                    ? "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่"
-                                    : entry.skipReason ||
-                                      "รายการนี้ถูกข้ามการลงบัญชี"}
-                                </p>
+                                isRef ? (
+                                  <p className="mt-1 text-xs text-blue-700">
+                                    บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ
+                                  </p>
+                                ) : (
+                                  <p className="mt-1 text-xs text-amber-700">
+                                    <span className="font-medium">
+                                      บันทึกในสมุดรายวันแล้ว:
+                                    </span>{" "}
+                                    {entry.skipReason === "backfilled-record-only"
+                                      ? "ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ ยังไม่มีรายการบัญชีคู่"
+                                      : entry.skipReason ||
+                                        "ยังไม่มีคู่รายการเดบิต/เครดิต"}
+                                  </p>
+                                )
                               )}
                             </td>
                             <td rowSpan={rowSpan} className="px-4 py-3 align-top">
@@ -317,9 +325,15 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
                             <td rowSpan={rowSpan} className="px-4 py-3 align-top">
                               <div className="flex flex-wrap items-center gap-1.5">
                                 {skipped ? (
-                                  <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-600">
-                                    ข้ามไม่ลงบัญชี
-                                  </span>
+                                  isRef ? (
+                                    <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-purple-50 text-purple-700">
+                                      บันทึกแล้ว (รายการอ้างอิง)
+                                    </span>
+                                  ) : (
+                                    <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-amber-50 text-amber-700">
+                                      บันทึกแล้ว (ยังไม่มีคู่บัญชี)
+                                    </span>
+                                  )
                                 ) : (
                                   <span className="inline-flex items-center text-xs font-medium px-2 py-1 rounded-full bg-blue-50 text-blue-700">
                                     ลงบัญชีแล้ว
