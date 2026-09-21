@@ -775,8 +775,10 @@ ok(
   journalPage.includes('entry.postingState === "SKIPPED"') &&
     journalPage.includes("entry.skipReason") &&
     journalPage.includes('value="SKIPPED"') &&
-    journalPage.includes('entry.skipReason === "backfilled-record-only"') &&
-    journalPage.includes("ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ"),
+    (journalPage.includes('entry.skipReason === "backfilled-record-only"') ||
+      journalActionModals.includes('entry.skipReason === "backfilled-record-only"')) &&
+    (journalPage.includes("ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ") ||
+      journalActionModals.includes("ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ")),
   "Journal page shows SKIPPED entries with their skip reason + a status filter, and maps backfilled-record-only to a friendly Thai label"
 );
 ok(
@@ -2450,11 +2452,37 @@ ok(
   "Journal UI presents SKIPPED filter label without 'ข้าม' and updates header copy"
 );
 ok(
-  journalPage.includes("บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ") &&
-    journalTab.includes("บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ") &&
-    journalPage.includes("บันทึกในสมุดรายวันแล้ว:") &&
-    journalTab.includes("บันทึกในสมุดรายวันแล้ว:"),
-  "Journal renders the required reference and unposted explanation texts"
+  journalActionModals.includes("บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ") &&
+    journalActionModals.includes("บันทึกในสมุดรายวันแล้ว:") &&
+    journalActionModals.includes("หมายเหตุรายการ") &&
+    !journalPage.includes('<p className="mt-1 text-xs text-blue-700">บันทึกครบแล้ว') &&
+    !journalTab.includes('<p className="mt-1 text-xs text-blue-700">บันทึกครบแล้ว') &&
+    !journalPage.includes('<p className="mt-1 text-xs text-amber-700">') &&
+    !journalTab.includes('<p className="mt-1 text-xs text-amber-700">'),
+  "Journal hides long explanations from default table view and exposes them via JournalNoteModal"
+);
+ok(
+  journalPage.includes("getEntryExplanation") &&
+    journalTab.includes("getEntryExplanation") &&
+    journalPage.includes("JournalNoteModal") &&
+    journalTab.includes("JournalNoteModal") &&
+    journalPage.includes('title="ดูหมายเหตุ"') &&
+    journalTab.includes('title="ดูหมายเหตุ"') &&
+    journalPage.includes("หมายเหตุ") &&
+    journalTab.includes("หมายเหตุ"),
+  "Journal displays lightweight note/info icon and 'หมายเหตุ' action button when explanation exists"
+);
+ok(
+  journalPage.includes("ต้องตรวจสอบ") &&
+    journalTab.includes("ต้องตรวจสอบ"),
+  "Journal displays 'ต้องตรวจสอบ' warning badge for unposted non-computable entries"
+);
+ok(
+  journalActionModals.includes("บันทึกช่วยจำ (User Note):") &&
+    journalActionModals.includes("isRef && (") &&
+    journalActionModals.includes("isSkipped && !isRef && (") &&
+    journalActionModals.includes("{userNote && ("),
+  "JournalNoteModal renders user note once under 'บันทึกช่วยจำ (User Note)' and reserves system boxes for ref/unposted"
 );
 
 // ---------------------------------------------------------------------------

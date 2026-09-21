@@ -19,6 +19,7 @@ import {
   buildReversal,
   classifyEntryCategory,
   getEntryMoneyFlow,
+  getEntryExplanation,
   incomeStatement,
   isReferenceOnlySkip,
   summarizeAccountLedgers,
@@ -2310,6 +2311,83 @@ async function main() {
   ok(
     classifyEntryCategory(divEntry).categoryId === "INCOME",
     "classifyEntryCategory: DIVIDEND (4010) is classified as INCOME"
+  );
+
+  // ---------------------------------------------------------------------------
+  // Entry explanation tests: reference-only vs unposted/non-computable vs user note vs normal
+  // ---------------------------------------------------------------------------
+  const expRefVat = getEntryExplanation({
+    postingState: "SKIPPED",
+    skipReason: "monthly fee/VAT summary row - fees already inside the BUY acquisition cost",
+  });
+  ok(
+    expRefVat.hasExplanation === true &&
+      expRefVat.isReference === true &&
+      expRefVat.isUnposted === false &&
+      expRefVat.explanation === "บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ",
+    "getEntryExplanation: reference-only monthly fee/VAT summary returns hasExplanation=true and reference text"
+  );
+
+  const expRefGain = getEntryExplanation({
+    postingState: "SKIPPED",
+    skipReason: "realized gain/loss already posted via the SELL row",
+  });
+  ok(
+    expRefGain.hasExplanation === true &&
+      expRefGain.isReference === true &&
+      expRefGain.isUnposted === false &&
+      expRefGain.explanation === "บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ",
+    "getEntryExplanation: reference-only duplicate gain summary returns hasExplanation=true and reference text"
+  );
+
+  const expNonComp = getEntryExplanation({
+    postingState: "SKIPPED",
+    skipReason: "SELL without trustworthy cost basis / realized gain - NON_COMPUTABLE, not posted",
+  });
+  ok(
+    expNonComp.hasExplanation === true &&
+      expNonComp.isReference === false &&
+      expNonComp.isUnposted === true &&
+      expNonComp.explanation.includes("NON_COMPUTABLE"),
+    "getEntryExplanation: non-computable SELL returns hasExplanation=true, isUnposted=true with technical reason"
+  );
+
+  const expBackfill = getEntryExplanation({
+    postingState: "SKIPPED",
+    skipReason: "backfilled-record-only",
+  });
+  ok(
+    expBackfill.hasExplanation === true &&
+      expBackfill.isReference === false &&
+      expBackfill.isUnposted === true &&
+      expBackfill.explanation.includes("ข้อมูลเก่า — นำเข้าก่อนระบบลงบัญชีอัตโนมัติ"),
+    "getEntryExplanation: backfilled-record-only returns Thai explanation"
+  );
+
+  const expNormalPosted = getEntryExplanation({
+    postingState: "POSTED",
+    skipReason: null,
+  });
+  ok(
+    expNormalPosted.hasExplanation === false &&
+      expNormalPosted.isReference === false &&
+      expNormalPosted.isUnposted === false &&
+      expNormalPosted.explanation === "",
+    "getEntryExplanation: normal POSTED row without note returns hasExplanation=false"
+  );
+
+  const expUserNote = getEntryExplanation({
+    postingState: "POSTED",
+    skipReason: null,
+    note: "Audited and confirmed with broker receipt",
+  });
+  ok(
+    expUserNote.hasExplanation === true &&
+      expUserNote.isReference === false &&
+      expUserNote.isUnposted === false &&
+      expUserNote.userNote === "Audited and confirmed with broker receipt" &&
+      expUserNote.explanation === "Audited and confirmed with broker receipt",
+    "getEntryExplanation: POSTED row with user note returns hasExplanation=true with userNote"
   );
 
   runReportRegressions(ok);
