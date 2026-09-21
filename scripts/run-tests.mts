@@ -3447,7 +3447,8 @@ async function main() {
         ok(false, "REG-RND: registered rounding user could not log in");
       } else {
         // 1. Simulate the pre-rounding SKIPPED rows (production shape).
-        //    1a. Promotable BUY: net 86.60 @ 31.57, principal 86.59, fee 0.01.
+        //    1a. Promotable BUY: broker net 86.60 @ 31.57. The current policy
+        //        capitalizes the net once; it does not create a separate fee leg.
         const txRound = randomUUID();
         await client`
           INSERT INTO "Capital_Transactions"
@@ -3507,10 +3508,10 @@ async function main() {
         );
         const rRep = rDry.entries.find((e) => e.transactionId === txRound);
         ok(
-          !!rRep && rRep.lineCount === 4 && rRep.adjustmentThb === "0.01" &&
-            rRep.adjustmentSide === "CREDIT" &&
-            rRep.debitThb === "2733.97" && rRep.creditThb === "2733.97",
-          "REG-RND: dry run reports the exact +0.01 CREDIT 5020 leg (THB now balanced)"
+            !!rRep && rRep.lineCount === 2 && rRep.adjustmentThb === null &&
+            rRep.adjustmentSide === null &&
+            Number(rRep.debitThb) === 2733.96 && Number(rRep.creditThb) === 2733.96,
+          "REG-RND: dry run reports a balanced two-leg acquisition-cost BUY (no duplicate fee leg)"
         );
         const [rDryEntry] = await client`
           SELECT posting_state, (SELECT count(*)::int FROM journal_entry_lines l WHERE l.journal_entry_id = ${rEntryId}) AS lines
@@ -3520,7 +3521,7 @@ async function main() {
           "REG-RND: dry run writes nothing (entry untouched, zero lines)"
         );
 
-        // 3. Apply: promotes the SAME journal entry id with the 4 real lines.
+        // 3. Apply: promotes the SAME journal entry id with the 2 real lines.
         const rApply = await reconcileSkippedRoundingPostings(rUserId, { apply: true });
         ok(rApply.promoted === 1, "REG-RND: --apply promotes the SKIPPED rounding entry");
         const rLegs = await client`
@@ -3534,13 +3535,12 @@ async function main() {
         const l1020 = rLine("1020");
         const l5020 = rLine("5020");
         ok(
-          rLegs.length === 4 &&
-            !!l1110 && Number(l1110.debit_amount) === 86.59 &&
-            !!l5010 && Number(l5010.debit_amount) === 0.01 &&
+          rLegs.length === 2 &&
+            !!l1110 && Number(l1110.debit_amount) === 86.6 &&
+            !l5010 &&
             !!l1020 && Number(l1020.credit_amount) === 86.6 &&
-            !!l5020 && Number(l5020.credit_amount) === 0.01 &&
-            l5020.memo === "THB rounding adjustment",
-          "REG-RND: promoted entry = Dr 1110 86.59 + Dr 5010 0.01 / Cr 1020 86.60 + Cr 5020 0.01"
+            !l5020,
+          "REG-RND: promoted entry = Dr 1110 86.60 / Cr 1020 86.60 (no duplicate 5010 fee)"
         );
         const [rPostApply] = await client`
           SELECT posting_state, skip_reason FROM journal_entries WHERE id = ${rEntryId}`;
@@ -4037,11 +4037,11 @@ async function main() {
           FROM "Capital_Transactions" WHERE transaction_id = ${sellId}`;
         ok(
           filled.length === 1 &&
-            filled[0].cost_basis === "100.00" &&
+            filled[0].cost_basis === "99.50" &&
             filled[0].proceeds === "290.00" &&
-            filled[0].realized_gain_loss === "190.00" &&
-            filled[0].realized_gain_loss_thb === "6729.80",
-          "REG-backfill: SELL filled from authoritative data (basis avg20*5=100 / proceeds net 290 / gain 190 / THB 190*35.42)"
+            filled[0].realized_gain_loss === "190.50" &&
+            filled[0].realized_gain_loss_thb === "6747.51",
+          "REG-backfill: SELL filled from fee-inclusive BUY basis (99.50 / proceeds 290 / gain 190.50 / THB 6747.51)"
         );
 
         const manStill = await client`SELECT realized_gain_loss_thb FROM "Capital_Transactions" WHERE transaction_id = ${manSellId}`;
@@ -4946,8 +4946,9 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
           const winBuy = avgOf(windowed?.entries, "BUY", "SCOPX", "2026-02-01");
           const winSell = avgOf(windowed?.entries, "SELL", "SCOPX", "2026-03-01");
           ok(
-            fullBuy === 10 && fullSell === 20,
-            "REG-scope: unfiltered SCOPX replay reports lifetime averages (BUY 10 pre-trade / SELL 20) for the in-window rows"
+            fullBuy !== null && fullSell !== null &&
+            Math.abs(fullBuy - 10.005) < 1e-9 && Math.abs(fullSell - 20.005) < 1e-9,
+            "REG-scope: unfiltered SCOPX replay reports fee-inclusive lifetime averages (BUY 10.005 / SELL 20.005)"
           );
           ok(
             winBuy === fullBuy && winSell === fullSell,

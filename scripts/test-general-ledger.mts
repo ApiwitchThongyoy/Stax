@@ -688,24 +688,20 @@ async function main() {
   };
   const roundingLeg = (entry: NonNullable<ReturnType<typeof roundingFrozen>>) =>
     entry.lines.find((l) => l.memo === "THB rounding adjustment") ?? null;
-  // BUY: principal 10.00 + fee 10.00 vs net 20.00 @ 3.1415 -> debit THB
-  // 31.42 + 31.42 = 62.84 vs credit 62.83 -> CREDIT 5020 0.01 (4 legs POSTED).
+  // BUY: the acquisition cost is a single amount, so both legs share it and the
+  // THB base always balances — no rounding leg is ever needed. The investment is
+  // debited by the full broker Net Amount (commissions/VAT INCLUDED), and the
+  // fee is NOT expensed separately.
   const buyRound = roundingFrozen(baseRow({ category: "asset", side: "BUY",
     amountForeign: "20.00", quantity: "10", unitPrice: "1.00",
     fxRateEffective: "3.1415", fxRateStatement: "3.1415" }));
-  ok(!!buyRound && buyRound.lines.length === 4,
-    "rounding: non-balancing BUY posts 4 legs (principal + fee + net + THB leg)");
+  ok(!!buyRound && buyRound.lines.length === 2 && !roundingLeg(buyRound),
+    "rounding: BUY posts 2 balanced legs (acquisition cost incl. fees), no THB leg");
   if (buyRound) {
-    const r = roundingLeg(buyRound);
-    ok(!!r && r.accountId === "5020" && r.currency === "THB" && r.side === "CREDIT" &&
-      r.amount === "0.01" && r.amountThb === "0.01" && r.fxRateEffective === "1" &&
-      r.fxRateStatement === "1",
-      "rounding: BUY CREDIT 5020 0.01 (THB debit 62.84 vs credit 62.83), THB pinned");
-    ok(buyRound.lines.some((l) => l.accountId === "1110" && l.side === "DEBIT" && l.amount === "10.00") &&
-      buyRound.lines.some((l) => l.accountId === "5010" && l.side === "DEBIT" && l.amount === "10.00") &&
+    ok(buyRound.lines.some((l) => l.accountId === "1110" && l.side === "DEBIT" && l.amount === "20.00") &&
       buyRound.lines.some((l) => l.accountId === "1020" && l.side === "CREDIT" && l.amount === "20.00") &&
-      buyRound.lines.every((l) => l.memo !== "FX conversion variance"),
-      "rounding: source legs keep principal/fee/net verbatim, no mistaken FX-variance leg");
+      buyRound.lines.every((l) => l.accountId !== "5010"),
+      "rounding: BUY debits investment by the net (20.00), no separate fee leg");
   }
   // SELL with gain: proceeds 100.00 vs basis 70.00 + gain 30.00 @ 1.2345 ->
   // debit THB 123.45 vs credit 86.42 + 37.04 = 123.46 -> DEBIT 5020 0.01.
@@ -720,8 +716,8 @@ async function main() {
       sellRound.lines.some((l) => l.accountId === "4020" && l.side === "CREDIT" && l.amount === "30.00"),
       "rounding: SELL DEBIT 5020 0.01 (THB debit 123.45 vs credit 123.46), gain leg intact");
   }
-  // Production-shaped fixtures: BUY rows at a real statement FX (31.5700) whose
-  // per-leg THB sums reproduce the exact production rounding pairs. Each MUST
+  // Production-shaped SELL fixtures: at a real statement FX (31.5700) the
+  // proceeds leg and the basis+gain legs round to different THB cents. Each MUST
   // POST 4 legs with the exact 5020 0.01 THB leg, on the side the imbalance
   // requires, and the reported THB totals must equal the named pair verbatim.
   const thbTotals = (entry: NonNullable<ReturnType<typeof roundingFrozen>>) => {
@@ -729,26 +725,26 @@ async function main() {
     const cr = Decimal.sum(0, ...entry.lines.filter((l) => l.side === "CREDIT").map((l) => l.amountThb)).toFixed(2);
     return { dr, cr };
   };
-  const fixturesBuy: { net: string; principal: string; fee: string; dr: string; cr: string }[] = [
-    { net: "86.60", principal: "86.59", fee: "0.01", dr: "2733.97", cr: "2733.96" },
-    { net: "108.92", principal: "108.91", fee: "0.01", dr: "3438.61", cr: "3438.60" },
-    { net: "161.57", principal: "161.56", fee: "0.01", dr: "5100.77", cr: "5100.76" },
-    { net: "166.03", principal: "165.99", fee: "0.04", dr: "5241.56", cr: "5241.57" },
-    { net: "35.59", principal: "35.57", fee: "0.02", dr: "1123.57", cr: "1123.58" },
-    { net: "417.15", principal: "417.13", fee: "0.02", dr: "13169.42", cr: "13169.43" },
-    { net: "106.92", principal: "106.91", fee: "0.01", dr: "3375.47", cr: "3375.46" },
+  const fixturesSell: { net: string; basis: string; gain: string; dr: string; cr: string }[] = [
+    { net: "86.60", basis: "0.01", gain: "86.59", dr: "2733.96", cr: "2733.97" },
+    { net: "108.92", basis: "0.01", gain: "108.91", dr: "3438.60", cr: "3438.61" },
+    { net: "161.57", basis: "0.01", gain: "161.56", dr: "5100.76", cr: "5100.77" },
+    { net: "166.03", basis: "0.04", gain: "165.99", dr: "5241.57", cr: "5241.56" },
+    { net: "35.59", basis: "0.02", gain: "35.57", dr: "1123.58", cr: "1123.57" },
+    { net: "417.15", basis: "0.02", gain: "417.13", dr: "13169.43", cr: "13169.42" },
+    { net: "106.92", basis: "0.01", gain: "106.91", dr: "3375.46", cr: "3375.47" },
   ];
-  for (const f of fixturesBuy) {
-    const e = roundingFrozen(baseRow({ category: "asset", side: "BUY",
-      amountForeign: f.net, quantity: "1", unitPrice: f.principal,
-      fxRateEffective: "31.57", fxRateStatement: "31.57" }));
+  for (const f of fixturesSell) {
+    const e = roundingFrozen(baseRow({ category: "asset", side: "SELL",
+      amountForeign: f.net, costBasis: f.basis, realizedGainLoss: f.gain,
+      realizedGainLossThb: "0", fxRateEffective: "31.57", fxRateStatement: "31.57" }));
     const r = e ? roundingLeg(e) : null;
     const { dr, cr } = e ? thbTotals(e) : { dr: "", cr: "" };
     ok(!!e && e.lines.length === 4 && !!r && r.amount === "0.01" &&
       ((f.dr > f.cr && r.side === "CREDIT") || (f.dr < f.cr && r.side === "DEBIT")) &&
-      e.lines.some((l) => l.accountId === "1110" && l.side === "DEBIT" && l.amount === f.principal) &&
-      e.lines.some((l) => l.accountId === "5010" && l.side === "DEBIT" && l.amount === f.fee) &&
-      e.lines.some((l) => l.accountId === "1020" && l.side === "CREDIT" && l.amount === f.net),
+      e.lines.some((l) => l.accountId === "1020" && l.side === "DEBIT" && l.amount === f.net) &&
+      e.lines.some((l) => l.accountId === "1110" && l.side === "CREDIT" && l.amount === f.basis) &&
+      e.lines.some((l) => l.accountId === "4020" && l.side === "CREDIT" && l.amount === f.gain),
       `rounding fixture ${f.dr}/${f.cr} (net ${f.net}) posts 4 legs with exact 5020 0.01 ${f.dr > f.cr ? "CREDIT" : "DEBIT"}`);
     ok(dr === cr && dr === (f.dr > f.cr ? f.dr : f.cr),
       `rounding fixture ${f.dr}/${f.cr} balances THB after the leg (dr ${dr} = cr ${cr})`);
@@ -1093,10 +1089,11 @@ async function main() {
     "buildStatementPostings entries carry trade detail"
   );
 
-  // ---- R4 FEES: principal/fee split, no double count, rebate, liquidation. ----
-  console.log("=== R4 FEES (principal + fee split, no double count) ===");
+  // ---- R4 FEES: acquisition-cost (fees-included) asset debit, no double count. ----
+  console.log("=== R4 FEES (acquisition cost incl. fees, no double count) ===");
 
-  // A) BUY with fee: 3 legs — principal to asset, fee to expense, net to cash.
+  // A) BUY with fee: 2 legs — acquisition cost (net) to asset, net to cash.
+  //    Fees are part of the asset cost, NOT a separate expense.
   const buyWithFee = postCapitalRow(
     baseRow({
       transactionId: "tx-buy-fee",
@@ -1111,18 +1108,18 @@ async function main() {
       netAmount: "1011.00",
     })
   );
-  ok(buyWithFee.ok && buyWithFee.entry.lines.length === 3, "R4-A: BUY with fee posts 3 legs");
+  ok(buyWithFee.ok && buyWithFee.entry.lines.length === 2, "R4-A: BUY with fee posts 2 legs");
   if (buyWithFee.ok) {
     const investLeg = buyWithFee.entry.lines.find((l) => l.accountId === "1110");
     const feeLeg = buyWithFee.entry.lines.find((l) => l.accountId === "5010");
     const cashLeg = buyWithFee.entry.lines.find((l) => l.accountId === "1020");
     ok(
-      !!investLeg && investLeg.debit === "1000.00" && investLeg.credit == null,
-      "R4-A: investment debited by PRINCIPAL (1000, fees excluded)"
+      !!investLeg && investLeg.debit === "1011.00" && investLeg.credit == null,
+      "R4-A: investment debited by the ACQUISITION COST (1011, fees INCLUDED)"
     );
     ok(
-      !!feeLeg && feeLeg.debit === "11.00" && feeLeg.credit == null,
-      "R4-A: fee expensed once (Dr 5010 11.00)"
+      feeLeg === undefined,
+      "R4-A: fee is NOT expensed separately (5010 absent — fees are inside the asset cost)"
     );
     ok(
       !!cashLeg && cashLeg.credit === "1011.00" && cashLeg.debit == null,
@@ -1165,7 +1162,9 @@ async function main() {
     );
   }
 
-  // C) BUY with rebate (negative fee → credit to 5010, not a debit).
+  // C) BUY with a broker rebate (negative fee): the authoritative acquisition
+  //    cost is the broker NET (995), so the asset is debited by the net actually
+  //    paid and no separate 5010 contra-expense leg is emitted.
   const buyRebate = postCapitalRow(
     baseRow({
       transactionId: "tx-buy-rebate",
@@ -1180,22 +1179,22 @@ async function main() {
       netAmount: "995.00",
     })
   );
-  ok(buyRebate.ok && buyRebate.entry.lines.length === 3, "R4-C: BUY with rebate posts 3 legs");
+  ok(buyRebate.ok && buyRebate.entry.lines.length === 2, "R4-C: BUY with rebate posts 2 legs");
   if (buyRebate.ok) {
     const investLeg = buyRebate.entry.lines.find((l) => l.accountId === "1110");
     const feeLeg = buyRebate.entry.lines.find((l) => l.accountId === "5010");
     const cashLeg = buyRebate.entry.lines.find((l) => l.accountId === "1020");
     ok(
-      !!investLeg && investLeg.debit === "1000.00",
-      "R4-C: investment debited by principal (1000), not by net (995)"
+      !!investLeg && investLeg.debit === "995.00",
+      "R4-C: investment debited by the net acquisition cost (995), not by gross (1000)"
     );
     ok(
-      !!feeLeg && feeLeg.debit == null && feeLeg.credit === "5.00",
-      "R4-C: rebate is a CREDIT to 5010 (contra-expense), sign preserved"
+      feeLeg === undefined,
+      "R4-C: rebate produces no separate 5010 leg (already inside the asset cost)"
     );
     ok(
       !!cashLeg && cashLeg.credit === "995.00",
-      "R4-C: cash = net = principal minus rebate"
+      "R4-C: cash = net = gross minus rebate"
     );
   }
 
@@ -1210,8 +1209,8 @@ async function main() {
     })
   );
   ok(
-    !monthlyFee.ok && monthlyFee.reason.includes("already in the trade postings"),
-    "R4-D: monthly brokerage-fee summary row not posted (fees already in trade postings)"
+    !monthlyFee.ok && monthlyFee.reason.includes("already inside the BUY acquisition cost"),
+    "R4-D: monthly brokerage-fee summary row not posted (fees already in the trade postings)"
   );
   const monthlyVat = postCapitalRow(
     baseRow({
@@ -1223,8 +1222,8 @@ async function main() {
     })
   );
   ok(
-    !monthlyVat.ok && monthlyVat.reason.includes("already in the trade postings"),
-    "R4-D: monthly VAT summary row not posted (fees already in trade postings)"
+    !monthlyVat.ok && monthlyVat.reason.includes("already inside the BUY acquisition cost"),
+    "R4-D: monthly VAT summary row not posted (fees already in the trade postings)"
   );
 
   // E) WHT rows (different section from fee/VAT): still posted normally.
@@ -1243,7 +1242,7 @@ async function main() {
   );
 
   // F) buildStatementJournalEntries: BUY + monthly rows → 3 journal entries
-  //    (BUY POSTED with 3 lines, fee-row SKIPPED with 0 lines, WHT POSTED).
+  //    (BUY POSTED with 2 lines, fee-row SKIPPED with 0 lines, WHT POSTED).
   const r4JournalRows = [
     baseRow({
       transactionId: "tx-r4-buy",
@@ -1275,8 +1274,8 @@ async function main() {
   ok(r4Entries.length === 3, "R4-F: one journal entry per row (BUY + fee summary + WHT)");
   const r4BuyEntry = r4Entries.find((e) => e.transactionId === "tx-r4-buy");
   ok(
-    !!r4BuyEntry && r4BuyEntry.postingState === "POSTED" && r4BuyEntry.entry.lines.length === 3,
-    "R4-F: BUY entry POSTED with 3 lines"
+    !!r4BuyEntry && r4BuyEntry.postingState === "POSTED" && r4BuyEntry.entry.lines.length === 2,
+    "R4-F: BUY entry POSTED with 2 lines (acquisition cost incl. fees)"
   );
   const r4FeeEntry = r4Entries.find((e) => e.transactionId === "tx-r4-fee");
   ok(
@@ -1315,8 +1314,10 @@ async function main() {
     "R4-Fb: standalone rebate -3.50 is journal-built and POSTED (Dr 1020 3.50 / Cr 5010 3.50, validateJournalEntry-safe)"
   );
 
-  // G) Liquidation lifecycle: BUY 10@100 (fee 11) → full SELL 10@120 (fee 11).
-  //    Investment dr 1000 / cr 1000 → zero; cash net +178; fee expensed once.
+  // G) Liquidation lifecycle: BUY 10@100 (fee 11, acquisition cost 1011) →
+  //    full SELL 10@120 (fee 11, net 1189). Investment dr 1011 / cr 1011 → zero;
+  //    cash net +178; no fee expensed (BUY fees inside the asset cost, SELL fees
+  //    inside the net proceeds).
   const lifeBuy = buildStatementJournalEntries([
     baseRow({
       transactionId: "tx-life-buy",
@@ -1344,9 +1345,9 @@ async function main() {
       amountForeign: "1189.00",
       netAmount: "1189.00",
       proceeds: "1189.00",
-      costBasis: "1000.00",
-      realizedGainLoss: "189.00",
-      realizedGainLossThb: "5670.00",
+      costBasis: "1011.00",
+      realizedGainLoss: "178.00",
+      realizedGainLossThb: "6304.76",
     }),
   ]);
   ok(lifeBuy.length === 1 && lifeSell.length === 1, "R4-G: lifecycle BUY + SELL each produce one entry");
@@ -1354,22 +1355,22 @@ async function main() {
     ok(lifeBuy[0].postingState === "POSTED" && lifeSell[0].postingState === "POSTED", "R4-G: both lifecycle entries POSTED");
     const bLines = lifeBuy[0].entry.lines;
     const sLines = lifeSell[0].entry.lines;
-    // Investment: Dr 1000 (BUY) / Cr 1000 (SELL) → net 0 (fully liquidated).
+    // Investment: Dr 1011 (BUY) / Cr 1011 (SELL) → net 0 (fully liquidated).
     const investDr = bLines
       .filter((l) => l.accountId === "1110" && l.debit != null)
       .reduce((s, l) => s + Number(l.debit), 0);
     const investCr = sLines
       .filter((l) => l.accountId === "1110" && l.credit != null)
       .reduce((s, l) => s + Number(l.credit), 0);
-    ok(investDr === 1000 && investCr === 1000, "R4-G: full liquidation drains investment to zero (1000 dr / 1000 cr)");
-    // Fee expense: only the BUY fee (11); SELL fees are netted in proceeds.
+    ok(investDr === 1011 && investCr === 1011, "R4-G: full liquidation drains investment to zero (1011 dr / 1011 cr)");
+    // No fee expense: BUY fees are inside the asset cost, SELL fees inside net.
     const feeDrTotal = bLines
       .filter((l) => l.accountId === "5010" && l.debit != null)
       .reduce((s, l) => s + Number(l.debit), 0);
     const feeCrInSell = sLines
       .filter((l) => l.accountId === "5010" && l.credit != null)
       .reduce((s, l) => s + Number(l.credit), 0);
-    ok(feeDrTotal === 11 && feeCrInSell === 0, "R4-G: fee expense total = 11 (BUY fee only, SELL fees netted)");
+    ok(feeDrTotal === 0 && feeCrInSell === 0, "R4-G: no 5010 fee lines (fees inside acquisition cost / net proceeds)");
     // Cash: -1011 (paid) / +1189 (received) → net +178.
     const cashCr = bLines
       .filter((l) => l.accountId === "1020" && l.credit != null)
@@ -1378,11 +1379,11 @@ async function main() {
       .filter((l) => l.accountId === "1020" && l.debit != null)
       .reduce((s, l) => s + Number(l.debit), 0);
     ok(cashDr - cashCr === 178, "R4-G: cash net +178 (1189 received − 1011 paid)");
-    // Gain: Cr 189 = net proceeds (1189) − basis (1000), SELL fee NOT subtracted again.
+    // Gain: Cr 178 = net proceeds (1189) − acquisition-cost basis (1011).
     const gainCr = sLines
       .filter((l) => l.accountId === "4020" && l.credit != null)
       .reduce((s, l) => s + Number(l.credit), 0);
-    ok(gainCr === 189, "R4-G: realized gain 189 = net proceeds 1189 − basis 1000 (SELL fee already in net)");
+    ok(gainCr === 178, "R4-G: realized gain 178 = net proceeds 1189 − basis 1011 (SELL fee already in net)");
   }
 
   // H) THB trade: asserted at PARSER/PIPELINE currency separation, NOT posting.
@@ -1422,7 +1423,7 @@ async function main() {
     "R4-H: THB row amount_thb === amount_foreign (THB = 1, no invented conversion)"
   );
 
-  // ---- R4 GAP-1: BUY without a parseable principal is SKIPPED (never capitalized). ----
+  // ---- R4 GAP-1: BUY with authoritative net can post without trade detail. ----
   const buyMissingPrincipal = postCapitalRow(
     baseRow({
       transactionId: "tx-buy-noprincipal",
@@ -1437,9 +1438,10 @@ async function main() {
     })
   );
   ok(
-    !buyMissingPrincipal.ok &&
-      buyMissingPrincipal.reason.includes("quantity x unitPrice"),
-    "R4-G1: BUY without qty x unitPrice is SKIPPED (net NOT capitalized as asset)"
+    buyMissingPrincipal.ok && buyMissingPrincipal.entry.lines.length === 2 &&
+      buyMissingPrincipal.entry.lines.some((l) => l.accountId === "1110" && l.debit === "1211.00") &&
+      buyMissingPrincipal.entry.lines.some((l) => l.accountId === "1020" && l.credit === "1211.00"),
+    "R4-G1: BUY with authoritative net posts a two-leg acquisition-cost transfer"
   );
 
   // ---- R4 GAP-2: provenace flag drives the monthly-row skip; the same section
@@ -1572,7 +1574,7 @@ async function main() {
   // ---- R4 GAP-3 + GAP-5: REAL parser -> pipeline -> posting regression.
   //      A statement mixing USD + THB trades must emit ONE fee row + ONE VAT row
   //      PER CURRENCY (never a cross-currency sum), and the posting engine must
-  //      derive the BUY principal from qty x unitPrice and skip the monthly rows. ----
+  //      use broker Net Amount as acquisition cost and skip the monthly rows. ----
   const mixedText = [
     "TRADE RECORDS",
     "Currency: USD",
@@ -1623,11 +1625,11 @@ async function main() {
   const mBuyThbEntry = mMixedEntries.find((e) => e.transactionId === mBuyThb?.transactionId);
   ok(
     mBuyUsdEntry?.postingState === "POSTED" &&
-      mBuyUsdEntry.entry.lines.length === 3 &&
-      mBuyUsdEntry.entry.lines.find((l) => l.accountId === "1110" && l.debit === "1000.00") !== undefined &&
-      mBuyUsdEntry.entry.lines.find((l) => l.accountId === "5010" && l.debit === "1.00") !== undefined &&
+      mBuyUsdEntry.entry.lines.length === 2 &&
+      mBuyUsdEntry.entry.lines.find((l) => l.accountId === "1110" && l.debit === "1001.00") !== undefined &&
+      !mBuyUsdEntry.entry.lines.some((l) => l.accountId === "5010") &&
       mBuyUsdEntry.entry.lines.find((l) => l.accountId === "1020" && l.credit === "1001.00") !== undefined,
-    "R4-G3: USD BUY posts principal 1000 / fee 1 / cash 1001 (principal = qty x price)"
+    "R4-G3: USD BUY posts fee-inclusive acquisition cost 1001 once (no 5010 double count)"
   );
   ok(
     mBuyThbEntry !== undefined,

@@ -38,7 +38,7 @@ export interface ExtractedTransaction {
   side?: "BUY" | "SELL";
   quantity?: number; // จำนวนหุ้น/หน่วย
   unitPrice?: number; // ราคาต่อหน่วย สกุลเงินเดียวกับ currency
-  grossAmount?: number; // unitPrice * quantity (เงินต้นของรายการซื้อขาย)
+  grossAmount?: number; // broker Gross Amount, preserved verbatim from the statement
   fees?: number; // commission + VAT ของรายการซื้อขายนี้
   proceeds?: number; // ยอดขายรวม gross (เฉพาะ SELL)
   costBasis?: number; // ต้นทุนรวมของหุ้นที่ขาย = avgCost * quantity (เฉพาะ SELL)
@@ -65,6 +65,7 @@ export interface ExtractedTransaction {
 // ใช้คณิตศาสตร์ Webull Average Cost เดียวกันทั้งหมด
 import {
   applyAverageCostTrade,
+  buyAcquisitionCost,
   type CostBasisMap,
   type CostBasisPosition,
 } from "./cost-basis-engine";
@@ -256,7 +257,7 @@ interface RawTradeEvent {
   description: string;
   currency: string;
   fees: number; // signed commission + VAT for this trade (may be a negative rebate)
-  gross: number; // gross = unit price * quantity
+  gross: number; // broker Gross Amount, printed VERBATIM (may differ from unit price * quantity)
   exchange: string;
 }
 
@@ -475,9 +476,6 @@ export function parseStatementRows(
 
     let buffer: string[] = [];
     let headerSeen = false;
-    let dividendWhtTotal = 0;
-    let dividendWhtCurrency = "USD";
-    let lastDividendDate = "";
 
     for (const line of dividendLines) {
       if (!headerSeen) {
@@ -498,10 +496,6 @@ export function parseStatementRows(
             .trim();
           const gross = toNumber(grossAmt);
           const wht = toNumber(whtAmt);
-
-          dividendWhtTotal += wht;
-          dividendWhtCurrency = currency;
-          lastDividendDate = date;
 
           // จับคู่ชื่อกองทุนในคำอธิบายกับสัญลักษณ์หุ้นที่รู้จัก (จาก Portfolio Summary / Trade Records)
           // เพื่อแยกเงินปันผลตามสัญลักษณ์ (เหมือน income:dividends:<symbol> ที่อาจารย์สอน)
@@ -530,28 +524,33 @@ export function parseStatementRows(
             section,
             included: true,
           });
+
+          // ภาษีหัก ณ ที่จ่ายของเงินปันผล: ออกเป็นค่าใช้จ่าย "รายบรรทัด" ตามวันที่
+          // Posting Date จริงของเงินปันผลต้นทาง (ห้ามรวมข้ามวัน) และกลับเครื่องหมาย
+          // ให้เป็นค่าบวก (ยอดในเอกสารเป็นค่าลบ = เงินออก) เพื่อให้ลงบัญชี
+          // Dr ภาษีหัก ณ ที่จ่าย / Cr เงินสด ได้ถูกต้อง
+          if (wht !== 0) {
+            results.push({
+              id: nextId(),
+              date,
+              description: matchedSymbol
+                ? `ภาษีหัก ณ ที่จ่าย - เงินปันผล · ${matchedSymbol}`
+                : "ภาษีหัก ณ ที่จ่าย - เงินปันผล",
+              subLabel: "ภาษีหัก ณ ที่จ่ายเงินปันผล",
+              currency,
+              amount: Math.abs(wht),
+              category: "expense",
+              pnlAmount: Math.abs(wht),
+              rate: baseRates[currency] ?? "-",
+              section: "ภาษีหัก ณ ที่จ่าย (ปันผล)",
+              included: true,
+            });
+          }
         }
         buffer = [];
       } else {
         buffer.push(line);
       }
-    }
-
-    // ภาษีหัก ณ ที่จ่ายจากเงินปันผลทั้งเดือน รวมเป็นค่าใช้จ่าย 1 บรรทัด (แยกจากภาษีหัก ณ ที่จ่ายดอกเบี้ยด้านล่าง)
-    if (dividendWhtTotal !== 0) {
-      results.push({
-        id: nextId(),
-        date: lastDividendDate,
-        description: "ภาษีหัก ณ ที่จ่าย - เงินปันผล (รวมทั้งเดือน)",
-        subLabel: "ภาษีหัก ณ ที่จ่ายเงินปันผล",
-        currency: dividendWhtCurrency,
-        amount: dividendWhtTotal,
-        category: "expense",
-        pnlAmount: dividendWhtTotal,
-        rate: baseRates[dividendWhtCurrency] ?? "-",
-        section: "ภาษีหัก ณ ที่จ่าย (ปันผล)",
-        included: true,
-      });
     }
   }
 
@@ -565,7 +564,11 @@ export function parseStatementRows(
     const rowPattern = /^(\d{2}\/\d{2}\/\d{4})\s+(.+?)\s+([A-Z]{3})\s+(-?[\d,]+\.\d{2})$/gm;
     for (const m of block.matchAll(rowPattern)) {
       const [, date, desc, currency, amountStr] = m;
-      const amount = toNumber(amountStr);
+      const signed = toNumber(amountStr);
+      // ภาษีหัก ณ ที่จ่ายดอกเบี้ย: เอกสารพิมพ์เป็นค่าลบ (เงินออก) — กลับเครื่องหมาย
+      // ให้เป็นค่าบวกเพื่อให้ลงบัญชี Dr ภาษีหัก ณ ที่จ่าย / Cr เงินสด ได้ถูกต้อง
+      // (เฉพาะแถว WHT เท่านั้น; ค่าใช้จ่าย/rebate อื่นๆ ยังคงเครื่องหมายเดิมไว้)
+      const amount = marker === "INTEREST WHT" ? Math.abs(signed) : signed;
       results.push({
         id: nextId(),
         date,
@@ -638,7 +641,7 @@ export function parseStatementRows(
         continue;
       }
 
-      const [, name, date, side, qtyStr, priceStr, , netAmt, commStr, vatStr, exchange] = m;
+      const [, name, date, side, qtyStr, priceStr, grossStr, netAmt, commStr, vatStr, exchange] = m;
       const inlineSymbol = name?.trim().split(/\s+/)[0] ?? "";
       // Prefer an inline ticker (legacy format) when present; otherwise the
       // symbol carried on its own previous line (real Webull layout). Fall back
@@ -661,7 +664,10 @@ export function parseStatementRows(
       vatTotals[currentCurrency] = (vatTotals[currentCurrency] ?? 0) + vat;
       lastTradeDate = date;
 
-      const gross = toNumber(priceStr) * toNumber(qtyStr);
+      // Broker Gross Amount column, VERBATIM. Never re-derive it as
+      // price×qty: the printed gross can differ from the displayed unit price
+      // by a cent (e.g. qty 20 @ 5.58 printed gross 111.70, not 111.60).
+      const gross = toNumber(grossStr);
 
       tradeEvents.push({
         date,
@@ -698,18 +704,30 @@ export function parseStatementRows(
     // proceeds = broker net, costBasis = avgCost*qty, realized gain/loss.
     let realizedMeta: { proceeds: number; costBasis: number; realizedGainLoss: number } | undefined;
 
-    // Webull Average Cost: BUY accumulates (price×qty, fees excluded) into the
-    // lifetime average; SELL reduces the live quantity only, keeps the average.
+    // Webull Average Cost: a BUY accumulates its AUTHORITATIVE acquisition cost
+    // (the broker Net Amount, i.e. commissions/VAT INCLUDED) into the lifetime
+    // average; a SELL reduces the live quantity only and keeps the average.
     // A SELL with no prior history falls back to this statement's own
     // PORTFOLIO SUMMARY (seed) as the "held before records" baseline.
     const seed = portfolioSummary[ev.symbol];
+    const acquisitionCost =
+      ev.side === "BUY"
+        ? buyAcquisitionCost({
+            quantity: ev.qty,
+            unitPrice: toNumber(ev.price),
+            netAmount: ev.net,
+            grossAmount: ev.gross,
+            fees: ev.fees,
+          })
+        : null;
     const { sellBasis } = applyAverageCostTrade(
       workingCostBasis,
       ev.symbol,
       ev.side,
       ev.qty,
       toNumber(ev.price),
-      seed
+      seed,
+      acquisitionCost
     );
 
     if (ev.side === "SELL" && sellBasis !== null) {

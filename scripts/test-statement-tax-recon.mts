@@ -94,6 +94,16 @@ async function main() {
   ok(usdBuy.amountThb === "3542.00", "amountThb = amount * effective rate");
   ok(usdBuy.symbol === "GLD" && usdBuy.side === "BUY", "trade detail (symbol/side) carried");
   ok(usdBuy.quantity === "10" && usdBuy.unitPrice === "50", "trade qty/unitPrice carried");
+  const grossWithAuthoritativeNet = map(
+    txn({ category: "asset", symbol: "BBAI", side: "BUY", amount: 111.70,
+      grossAmount: 111.70, netAmount: 111.82, quantity: 20, unitPrice: 5.58 })
+  );
+  ok(
+    grossWithAuthoritativeNet.amountForeign === "111.82" &&
+      Number(grossWithAuthoritativeNet.grossAmount) === 111.70 &&
+      Number(grossWithAuthoritativeNet.netAmount) === 111.82,
+    "BUY cash and acquisition cost use authoritative net while gross stays verbatim"
+  );
 
   const thbRow = map(txn({ currency: "THB", amount: 5000, rate: undefined }));
   ok(thbRow.fxRateStatement === "1" && thbRow.fxRateEffective === "1" && thbRow.fxRateBot === null,
@@ -421,7 +431,8 @@ async function main() {
   // ---- Gain/loss backfill: heal FROZEN SELL rows (out-of-order imports) ----
   const bfRow = (
     overrides: Partial<GainLossBackfillRow>
-  ): GainLossBackfillRow => ({
+  ): GainLossBackfillRow => {
+    const row: GainLossBackfillRow = {
     transactionId: overrides.transactionId ?? "bf",
     sourceType: "AI_PARSED",
     transactionDate: "2026-02-05",
@@ -435,8 +446,23 @@ async function main() {
     currency: "USD",
     fxRateEffective: "35.42",
     realizedGainLossThb: null,
-    ...overrides,
-  });
+      ...overrides,
+    };
+    // BUY fixtures without explicit broker totals model a fee-free trade at
+    // quantity * unit price. Fee-inclusive cases provide gross/net explicitly.
+    if (
+      overrides.grossAmount === undefined &&
+      row.side === "BUY" &&
+      row.quantity !== null &&
+      row.unitPrice !== null
+    ) {
+      row.grossAmount = String(Number(row.quantity) * Number(row.unitPrice));
+    }
+    if (overrides.netAmount === undefined && row.side === "BUY" && row.grossAmount !== null) {
+      row.netAmount = row.grossAmount;
+    }
+    return row;
+  };
 
   const bfFrozen = computeGainLossBackfill([
     bfRow({
@@ -462,16 +488,16 @@ async function main() {
   ok(bfFrozen.stats.filled === 1, "backfill fills ONE frozen SELL (BUY was imported later)");
   const aaa = bfFrozen.updates.find((u) => u.transactionId === "sellFrozen");
   ok(
-    aaa?.update.costBasis === "100.00" && aaa?.update.proceeds === "290.00",
-    "backfill cost basis = avg 20 * 5 = 100; proceeds reconstructed from gross 300 - fees 10 (no stored net)"
+    aaa?.update.costBasis === "99.50" && aaa?.update.proceeds === "290.00",
+    "backfill cost basis = fee-inclusive avg 19.90 * 5 = 99.50; proceeds reconstructed from gross 300 - fees 10"
   );
   ok(
-    aaa?.update.realizedGainLoss === "190.00",
-    "backfill realized gain = net 290 - basis 100 = 190"
+    aaa?.update.realizedGainLoss === "190.50",
+    "backfill realized gain = net 290 - fee-inclusive basis 99.50 = 190.50"
   );
   ok(
-    aaa?.update.realizedGainLossThb === "6729.80",
-    "backfill THB gain = 190 * stored fx_rate_effective 35.42 (never an invented rate)"
+    aaa?.update.realizedGainLossThb === "6747.51",
+    "backfill THB gain = 190.50 * stored fx_rate_effective 35.42 (never an invented rate)"
   );
 
   const bfStoredNet = computeGainLossBackfill([
@@ -809,6 +835,8 @@ async function main() {
       transactionDate: "2026-01-01",
       quantity: "100",
       unitPrice: "10",
+      grossAmount: "1000",
+      netAmount: "1000",
     }),
     bfRow({
       transactionId: "b2",
@@ -817,6 +845,8 @@ async function main() {
       transactionDate: "2026-02-01",
       quantity: "100",
       unitPrice: "20",
+      grossAmount: "2000",
+      netAmount: "2000",
     }),
     bfRow({
       transactionId: "sOldMethod",

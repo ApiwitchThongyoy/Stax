@@ -9,6 +9,7 @@ import { capitalTransactions, corporateActions, costBasisState } from "../db/sch
 import { applyCorporateAction, type CorporateActionInput } from "./corporate-action";
 import {
   applyAverageCostTrade,
+  buyAcquisitionCost,
   type CostBasisMap,
   type CostBasisPosition,
 } from "./cost-basis-engine";
@@ -75,6 +76,13 @@ function parseRate(rate: string | undefined): number | null {
   const num = parseFloat(rate.replace(/,/g, ""));
   if (Number.isNaN(num) || num <= 0) return null;
   return num;
+}
+
+/** Parse a nullable numeric DB string into a finite number (else null). */
+function numOrNull(value: string | null | undefined): number | null {
+  if (value == null || value.trim() === "") return null;
+  const num = parseFloat(value);
+  return Number.isFinite(num) ? num : null;
 }
 
 /**
@@ -155,8 +163,16 @@ export function mapToCapitalRow(
   // (Dr cash / Cr fee) instead of a phoney extra fee. Non-expense rows keep the
   // historical positive-magnitude convention (equity deposit/withdrawal sign
   // is captured by `type`, only the magnitude is persisted).
+  // Trade cash is the broker's authoritative Net Amount when present. The
+  // parser already puts that value in `amount`, but preview/replay callers may
+  // provide gross `amount` alongside an explicit net field, so normalize it at
+  // this boundary rather than letting a gross value reach the journal.
+  const tradeAmount =
+    t.side !== undefined && t.netAmount !== undefined && Number.isFinite(t.netAmount)
+      ? t.netAmount
+      : t.amount;
   const amountForeign =
-    t.category === "expense" ? t.amount : Math.abs(t.amount);
+    t.category === "expense" ? t.amount : Math.abs(tradeAmount);
   const amountThb =
     fxRateEffective !== null ? moneyInThb(amountForeign, fxRateEffective) : null;
 
@@ -508,6 +524,12 @@ export interface CostBasisReplayRow {
   side: string | null;
   quantity: string | null;
   unitPrice: string | null;
+  /** Broker Gross Amount (verbatim) — used only to derive the acquisition cost. */
+  grossAmount?: string | null;
+  /** Signed commissions+VAT — used only to derive the acquisition cost. */
+  fees?: string | null;
+  /** Broker Net Amount (authoritative acquisition cost for a BUY). */
+  netAmount?: string | null;
   /**
    * Optional deterministic tie-break for same-date events. The persist path
    * supplies it (ORDER BY transaction_date, transaction_id) so the replay
@@ -563,10 +585,21 @@ export function recomputeCostBasisMap(
     if (!Number.isFinite(qty) || qty <= 0) continue;
     const price = r.unitPrice != null ? parseFloat(r.unitPrice) : NaN;
     if (r.side === "BUY" || r.side === "SELL") {
-      // Webull Average Cost replay — identical math to the parser (BUY
-      // accumulates price×qty, SELL only reduces the live quantity; a fully
-      // drained position is dropped so the next statement re-seeds).
-      applyAverageCostTrade(map, r.symbol, r.side, qty, price);
+      // Webull Average Cost replay — identical math to the parser (a BUY
+      // accumulates its authoritative acquisition cost, a SELL only reduces the
+      // live quantity; a fully drained position is dropped so the next
+      // statement re-seeds).
+      const acquisitionCost =
+        r.side === "BUY"
+          ? buyAcquisitionCost({
+              quantity: qty,
+              unitPrice: price,
+              netAmount: numOrNull(r.netAmount),
+              grossAmount: numOrNull(r.grossAmount),
+              fees: numOrNull(r.fees),
+            })
+          : null;
+      applyAverageCostTrade(map, r.symbol, r.side, qty, price, undefined, acquisitionCost);
     }
   }
   return map;
@@ -590,6 +623,9 @@ export async function rebuildCostBasisStateFromLedger(
       side: capitalTransactions.side,
       quantity: capitalTransactions.quantity,
       unitPrice: capitalTransactions.unitPrice,
+      grossAmount: capitalTransactions.grossAmount,
+      fees: capitalTransactions.fees,
+      netAmount: capitalTransactions.netAmount,
     })
     .from(capitalTransactions)
     .where(eq(capitalTransactions.userId, userId))
@@ -767,8 +803,15 @@ export function computeGainLossBackfill(
     if (r.side === "BUY") {
       if (!qtyOk) continue;
       const price = r.unitPrice != null ? parseFloat(r.unitPrice) : NaN;
-      if (!Number.isFinite(price) || price <= 0) continue;
-      applyAverageCostTrade(map, r.symbol, "BUY", qty, price);
+      const acquisitionCost = buyAcquisitionCost({
+        quantity: qty,
+        unitPrice: price,
+        netAmount: numOrNull(r.netAmount),
+        grossAmount: numOrNull(r.grossAmount),
+        fees: numOrNull(r.fees),
+      });
+      if (acquisitionCost == null) continue;
+      applyAverageCostTrade(map, r.symbol, "BUY", qty, price, undefined, acquisitionCost);
       continue;
     }
 
@@ -943,8 +986,15 @@ export function recomputeAllGainLoss(
     if (r.side === "BUY") {
       if (!qtyOk) continue;
       const price = r.unitPrice != null ? parseFloat(r.unitPrice) : NaN;
-      if (!Number.isFinite(price) || price <= 0) continue;
-      applyAverageCostTrade(map, r.symbol, "BUY", qty, price);
+      const acquisitionCost = buyAcquisitionCost({
+        quantity: qty,
+        unitPrice: price,
+        netAmount: numOrNull(r.netAmount),
+        grossAmount: numOrNull(r.grossAmount),
+        fees: numOrNull(r.fees),
+      });
+      if (acquisitionCost == null) continue;
+      applyAverageCostTrade(map, r.symbol, "BUY", qty, price, undefined, acquisitionCost);
       continue;
     }
 

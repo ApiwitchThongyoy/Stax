@@ -218,10 +218,55 @@ function main() {
   const f8Buy = trade(f8.transactions, "BUY", "GOOG");
   ok(f8Buy !== undefined && approx(f8Buy.quantity ?? NaN, 0.04436) && approx(f8Buy.unitPrice ?? NaN, 338.11),
     "f8: fractional qty BUY parsed (GOOG 0.04436 @ 338.11)");
-  ok(f8Buy !== undefined && approx(f8Buy.grossAmount ?? NaN, 0.04436 * 338.11, 0.01),
-    "f8: grossAmount computed from qty*price (not text gross, which may round)");
+  ok(f8Buy !== undefined && f8Buy.grossAmount === 15,
+    "f8: broker Gross Amount is preserved verbatim (15.00, not qty*price)");
   ok(f8Buy !== undefined && f8Buy.netAmount === 15,
     "f8: broker-rounded net 15 kept authoritative");
+
+  // ---- 9. Broker Gross Amount can differ from displayed rounded price ----
+  const f9 = parse([
+    "TRADE RECORDS",
+    "Currency: USD",
+    "BBAI",
+    "10/01/2026 10:00:00,GMT+07 10/01/2026 BUY 20 5.58 111.70 111.82 0.11 0.01 NASDAQ",
+    "BULL",
+    "11/01/2026 10:00:00,GMT+07 11/01/2026 BUY 20 7.60 152.10 152.26 0.14 0.02 NASDAQ",
+    "PORTFOLIO SUMMARY",
+  ]);
+  const bbai = trade(f9.transactions, "BUY", "BBAI");
+  const bull = trade(f9.transactions, "BUY", "BULL");
+  ok(bbai?.grossAmount === 111.70 && bbai.netAmount === 111.82,
+    "f9: BBAI preserves broker Gross 111.70 and Net 111.82");
+  ok(bull?.grossAmount === 152.10 && bull.netAmount === 152.26,
+    "f9: BULL preserves broker Gross 152.10 and Net 152.26");
+  ok(f9.updatedCostBasis.BBAI?.cumCost === 111.82 && f9.updatedCostBasis.BULL?.cumCost === 152.26,
+    "f9: BUY cost basis accumulates authoritative Net, not displayed price*qty");
+
+  // ---- 10. Dividend and interest withholding stay on their source dates ----
+  const f10 = parse([
+    "DIVIDENDS",
+    "Posting Date Description Currency Gross Amount Withholding Net Amount",
+    "05/01/2026 Fund Cash Div",
+    "USD 5.12 -0.77 4.35",
+    "09/01/2026 Fund Cash Div",
+    "USD 6.37 -0.96 5.41",
+    "INTEREST",
+    "05/01/2026 Interest USD 0.37",
+    "INTEREST WHT",
+    "05/01/2026 Interest WHT USD -0.06",
+    "NOTES",
+  ]);
+  const dividendWht = f10.transactions.filter((t) => t.section === "ภาษีหัก ณ ที่จ่าย (ปันผล)");
+  const interest = f10.transactions.find((t) => t.section === "ดอกเบี้ย");
+  const interestWht = f10.transactions.find((t) => t.section === "ภาษีหัก ณ ที่จ่าย (ดอกเบี้ย)");
+  ok(dividendWht.length === 2 && dividendWht.every((t) => t.category === "expense" && t.amount > 0),
+    "f10: each dividend WHT is a positive expense row");
+  ok(dividendWht.map((t) => t.date).sort().join(",") === "05/01/2026,09/01/2026" &&
+      dividendWht.reduce((sum, t) => sum + t.amount, 0) === 1.73,
+    "f10: dividend WHT stays on source dates with cumulative 1.73 after 09/01");
+  ok(interest?.amount === 0.37 && interestWht?.amount === 0.06 &&
+      interestWht?.date === "05/01/2026",
+    "f10: interest gross and WHT are separate positive-dated rows");
 
   console.log(`\n================ SUMMARY ================`);
   console.log(`PASS: ${passed}   FAIL: ${failed}`);
