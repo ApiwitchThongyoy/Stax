@@ -18,6 +18,7 @@
 // Server-authoritative: the route computes these once, React renders verbatim.
 import {
   applyAverageCostTrade,
+  buyAcquisitionCost,
   type CostBasisMap,
 } from "./cost-basis-engine";
 import { applyCorporateAction, type CorporateActionInput } from "./corporate-action";
@@ -177,8 +178,17 @@ export function buildTradingJournalEntries(
       avgCostAtTime = pos && pos.cumQuantity > 0 ? pos.avgCost : null;
       const price = toNum(r.unitPrice);
       if (qty !== null && qty > 0) {
-        if (journalSide === "BUY" && price !== null && price > 0) {
-          applyAverageCostTrade(map, symbol, "BUY", qty, price);
+        if (journalSide === "BUY") {
+          const acquisitionCost = buyAcquisitionCost({
+            quantity: qty,
+            unitPrice: price,
+            netAmount: toNum(r.netAmount),
+            grossAmount: toNum(r.grossAmount),
+            fees: toNum(r.fees),
+          });
+          if (acquisitionCost !== null) {
+            applyAverageCostTrade(map, symbol, "BUY", qty, price ?? 0, undefined, acquisitionCost);
+          }
         } else if (journalSide === "SELL") {
           applyAverageCostTrade(map, symbol, "SELL", qty, price ?? 0);
         }

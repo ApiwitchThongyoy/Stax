@@ -3,8 +3,9 @@
 // Switches every existing user's cost basis (and all AI_PARSED SELL realized
 // gain/loss — which drives the tax base and the general ledger) from the old
 // "remaining-qty running average" to the Webull "Average Cost" method:
-//   avg = cumulative price×qty of ALL BUYs / cumulative BUY quantity
-//   (SELL reduces live quantity only; fees excluded; reset on full liquidation)
+//   avg = cumulative acquisition cost of ALL BUYs / cumulative BUY quantity
+//   (acquisition cost = broker Net Amount incl. commissions/VAT;
+//    SELL reduces live quantity only; reset on full liquidation)
 //
 // What it does per user:
 //   1. Replays the full ledger + corporate actions chronologically under the

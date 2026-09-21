@@ -47,7 +47,7 @@ function ok(cond: boolean, label: string) {
 }
 
 function journalRow(partial: Partial<CapitalJournalRecord>): CapitalJournalRecord {
-  return {
+  const row: CapitalJournalRecord = {
     sourceTransactionId: "tx-1",
     userId: "user-1",
     entryDate: "2026-01-15",
@@ -83,6 +83,16 @@ function journalRow(partial: Partial<CapitalJournalRecord>): CapitalJournalRecor
     note: null,
     ...partial,
   };
+  if (partial.grossAmount === undefined && row.quantity && row.unitPrice) {
+    row.grossAmount = String(Number(row.quantity) * Number(row.unitPrice));
+  }
+  if (partial.netAmount === undefined && row.grossAmount) {
+    // These fixtures model the broker's authoritative net independently from
+    // the displayed fee field; task-specific fee-inclusive cases set netAmount
+    // explicitly.
+    row.netAmount = row.grossAmount;
+  }
+  return row;
 }
 
 async function main() {

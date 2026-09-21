@@ -14,15 +14,13 @@
 //   expense (positive) -> Dr fee/WHT expense / Cr broker-cash
 //   expense (negative, rebate) -> Dr broker-cash / Cr fee/WHT expense (contra-expense,
 //                         leg amounts positive, magnitude from the signed expense row)
-//   asset + BUY        -> Dr investments (PRINCIPAL = quantity x unitPrice via
-//                         Decimal, fees excluded, matching the avg-cost basis
-//                         so a full liquidation drains the asset to zero) / Dr
-//                         fee expense (fee = net - principal, derived; a rebate
-//                         credits the fee account) / Cr broker-cash (net, the
-//                         authoritative broker figure). If quantity x unitPrice
-//                         cannot yield a parseable positive principal the row is
-//                         SKIPPED — the net is NEVER capitalized into the asset
-//                         (that would bake fees into cost basis).
+//   asset + BUY        -> Dr investments (AUTHORITATIVE acquisition cost = the
+//                         broker Net Amount, i.e. gross + commissions/VAT — fees
+//                         INCLUDED, matching the avg-cost basis so a full
+//                         liquidation drains the asset to zero) / Cr broker-cash
+//                         (the same net). Fees are part of the asset's cost and
+//                         are NEVER expensed separately (that would double-count
+//                         them and break the running average).
 //   asset + SELL       -> Dr broker-cash (net proceeds) / Cr investments (cost basis) +
 //                         gain -> Cr gains income | loss -> Dr losses expense.
 //                         SELL FEE POLICY: realizedGainLoss = net proceeds -
@@ -38,8 +36,8 @@
 //                         unknown pre-0027 provenance) are BOTH SKIPPED with
 //                         zero lines; only FALSE (confirmed standalone fee)
 //                         posts once. TRUE rows aggregate the month's
-//                         commission/VAT — already in the per-trade postings
-//                         (BUY fee leg / SELL net proceeds), so posting again
+//                         commission/VAT — already inside the BUY acquisition
+//                         cost and the SELL net proceeds — so posting again
 //                         would double-count. NULL is UNKNOWN: the historical
 //                         row cannot be proved to be a monthly aggregate OR a
 //                         genuine standalone fee, so posting it risks
@@ -404,56 +402,32 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
   if (category === "asset") {
     if (row.side === "BUY") {
       const cash = cashAccountFor(row.currency);
-      // R4 (finalized): the investment is debited by the PRINCIPAL ONLY —
-      // quantity x unitPrice (Decimal), fees excluded — so it matches the
-      // Webull avg-cost basis and a full liquidation drains the asset to zero.
-      // The fee is recognized in the SAME entry: fee = net − principal
-      // (derived, never invented), so the entry always balances and a negative
-      // residual (broker rebate) credits the fee account instead of debiting it.
-      //
-      // Do NOT fall back to capitalizing the net amount as the asset value. That
-      // would bake the fees into the cost basis and break the running average.
-      // If quantity x unitPrice cannot be derived (missing/non-finite/non-positive),
-      // the row is NOT posted (SKIPPED): the amount stays recorded, no line is
-      // fabricated, and the caller records it as a non-computable buy.
+      // The investment is debited by the AUTHORITATIVE acquisition cost — the
+      // broker's Net Amount (gross + commissions/VAT), which is exactly what the
+      // Webull average-cost engine accumulates into the cost basis. Fees are
+      // therefore part of the asset's cost and are NOT expensed separately
+      // (posting them too would double-count them and break the running average).
+      // The entry is a plain two-leg asset transfer: Dr investments / Cr cash.
       const net = new Decimal(amount);
-      const qtyRaw = row.quantity;
-      const priceRaw = row.unitPrice;
-      const qty = qtyRaw != null && qtyRaw.trim() !== "" ? new Decimal(qtyRaw) : null;
-      const price = priceRaw != null && priceRaw.trim() !== "" ? new Decimal(priceRaw) : null;
-      const principal =
-        qty && price && qty.isFinite() && price.isFinite() && qty.gt(0) && price.gt(0)
-          ? qty.mul(price)
-          : null;
-      if (principal == null) {
+      if (!net.isFinite() || net.lte(0)) {
         return {
           ok: false,
-          reason:
-            "BUY without a parseable positive principal (quantity x unitPrice) - not posted (net would wrongly capitalize the fee)",
+          reason: "BUY without a positive authoritative acquisition cost - not posted",
         };
-      }
-      const fee = net.minus(principal);
-      const lines: JournalLineInput[] = [
-        leg(INVEST_STOCKS, "debit", principal.toFixed(2), row),
-        leg(cash, "credit", amount, row),
-      ];
-      if (!fee.isZero()) {
-        if (fee.gt(0)) {
-          lines.push(leg(FEE_EXPENSE, "debit", fee.toFixed(2), row));
-        } else {
-          lines.push(leg(FEE_EXPENSE, "credit", fee.negated().toFixed(2), row));
-        }
       }
       return {
         ok: true,
-        note: "buy (principal + fee split)",
+        note: "buy (acquisition cost incl. fees)",
         entry: {
           entryDate: row.transactionDate,
           description: descriptionFor(row),
           sourceType: "STATEMENT",
           sourceDocumentId: row.sourceDocumentId,
           sourceTransactionId: row.transactionId,
-          lines,
+          lines: [
+            leg(INVEST_STOCKS, "debit", amount, row),
+            leg(cash, "credit", amount, row),
+          ],
         },
       };
     }
@@ -582,8 +556,9 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
     // R4 fees: monthly fee/VAT summary rows flagged by the parser
     // (isMonthlyFeeAggregate) aggregate every trade's commission and VAT for the
     // whole month PER CURRENCY. Those fees are ALREADY in the per-trade
-    // postings (the BUY fee leg and the SELL netted proceeds), so posting the
-    // aggregate again would double-count the fee AND charge broker cash twice.
+    // postings (inside the BUY acquisition cost and the SELL netted proceeds),
+    // so posting the aggregate again would double-count the fee AND charge
+    // broker cash twice.
     // Record the row as SKIPPED — amounts preserved for the archive, never
     // posted to GL.
     //
@@ -607,7 +582,7 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
       return {
         ok: false,
         reason:
-          "monthly fee/VAT summary row - fees already in the trade postings (BUY fee leg / SELL net proceeds)",
+          "monthly fee/VAT summary row - fees already inside the BUY acquisition cost / SELL net proceeds",
       };
     }
     if (row.isMonthlyFeeAggregate == null) {

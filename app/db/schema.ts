@@ -147,7 +147,8 @@ export const capitalTransactions = pgTable(
 // Server-authoritative Webull Average-Cost cost basis per (user, symbol).
 // The deterministic statement pipeline maintains this across imports, mirroring
 // the parser's Webull Average-Cost algorithm; `cum_quantity`/`cum_cost` are the
-// lifetime accumulator (every BUY adds price×qty; SELL only reduces `quantity`)
+// lifetime accumulator (every BUY adds its acquisition cost, i.e. the broker
+// Net Amount incl. commissions/VAT; SELL only reduces `quantity`)
 // that makes `avg_cost = cum_cost / cum_quantity` and SELL realized gain/loss
 // computable. Additive-only; historical data is preserved.
 export const costBasisState = pgTable(
