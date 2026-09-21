@@ -19,6 +19,7 @@ import {
   GeminiError,
   GeminiErrorCode,
 } from "../app/lib/gemini-statement-parser";
+import { isReferenceOnlySkip } from "../app/lib/general-ledger";
 
 let passed = 0;
 let failed = 0;
@@ -858,11 +859,12 @@ ok(
   journalPage.includes("วิธีอ่านสมุดรายวัน") &&
     journalPage.includes("เดบิต") &&
     journalPage.includes("เครดิต") &&
-    journalPage.includes("ข้าม (ไม่ลงบัญชี)") &&
+    journalPage.includes("บันทึกแล้ว (รายการอ้างอิง)") &&
+    journalPage.includes("บันทึกแล้ว (ยังไม่มีคู่บัญชี)") &&
     journalPage.includes("ข้อมูลเก่า (backfilled)") &&
     !journalPage.includes("เดบิต (เขียว)") &&
     !journalPage.includes("เครดิต (แดง)"),
-  "Journal legend explains debit/credit without green/red color labels, and adds a backfilled-legacy explainer"
+  "Journal legend explains debit/credit without green/red color labels, and adds reference and unposted explainers"
 );
 ok(
   journalPage.includes("px-4 py-3 text-gray-800 font-medium text-right") &&
@@ -2383,6 +2385,73 @@ ok(
     dashboardPage.includes('? `-${t.liabilitiesThb}`') &&
     dashboardPage.includes("เครื่องหมายเจ้าของ"),
   "DashboardHomePage: liability totals render negative (owner sign) via explicit - prefix, server-sourced footnote"
+);
+
+// ---------------------------------------------------------------------------
+// STAX FINAL PROFESSOR-REQUIREMENT PASS:
+// 1. Journal status semantics: POSTED / REFERENCE-ONLY / UNPOSTED
+// 2. Remove misleading "ข้ามไม่ลงบัญชี" wording
+// 3. 5-card responsive summary (รายการทั้งหมด / ลงบัญชีแล้ว / บันทึกอ้างอิง / ยังไม่มีคู่บัญชี / กลับรายการแล้ว)
+// 4. Filter label: บันทึกแล้ว (ไม่มีคู่เดบิต/เครดิต) with value="SKIPPED"
+// 5. Search includes skipReason
+// 6. Detailed auditability
+// ---------------------------------------------------------------------------
+ok(
+  journalPage.includes("บันทึกแล้ว (รายการอ้างอิง)") &&
+    journalTab.includes("บันทึกแล้ว (รายการอ้างอิง)"),
+  "Journal renders: 'บันทึกแล้ว (รายการอ้างอิง)'"
+);
+ok(
+  journalPage.includes("บันทึกแล้ว (ยังไม่มีคู่บัญชี)") &&
+    journalTab.includes("บันทึกแล้ว (ยังไม่มีคู่บัญชี)"),
+  "Journal renders: 'บันทึกแล้ว (ยังไม่มีคู่บัญชี)'"
+);
+ok(
+  isReferenceOnlySkip("monthly fee/VAT summary row - fees already inside the BUY acquisition cost / SELL net proceeds") === true &&
+    isReferenceOnlySkip("Monthly Fee/VAT aggregate") === true &&
+    isReferenceOnlySkip("fee/vat summary") === true,
+  "monthly fee/VAT summary is classified reference-only"
+);
+ok(
+  isReferenceOnlySkip("realized gain/loss already posted via the SELL row") === true &&
+    isReferenceOnlySkip("already posted via the sell row") === true,
+  "realized gain/loss duplicate summary is classified reference-only"
+);
+ok(
+  isReferenceOnlySkip("SELL without trustworthy cost basis / realized gain - NON_COMPUTABLE, not posted") === false,
+  "real NON_COMPUTABLE SELL is NOT classified reference-only"
+);
+ok(
+  !journalPage.includes("ข้ามไม่ลงบัญชี") &&
+    !journalTab.includes("ข้ามไม่ลงบัญชี") &&
+    !journalPage.includes("ข้าม (ไม่ลงบัญชี)"),
+  "old visible reference badge 'ข้ามไม่ลงบัญชี' is gone"
+);
+ok(
+  journalPage.includes("summary.reference") &&
+    journalPage.includes("summary.unposted") &&
+    journalPage.includes("grid-cols-2 sm:grid-cols-3 lg:grid-cols-5") &&
+    journalPage.includes("บันทึกอ้างอิง") &&
+    journalPage.includes("ยังไม่มีคู่บัญชี"),
+  "reference entries are separated from unposted entries in counters"
+);
+ok(
+  journalPage.includes('entry.skipReason ?? ""') &&
+    journalTab.includes('entry.skipReason ?? ""'),
+  "search includes skipReason"
+);
+ok(
+  journalPage.includes('<option value="SKIPPED">บันทึกแล้ว (ไม่มีคู่เดบิต/เครดิต)</option>') &&
+    journalPage.includes("ทุกรายการใน Statement ถูกบันทึกครบถ้วน (รวมถึงรายการอ้างอิงที่ไม่ลงเดบิต/เครดิตซ้ำ)") &&
+    journalTab.includes("ทุกรายการใน Statement ถูกบันทึกครบถ้วน (รวมถึงรายการอ้างอิงที่ไม่ลงเดบิต/เครดิตซ้ำ)"),
+  "Journal UI presents SKIPPED filter label without 'ข้าม' and updates header copy"
+);
+ok(
+  journalPage.includes("บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ") &&
+    journalTab.includes("บันทึกครบแล้ว: ผลกระทบทางบัญชีถูกบันทึกผ่านรายการหลักแล้ว จึงไม่ลงเดบิต/เครดิตซ้ำ") &&
+    journalPage.includes("บันทึกในสมุดรายวันแล้ว:") &&
+    journalTab.includes("บันทึกในสมุดรายวันแล้ว:"),
+  "Journal renders the required reference and unposted explanation texts"
 );
 
 console.log("\n================ SUMMARY ================");

@@ -255,6 +255,45 @@ export type JournalEntryValidation =
   | { ok: false; errors: string[] };
 
 /**
+ * Classify whether a SKIPPED journal entry is an intentional reference-only row
+ * (e.g. monthly fee/VAT summary rows where fees are already inside trade costs,
+ * or duplicate realized gain/loss income rows where the SELL row already posted
+ * the gain to 4020/5120).
+ *
+ * Reference-only rows are intentional non-postings that prevent duplicate
+ * debit/credits. Genuinely unpostable rows (missing cost basis, invalid journal,
+ * missing FX, unknown category, legacy fee unknown) return false.
+ */
+export function isReferenceOnlySkip(skipReason?: string | null): boolean {
+  if (!skipReason) return false;
+  const s = skipReason.toLowerCase().trim();
+
+  // Legacy fee unknown is a genuine unposted row, NOT a confirmed reference aggregate.
+  if (s.includes("legacy fee provenance unknown")) return false;
+
+  // 1. Monthly fee/VAT summary row (confirmed accounting duplicate markers):
+  const isMonthlyFeeSummary =
+    s.includes("monthly fee/vat summary row") ||
+    s.includes("monthly fee/vat summary") ||
+    s.includes("monthly fee/vat aggregate") ||
+    s.includes("fee/vat summary row") ||
+    s.includes("fee/vat summary") ||
+    s.includes("fee/vat aggregate") ||
+    s.includes("fee and vat summary row") ||
+    s.includes("fee and vat aggregate") ||
+    s.includes("fees already in the trade postings") ||
+    s.includes("fees already inside the buy acquisition cost");
+
+  // 2. Realized gain/loss already posted via the SELL row:
+  const isRealizedGainDuplicate =
+    s.includes("realized gain/loss already posted via the sell row") ||
+    s.includes("already posted via the sell row") ||
+    s.includes("realized gain/loss already posted");
+
+  return isMonthlyFeeSummary || isRealizedGainDuplicate;
+}
+
+/**
  * Validate an entry and normalize its lines. Pure. Returns structured errors
  * instead of throwing so callers (API + posting engine) can report them in a
  * transport-safe way.
