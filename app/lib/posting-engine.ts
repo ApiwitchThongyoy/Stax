@@ -81,6 +81,7 @@ const FEE_EXPENSE = "5010";
 const FX_VARIANCE = "5020";
 const WHT_EXPENSE = "5110";
 const LOSS_EXPENSE = "5120";
+const VAT_EXPENSE = "5130";
 /** Memo stamped on the THB 5020 FX-variance leg of a non-balancing exchange. */
 export const FX_VARIANCE_MEMO = "FX conversion variance";
 
@@ -318,6 +319,9 @@ function dividendSymbolFor(row: ValidatedCapitalRow): string | null {
 
 function expenseAccountFor(row: ValidatedCapitalRow): string {
   const section = (row.section ?? "").trim().toLowerCase();
+  if (section.includes("vat") || section.includes("ภาษีมูลค่าเพิ่ม")) {
+    return VAT_EXPENSE;
+  }
   if (section.includes("ภาษี") || section.includes("wht")) {
     return WHT_EXPENSE;
   }
@@ -402,67 +406,150 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
   if (category === "asset") {
     if (row.side === "BUY") {
       const cash = cashAccountFor(row.currency);
-      // The investment is debited by the AUTHORITATIVE acquisition cost — the
-      // broker's Net Amount (gross + commissions/VAT), which is exactly what the
-      // Webull average-cost engine accumulates into the cost basis. Fees are
-      // therefore part of the asset's cost and are NOT expensed separately
-      // (posting them too would double-count them and break the running average).
-      // The entry is a plain two-leg asset transfer: Dr investments / Cr cash.
-      const net = new Decimal(amount);
-      if (!net.isFinite() || net.lte(0)) {
+      const totalCash = new Decimal(amount);
+      if (!totalCash.isFinite() || totalCash.lte(0)) {
         return {
           ok: false,
           reason: "BUY without a positive authoritative acquisition cost - not posted",
         };
       }
+
+      // Determine gross amount and fees
+      let gross = row.grossAmount ? new Decimal(row.grossAmount) : null;
+      if (!gross && row.quantity && row.unitPrice) {
+        gross = new Decimal(row.quantity).mul(new Decimal(row.unitPrice));
+      }
+
+      let comm = new Decimal(0);
+      let vat = new Decimal(0);
+      if (row.fees != null) {
+        const feesDec = new Decimal(row.fees);
+        // If the customer paid less than gross, the negative fee is a genuine rebate (no VAT).
+        const isRebate = gross != null ? totalCash.lt(gross) : feesDec.lt(0) && row.grossAmount == null;
+        if (isRebate) {
+          // Genuine rebate: reduces acquisition cost directly, no VAT
+          comm = feesDec;
+        } else {
+          // Broker fee charged (whether stored with positive or negative sign): separate VAT and capitalize commission
+          const feeMag = feesDec.abs();
+          if (feeMag.gt(0)) {
+            comm = feeMag.div(1.07).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+            vat = feeMag.minus(comm);
+            if (vat.lt(0)) vat = new Decimal(0);
+          }
+        }
+      }
+
+      // Acquisition cost = totalCash - vat (capitalizes gross + commission into 1110; VAT separated into 5130)
+      const acqCost = totalCash.minus(vat);
+
+      const lines: JournalLineInput[] = [
+        leg(INVEST_STOCKS, "debit", acqCost.toFixed(2), row),
+      ];
+      if (vat.gt(0)) {
+        lines.push(leg(VAT_EXPENSE, "debit", vat.toFixed(2), row, "ภาษีมูลค่าเพิ่ม (VAT)"));
+      }
+      lines.push(leg(cash, "credit", totalCash.toFixed(2), row));
+
       return {
         ok: true,
-        note: "buy (acquisition cost incl. fees)",
+        note: "buy (acquisition cost incl. fee capitalized, VAT separated)",
         entry: {
           entryDate: row.transactionDate,
           description: descriptionFor(row),
           sourceType: "STATEMENT",
           sourceDocumentId: row.sourceDocumentId,
           sourceTransactionId: row.transactionId,
-          lines: [
-            leg(INVEST_STOCKS, "debit", amount, row),
-            leg(cash, "credit", amount, row),
-          ],
+          lines,
         },
       };
     }
     if (row.side === "SELL") {
       const cash = cashAccountFor(row.currency);
-      const proceeds = amount; // net proceeds (authoritative)
       const costBasis = row.costBasis;
-      const gain = row.realizedGainLoss;
-      if (costBasis != null && gain != null) {
-        const g = new Decimal(gain).toDecimalPlaces(2);
-        const lines: JournalLineInput[] = [
-          leg(cash, "debit", proceeds, row),
-          leg(INVEST_STOCKS, "credit", costBasis, row),
-        ];
-        if (g.gt(0)) {
-          lines.push(leg(GAIN_INCOME, "credit", gain, row, row.symbol));
-        } else if (g.lt(0)) {
-          lines.push(leg(LOSS_EXPENSE, "debit", g.abs().toFixed(2), row, row.symbol));
-        }
+      if (costBasis == null || !new Decimal(costBasis).isFinite()) {
         return {
-          ok: true,
-          note: "sell with realized gain/loss split",
-          entry: {
-            entryDate: row.transactionDate,
-            description: descriptionFor(row),
-            sourceType: "STATEMENT",
-            sourceDocumentId: row.sourceDocumentId,
-            sourceTransactionId: row.transactionId,
-            lines,
-          },
+          ok: false,
+          reason: "SELL without trustworthy cost basis / realized gain - NON_COMPUTABLE, not posted",
         };
       }
+
+      // Selling fee & VAT recorded separately as expenses (5010 & 5130)
+      let sellingFee = new Decimal(0);
+      let sellingVat = new Decimal(0);
+      if (row.fees != null) {
+        const totalFees = new Decimal(row.fees).abs();
+        if (totalFees.gt(0)) {
+          sellingFee = totalFees.div(1.07).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+          sellingVat = totalFees.minus(sellingFee);
+          if (sellingVat.lt(0)) sellingVat = new Decimal(0);
+        }
+      }
+
+      const basisDec = new Decimal(costBasis).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+
+      // Determine gross proceeds and trading gain/loss
+      let tradingGainLoss: Decimal;
+      let gross: Decimal;
+
+      if (row.grossAmount != null && new Decimal(row.grossAmount).isFinite()) {
+        gross = new Decimal(row.grossAmount);
+        tradingGainLoss = gross.minus(basisDec);
+      } else if (row.realizedGainLoss != null && new Decimal(row.realizedGainLoss).isFinite()) {
+        tradingGainLoss = new Decimal(row.realizedGainLoss);
+        gross = basisDec.plus(tradingGainLoss);
+      } else if (row.proceeds != null && new Decimal(row.proceeds).isFinite()) {
+        const proc = new Decimal(row.proceeds);
+        gross = proc.plus(sellingFee).plus(sellingVat);
+        tradingGainLoss = gross.minus(basisDec);
+      } else {
+        const netCandidate = new Decimal(amount);
+        gross = netCandidate.plus(sellingFee).plus(sellingVat);
+        tradingGainLoss = gross.minus(basisDec);
+      }
+
+      const netCash = gross.minus(sellingFee).minus(sellingVat);
+      if (!netCash.isFinite() || netCash.lte(0)) {
+        return {
+          ok: false,
+          reason: "SELL without positive net proceeds - not posted",
+        };
+      }
+
+      const lines: JournalLineInput[] = [
+        leg(cash, "debit", netCash.toFixed(2), row),
+      ];
+      if (sellingFee.gt(0)) {
+        lines.push(leg(FEE_EXPENSE, "debit", sellingFee.toFixed(2), row, "ค่านายหน้าขายหุ้น"));
+      }
+      if (sellingVat.gt(0)) {
+        lines.push(leg(VAT_EXPENSE, "debit", sellingVat.toFixed(2), row, "VAT จากค่าธรรมเนียม"));
+      }
+
+      if (tradingGainLoss.gt(0)) {
+        // Gain on sale
+        lines.push(leg(INVEST_STOCKS, "credit", basisDec.toFixed(2), row));
+        lines.push(leg(GAIN_INCOME, "credit", tradingGainLoss.toFixed(2), row, row.symbol));
+      } else if (tradingGainLoss.lt(0)) {
+        // Loss on sale
+        lines.push(leg(LOSS_EXPENSE, "debit", tradingGainLoss.abs().toFixed(2), row, row.symbol));
+        lines.push(leg(INVEST_STOCKS, "credit", basisDec.toFixed(2), row));
+      } else {
+        // Exact break-even
+        lines.push(leg(INVEST_STOCKS, "credit", basisDec.toFixed(2), row));
+      }
+
       return {
-        ok: false,
-        reason: "SELL without trustworthy cost basis / realized gain - NON_COMPUTABLE, not posted",
+        ok: true,
+        note: "sell with realized gain/loss split, fee, and vat",
+        entry: {
+          entryDate: row.transactionDate,
+          description: descriptionFor(row),
+          sourceType: "STATEMENT",
+          sourceDocumentId: row.sourceDocumentId,
+          sourceTransactionId: row.transactionId,
+          lines,
+        },
       };
     }
     // Only explicit source/received amounts identify a computable exchange.
@@ -534,6 +621,21 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
     const cash = cashAccountFor(row.currency);
     const incomeAccount = incomeAccountFor(row);
     const symbolMemo = incomeAccount === DIVIDEND_INCOME ? dividendSymbolFor(row) : null;
+
+    const net = new Decimal(amount);
+    const gross = row.grossAmount ? new Decimal(row.grossAmount) : net;
+    const wht = gross.gt(net) ? gross.minus(net) : new Decimal(0);
+
+    const lines: JournalLineInput[] = [];
+    if (wht.gt(0)) {
+      lines.push(leg(cash, "debit", net.toFixed(2), row));
+      lines.push(leg(WHT_EXPENSE, "debit", wht.toFixed(2), row, "ภาษีหัก ณ ที่จ่าย"));
+      lines.push(leg(incomeAccount, "credit", gross.toFixed(2), row, symbolMemo ?? undefined));
+    } else {
+      lines.push(leg(cash, "debit", amount, row));
+      lines.push(leg(incomeAccount, "credit", amount, row, symbolMemo ?? undefined));
+    }
+
     return {
       ok: true,
       note: "income",
@@ -543,10 +645,7 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
         sourceType: "STATEMENT",
         sourceDocumentId: row.sourceDocumentId,
         sourceTransactionId: row.transactionId,
-        lines: [
-          leg(cash, "debit", amount, row),
-          leg(incomeAccount, "credit", amount, row, symbolMemo ?? undefined),
-        ],
+        lines,
       },
     };
   }

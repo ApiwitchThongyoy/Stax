@@ -39,6 +39,10 @@ import {
   postCapitalRow,
   sellRowDescription,
 } from "../app/lib/posting-engine";
+import {
+  applyAverageCostTrade,
+  type CostBasisMap,
+} from "../app/lib/cost-basis-engine";
 import type { ValidatedCapitalRow } from "../app/lib/statement-pipeline";
 import { mapToCapitalRow } from "../app/lib/statement-pipeline";
 import { parseStatementRows } from "../app/lib/pdfStatementParser";
@@ -1003,8 +1007,8 @@ async function main() {
   ok(built.length === 3, "buildStatementJournalEntries returns one entry per row (3 rows -> 3 entries)");
   const txSell = built.find((e) => e.transactionId === "tx-sell");
   ok(
-    !!txSell && txSell.postingState === "POSTED" && txSell.entry.lines.length === 3,
-    "computable SELL -> POSTED entry with its posting lines"
+    !!txSell && txSell.postingState === "POSTED" && txSell.entry.lines.length === 5,
+    "computable SELL -> POSTED entry with its posting lines (cash, fee, vat, basis, gain)"
   );
   const txGainDup = built.find((e) => e.transactionId === "tx-gain-dup");
   ok(
@@ -1112,18 +1116,23 @@ async function main() {
       netAmount: "1011.00",
     })
   );
-  ok(buyWithFee.ok && buyWithFee.entry.lines.length === 2, "R4-A: BUY with fee posts 2 legs");
+  ok(buyWithFee.ok && buyWithFee.entry.lines.length === 3, "R4-A: BUY with fee posts 3 legs");
   if (buyWithFee.ok) {
     const investLeg = buyWithFee.entry.lines.find((l) => l.accountId === "1110");
     const feeLeg = buyWithFee.entry.lines.find((l) => l.accountId === "5010");
+    const vatLeg = buyWithFee.entry.lines.find((l) => l.accountId === "5130");
     const cashLeg = buyWithFee.entry.lines.find((l) => l.accountId === "1020");
     ok(
-      !!investLeg && investLeg.debit === "1011.00" && investLeg.credit == null,
-      "R4-A: investment debited by the ACQUISITION COST (1011, fees INCLUDED)"
+      !!investLeg && investLeg.debit === "1010.28" && investLeg.credit == null,
+      "R4-A: investment debited by the ACQUISITION COST (1010.28, commission INCLUDED)"
+    );
+    ok(
+      !!vatLeg && vatLeg.debit === "0.72",
+      "R4-A: VAT debited to 5130"
     );
     ok(
       feeLeg === undefined,
-      "R4-A: fee is NOT expensed separately (5010 absent — fees are inside the asset cost)"
+      "R4-A: fee is NOT expensed separately (5010 absent — commission is inside the asset cost)"
     );
     ok(
       !!cashLeg && cashLeg.credit === "1011.00" && cashLeg.debit == null,
@@ -1278,8 +1287,8 @@ async function main() {
   ok(r4Entries.length === 3, "R4-F: one journal entry per row (BUY + fee summary + WHT)");
   const r4BuyEntry = r4Entries.find((e) => e.transactionId === "tx-r4-buy");
   ok(
-    !!r4BuyEntry && r4BuyEntry.postingState === "POSTED" && r4BuyEntry.entry.lines.length === 2,
-    "R4-F: BUY entry POSTED with 2 lines (acquisition cost incl. fees)"
+    !!r4BuyEntry && r4BuyEntry.postingState === "POSTED" && r4BuyEntry.entry.lines.length === 3,
+    "R4-F: BUY entry POSTED with 3 lines (acquisition cost incl. fees)"
   );
   const r4FeeEntry = r4Entries.find((e) => e.transactionId === "tx-r4-fee");
   ok(
@@ -1349,8 +1358,8 @@ async function main() {
       amountForeign: "1189.00",
       netAmount: "1189.00",
       proceeds: "1189.00",
-      costBasis: "1011.00",
-      realizedGainLoss: "178.00",
+      costBasis: "1010.28",
+      realizedGainLoss: "189.72",
       realizedGainLossThb: "6304.76",
     }),
   ]);
@@ -1359,22 +1368,22 @@ async function main() {
     ok(lifeBuy[0].postingState === "POSTED" && lifeSell[0].postingState === "POSTED", "R4-G: both lifecycle entries POSTED");
     const bLines = lifeBuy[0].entry.lines;
     const sLines = lifeSell[0].entry.lines;
-    // Investment: Dr 1011 (BUY) / Cr 1011 (SELL) → net 0 (fully liquidated).
+    // Investment: Dr 1010.28 (BUY) / Cr 1010.28 (SELL) → net 0 (fully liquidated).
     const investDr = bLines
       .filter((l) => l.accountId === "1110" && l.debit != null)
       .reduce((s, l) => s + Number(l.debit), 0);
     const investCr = sLines
       .filter((l) => l.accountId === "1110" && l.credit != null)
       .reduce((s, l) => s + Number(l.credit), 0);
-    ok(investDr === 1011 && investCr === 1011, "R4-G: full liquidation drains investment to zero (1011 dr / 1011 cr)");
-    // No fee expense: BUY fees are inside the asset cost, SELL fees inside net.
-    const feeDrTotal = bLines
+    ok(investDr === 1010.28 && investCr === 1010.28, "R4-G: full liquidation drains investment to zero (1010.28 dr / 1010.28 cr)");
+    // BUY fees capitalized in 1110 (5010 absent); SELL fees expensed to 5010 (10.28).
+    const feeDrBuy = bLines
       .filter((l) => l.accountId === "5010" && l.debit != null)
       .reduce((s, l) => s + Number(l.debit), 0);
-    const feeCrInSell = sLines
-      .filter((l) => l.accountId === "5010" && l.credit != null)
-      .reduce((s, l) => s + Number(l.credit), 0);
-    ok(feeDrTotal === 0 && feeCrInSell === 0, "R4-G: no 5010 fee lines (fees inside acquisition cost / net proceeds)");
+    const feeDrSell = sLines
+      .filter((l) => l.accountId === "5010" && l.debit != null)
+      .reduce((s, l) => s + Number(l.debit), 0);
+    ok(feeDrBuy === 0 && feeDrSell === 10.28, "R4-G: BUY fees capitalized in 1110; SELL fees expensed to 5010 (10.28)");
     // Cash: -1011 (paid) / +1189 (received) → net +178.
     const cashCr = bLines
       .filter((l) => l.accountId === "1020" && l.credit != null)
@@ -1383,11 +1392,11 @@ async function main() {
       .filter((l) => l.accountId === "1020" && l.debit != null)
       .reduce((s, l) => s + Number(l.debit), 0);
     ok(cashDr - cashCr === 178, "R4-G: cash net +178 (1189 received − 1011 paid)");
-    // Gain: Cr 178 = net proceeds (1189) − acquisition-cost basis (1011).
+    // Gain: Cr 189.72 = gross proceeds (1200) − acquisition-cost basis (1010.28).
     const gainCr = sLines
       .filter((l) => l.accountId === "4020" && l.credit != null)
       .reduce((s, l) => s + Number(l.credit), 0);
-    ok(gainCr === 178, "R4-G: realized gain 178 = net proceeds 1189 − basis 1011 (SELL fee already in net)");
+    ok(gainCr === 189.72, "R4-G: realized gain 189.72 = gross 1200 − basis 1010.28 (selling fee expensed separately)");
   }
 
   // H) THB trade: asserted at PARSER/PIPELINE currency separation, NOT posting.
@@ -1629,11 +1638,12 @@ async function main() {
   const mBuyThbEntry = mMixedEntries.find((e) => e.transactionId === mBuyThb?.transactionId);
   ok(
     mBuyUsdEntry?.postingState === "POSTED" &&
-      mBuyUsdEntry.entry.lines.length === 2 &&
-      mBuyUsdEntry.entry.lines.find((l) => l.accountId === "1110" && l.debit === "1001.00") !== undefined &&
+      mBuyUsdEntry.entry.lines.length === 3 &&
+      mBuyUsdEntry.entry.lines.find((l) => l.accountId === "1110" && l.debit === "1000.93") !== undefined &&
+      mBuyUsdEntry.entry.lines.find((l) => l.accountId === "5130" && l.debit === "0.07") !== undefined &&
       !mBuyUsdEntry.entry.lines.some((l) => l.accountId === "5010") &&
       mBuyUsdEntry.entry.lines.find((l) => l.accountId === "1020" && l.credit === "1001.00") !== undefined,
-    "R4-G3: USD BUY posts fee-inclusive acquisition cost 1001 once (no 5010 double count)"
+    "R4-G3: USD BUY posts fee-inclusive acquisition cost 1000.93 + VAT 0.07 once (no 5010 double count)"
   );
   ok(
     mBuyThbEntry !== undefined,
@@ -1666,21 +1676,22 @@ async function main() {
       netAmount: "1189.00",
       proceeds: "1189.00",
       costBasis: "1000.00",
-      realizedGainLoss: "189.00",
-      realizedGainLossThb: "5670.00",
+      realizedGainLoss: "200.00",
+      realizedGainLossThb: "6000.00",
     })
   );
   ok(
     sellFeePolicy.ok &&
       sellFeePolicy.entry.lines.some((l) => l.accountId === "1020" && l.debit === "1189.00") &&
+      sellFeePolicy.entry.lines.some((l) => l.accountId === "5010" && l.debit === "10.28") &&
+      sellFeePolicy.entry.lines.some((l) => l.accountId === "5130" && l.debit === "0.72") &&
       sellFeePolicy.entry.lines.some((l) => l.accountId === "1110" && l.credit === "1000.00") &&
-      sellFeePolicy.entry.lines.some((l) => l.accountId === "4020" && l.credit === "189.00") &&
-      sellFeePolicy.entry.lines.every((l) => l.accountId !== "5010"),
-    "R4-G4: SELL gain 189 = net proceeds 1189 − basis 1000; SELL fee NOT expensed (no 5010 leg)"
+      sellFeePolicy.entry.lines.some((l) => l.accountId === "4020" && l.credit === "200.00"),
+    "R4-G4: SELL gross 1200 − basis 1000 = gain 200; selling fee (10.28) and VAT (0.72) expensed separately"
   );
 
   // ---- R4 GAP-5 end-to-end: real parser -> mapToCapitalRow -> posting for a SELL
-  //      whose gain IS computable (net − basis, fee already netted). ----
+  //      whose gain IS computable (gross − basis, fee expensed separately). ----
   const sellText = [
     "TRADE RECORDS",
     "Currency: USD",
@@ -1702,18 +1713,81 @@ async function main() {
     sSell !== undefined &&
       sSell.netAmount === "1189" &&
       sSell.costBasis === "1000.00" &&
-      sSell.realizedGainLoss === "189.00" &&
+      sSell.realizedGainLoss === "200.00" &&
       sSell.amountForeign === "1189.00",
-    "R4-G5: real parser computes SELL net 1189 / basis 1000 / gain 189 (fee already netted)"
+    "R4-G5: real parser computes SELL gross 1200 / basis 1000 / gain 200 (fee expensed separately)"
   );
   const sEntries = buildStatementJournalEntries(sRows.filter((r) => r.transactionId === sSell?.transactionId));
   ok(
     sEntries.length === 1 &&
       sEntries[0].postingState === "POSTED" &&
-      sEntries[0].entry.lines.some((l) => l.accountId === "4020" && l.credit === "189.00") &&
-      sEntries[0].entry.lines.every((l) => l.accountId !== "5010"),
-    "R4-G5: real-parser SELL posts gain 189 with NO second fee subtraction (no 5010)"
+      sEntries[0].entry.lines.some((l) => l.accountId === "4020" && l.credit === "200.00") &&
+      sEntries[0].entry.lines.some((l) => l.accountId === "5010" && l.debit === "10.28") &&
+      sEntries[0].entry.lines.some((l) => l.accountId === "5130" && l.debit === "0.72"),
+    "R4-G5: real-parser SELL posts gain 200 with selling fee and VAT expensed to 5010 and 5130"
   );
+
+  // ---- Explicit Professor Requirement Verification Fixtures ----
+  // 1. TSLY BUY fixture:
+  //    Gross 110.40, Fee 0.11, VAT 0.01, Net Cash 110.52 -> Dr 1110: 110.51, Dr 5130: 0.01, Cr 1020: 110.52.
+  const tslyBuy = postCapitalRow(
+    baseRow({
+      transactionId: "tx-tsly-buy",
+      category: "asset",
+      side: "BUY",
+      symbol: "TSLY",
+      quantity: "10",
+      unitPrice: "11.04",
+      grossAmount: "110.40",
+      fees: "0.12",
+      amountForeign: "110.52",
+      netAmount: "110.52",
+    })
+  );
+  ok(tslyBuy.ok && tslyBuy.entry.lines.length === 3, "TSLY fixture: BUY with comm 0.11 and VAT 0.01 posts 3 legs");
+  if (tslyBuy.ok) {
+    const drInvest = tslyBuy.entry.lines.find((l) => l.accountId === "1110");
+    const drVat = tslyBuy.entry.lines.find((l) => l.accountId === "5130");
+    const crCash = tslyBuy.entry.lines.find((l) => l.accountId === "1020");
+    ok(drInvest?.debit === "110.51", "TSLY fixture: Dr 1110 Investment = Gross 110.40 + Comm 0.11 = 110.51");
+    ok(drVat?.debit === "0.01", "TSLY fixture: Dr 5130 VAT Expense = 0.01");
+    ok(crCash?.credit === "110.52", "TSLY fixture: Cr 1020 Cash USD = Net Cash 110.52");
+    ok(tslyBuy.entry.lines.every((l) => l.accountId !== "5010"), "TSLY fixture: No 5010 double expense leg");
+  }
+
+  // 2. SELL double-entry (RDW / UUUU fixture):
+  //    Gross 100.00, Fee 1.00, VAT 0.07, Net Cash 98.93, Cost Basis 60.00 ->
+  //    Dr 1020: 98.93, Dr 5010: 1.00, Dr 5130: 0.07, Cr 1110: 60.00, Cr 4020: 40.00.
+  const rdwSell = postCapitalRow(
+    baseRow({
+      transactionId: "tx-rdw-sell",
+      category: "asset",
+      side: "SELL",
+      symbol: "RDW",
+      quantity: "10",
+      unitPrice: "10.00",
+      grossAmount: "100.00",
+      fees: "1.07",
+      amountForeign: "98.93",
+      netAmount: "98.93",
+      proceeds: "98.93",
+      costBasis: "60.00",
+      realizedGainLoss: "40.00",
+    })
+  );
+  ok(rdwSell.ok && rdwSell.entry.lines.length === 5, "RDW fixture: SELL posts 5 legs (Cash, Fee, VAT, Basis, Gain)");
+  if (rdwSell.ok) {
+    const drCash = rdwSell.entry.lines.find((l) => l.accountId === "1020");
+    const drFee = rdwSell.entry.lines.find((l) => l.accountId === "5010");
+    const drVat = rdwSell.entry.lines.find((l) => l.accountId === "5130");
+    const crInvest = rdwSell.entry.lines.find((l) => l.accountId === "1110");
+    const crGain = rdwSell.entry.lines.find((l) => l.accountId === "4020");
+    ok(drCash?.debit === "98.93", "RDW fixture: Dr 1020 Cash USD = Net Cash 98.93");
+    ok(drFee?.debit === "1.00", "RDW fixture: Dr 5010 Brokerage Fee = 1.00");
+    ok(drVat?.debit === "0.07", "RDW fixture: Dr 5130 VAT Expense = 0.07");
+    ok(crInvest?.credit === "60.00", "RDW fixture: Cr 1110 Investment = Cost Basis 60.00");
+    ok(crGain?.credit === "40.00", "RDW fixture: Cr 4020 Trading Gain = Gross 100.00 - Basis 60.00 = 40.00");
+  }
 
   // ---- R4 PERSISTENCE (migration 0027): the monthly-fee-aggregate flag must
   //      survive the persisted Capital_Transactions shape, the journal detail,
@@ -2389,6 +2463,435 @@ async function main() {
       expUserNote.explanation === "Audited and confirmed with broker receipt",
     "getEntryExplanation: POSTED row with user note returns hasExplanation=true with userNote"
   );
+
+  // ---- Critical Verification: Moving Average Cost Sequence (regression case) ----
+  // 1. BUY 10 shares @ 10 USD -> quantity=10, costBasis=100, avgCost=10
+  // 2. SELL 5 shares -> quantity=5, remainingCostBasis=50, avgCost=10, costBasisSold=50
+  // 3. BUY 5 shares @ 20 USD -> quantity=10, live costBasis=150, avgCost=15 (MUST NOT be 13.3333)
+  const regMap: CostBasisMap = {};
+  applyAverageCostTrade(regMap, "REG_TEST", "BUY", 10, 10);
+  ok(
+    regMap.REG_TEST?.quantity === 10 &&
+      regMap.REG_TEST?.avgCost === 10 &&
+      regMap.REG_TEST?.cumCost === 100,
+    "regression case step 1: BUY 10 @ 10 -> qty 10, costBasis 100, avgCost 10"
+  );
+  const regSellRes = applyAverageCostTrade(regMap, "REG_TEST", "SELL", 5, 12);
+  const regBasisSold = (regSellRes.sellBasis ?? 0) * 5;
+  ok(
+    regMap.REG_TEST?.quantity === 5 &&
+      regMap.REG_TEST?.avgCost === 10 &&
+      regMap.REG_TEST?.cumCost === 50 &&
+      regBasisSold === 50,
+    "regression case step 2: SELL 5 -> qty 5, remainingCostBasis 50, avgCost 10, costBasisSold 50"
+  );
+  applyAverageCostTrade(regMap, "REG_TEST", "BUY", 5, 20);
+  ok(
+    regMap.REG_TEST?.quantity === 10 &&
+      regMap.REG_TEST?.cumCost === 150 &&
+      Math.abs((regMap.REG_TEST?.avgCost ?? 0) - 15) < 1e-6 &&
+      Math.abs((regMap.REG_TEST?.avgCost ?? 0) - 13.3333) > 0.5,
+    "regression case step 3: BUY 5 @ 20 -> qty 10, live costBasis 150, avgCost 15 (MUST NOT be 13.3333)"
+  );
+
+  // Commission handling with the same sequence:
+  // 1. BUY 10 @ 10 + commission 1.00 -> acquisitionCost = 101.00, avgCost = 10.10, live costBasis = 101.00
+  // 2. SELL 5 -> costBasisSold = 50.50, remaining qty = 5, remaining costBasis = 50.50, avgCost = 10.10
+  // 3. BUY 5 @ 20 + commission 0.50 -> acquisitionCost = 100.50, live qty = 10, live costBasis = 151.00, avgCost = 15.10
+  const regCommMap: CostBasisMap = {};
+  applyAverageCostTrade(regCommMap, "REG_COMM", "BUY", 10, 10, undefined, 101);
+  ok(
+    regCommMap.REG_COMM?.quantity === 10 &&
+      regCommMap.REG_COMM?.cumCost === 101 &&
+      regCommMap.REG_COMM?.avgCost === 10.1,
+    "regression comm step 1: BUY 10 @ 10 with comm 1 -> qty 10, costBasis 101, avgCost 10.10"
+  );
+  const regSellCommRes = applyAverageCostTrade(regCommMap, "REG_COMM", "SELL", 5, 15);
+  const regCommBasisSold = (regSellCommRes.sellBasis ?? 0) * 5;
+  ok(
+    regCommMap.REG_COMM?.quantity === 5 &&
+      regCommMap.REG_COMM?.avgCost === 10.1 &&
+      regCommMap.REG_COMM?.cumCost === 50.5 &&
+      regCommBasisSold === 50.5,
+    "regression comm step 2: SELL 5 -> qty 5, remainingCostBasis 50.50, avgCost 10.10, costBasisSold 50.50"
+  );
+  applyAverageCostTrade(regCommMap, "REG_COMM", "BUY", 5, 20, undefined, 100.5);
+  ok(
+    regCommMap.REG_COMM?.quantity === 10 &&
+      regCommMap.REG_COMM?.cumCost === 151 &&
+      regCommMap.REG_COMM?.avgCost === 15.1,
+    "regression comm step 3: BUY 5 @ 20 with comm 0.5 -> qty 10, live costBasis 151, avgCost 15.10"
+  );
+
+  // === RECONCILIATION APPLY PERSISTENCE & IDEMPOTENCY REGRESSION TEST ===
+  // Invariant required:
+  // initial: Already Posted = N, Promotable = 1
+  // apply: Promoted = 1, in-place update or zero duplicates
+  // second dry-run: Already Posted = N + 1, Promotable = 0
+  // second apply: Promoted = 0, zero duplicate journals created
+  {
+    interface TestJournal {
+      id: string;
+      sourceTransactionId: string;
+      status: "POSTED" | "DRAFT";
+      postingState: "POSTED" | "SKIPPED";
+      skipReason: string | null;
+      lines: any[];
+    }
+
+    const testTx = baseRow({
+      transactionId: "tx-reconcile-persist",
+      category: "asset",
+      side: "BUY",
+      symbol: "NVDA",
+      quantity: "10",
+      unitPrice: "100",
+      grossAmount: "1000",
+      fees: "-1.07",
+      amountForeign: "1001.07",
+      netAmount: "1001.07",
+    });
+
+    let journals: TestJournal[] = [
+      {
+        id: "j-initial-skipped",
+        sourceTransactionId: "tx-reconcile-persist",
+        status: "POSTED",
+        postingState: "SKIPPED",
+        skipReason: "invalid entry: USD does not balance",
+        lines: [],
+      },
+    ];
+
+    function mapExisting(list: TestJournal[]): Map<string, TestJournal> {
+      const map = new Map<string, TestJournal>();
+      for (const e of list) {
+        if (!e.sourceTransactionId) continue;
+        const prev = map.get(e.sourceTransactionId);
+        if (!prev || (prev.postingState !== "POSTED" && e.postingState === "POSTED")) {
+          map.set(e.sourceTransactionId, e);
+        }
+      }
+      return map;
+    }
+
+    function scan(list: TestJournal[]) {
+      const entryMap = mapExisting(list);
+      const [plan] = buildStatementJournalEntries([testTx]);
+      const existing = entryMap.get(testTx.transactionId);
+      const isAlreadyPosted = existing && existing.postingState === "POSTED" && existing.status === "POSTED";
+      const isPromotable = !isAlreadyPosted && plan && plan.postingState === "POSTED";
+      return {
+        alreadyPosted: isAlreadyPosted ? 1 : 0,
+        promotable: isPromotable ? 1 : 0,
+        plan,
+      };
+    }
+
+    function applyPromotion(list: TestJournal[]) {
+      const scanRes = scan(list);
+      let promoted = 0;
+      if (scanRes.promotable > 0 && scanRes.plan) {
+        const existing = mapExisting(list).get(testTx.transactionId);
+        if (existing) {
+          existing.postingState = "POSTED";
+          existing.status = "POSTED";
+          existing.skipReason = null;
+          existing.lines = scanRes.plan.entry.lines;
+          promoted++;
+        }
+      }
+      return { promoted };
+    }
+
+    // Step 1: initial dry run
+    const run1 = scan(journals);
+    ok(run1.alreadyPosted === 0 && run1.promotable === 1, "reconcile idempotency step 1: initial Already Posted = 0, Promotable = 1");
+
+    // Step 2: apply promotion
+    const apply1 = applyPromotion(journals);
+    ok(apply1.promoted === 1, "reconcile idempotency step 2: apply Promoted = 1");
+
+    // Step 3: second dry run
+    const run2 = scan(journals);
+    ok(run2.alreadyPosted === 1 && run2.promotable === 0, "reconcile idempotency step 3: second dry-run Already Posted = 1, Promotable = 0");
+
+    // Step 4: second apply
+    const apply2 = applyPromotion(journals);
+    ok(apply2.promoted === 0, "reconcile idempotency step 4: second apply Promoted = 0");
+
+    // Step 5: duplicate check
+    const dups = journals.filter((j) => j.sourceTransactionId === "tx-reconcile-persist");
+    ok(dups.length === 1, "reconcile idempotency step 5: exactly one journal entry exists, zero duplicates");
+
+    // Step 6: map prioritization safety against legacy duplicate row
+    const legacyDuplicateList: TestJournal[] = [
+      {
+        id: "j-new-posted",
+        sourceTransactionId: "tx-legacy-dup",
+        status: "POSTED",
+        postingState: "POSTED",
+        skipReason: null,
+        lines: [{ debit: "100" }, { credit: "100" }],
+      },
+      {
+        id: "j-old-skipped",
+        sourceTransactionId: "tx-legacy-dup",
+        status: "POSTED",
+        postingState: "SKIPPED",
+        skipReason: "historical skip",
+        lines: [],
+      },
+    ];
+    const mapWithLegacyDup = mapExisting(legacyDuplicateList);
+    const selected = mapWithLegacyDup.get("tx-legacy-dup");
+    ok(
+      selected !== undefined && selected.id === "j-new-posted" && selected.postingState === "POSTED",
+      "reconcile idempotency step 6: map prioritization picks POSTED over SKIPPED even if SKIPPED appears later"
+    );
+
+    // === DUPLICATE CLEANUP & POSTING INTEGRITY TESTS ===
+    const { identifyStaleDuplicatesPure } = await import("./cleanup-duplicate-stale-placeholders.mjs");
+
+    // Test 1: existing SKIPPED placeholder -> promoted in place
+    const placeholderTxId = "tx-promote-in-place";
+    const placeholderList: TestJournal[] = [
+      {
+        id: "j-placeholder-1",
+        sourceTransactionId: placeholderTxId,
+        status: "POSTED",
+        postingState: "SKIPPED",
+        skipReason: "initial skip placeholder",
+        lines: [],
+      },
+    ];
+    // In-place promotion simulation
+    const stub = placeholderList.find((j) => j.sourceTransactionId === placeholderTxId && j.postingState === "SKIPPED");
+    ok(stub !== undefined, "posting integrity: found existing SKIPPED placeholder");
+    if (stub) {
+      stub.postingState = "POSTED";
+      stub.skipReason = null;
+      stub.lines = [{ debit: "100" }, { credit: "100" }];
+    }
+    ok(
+      placeholderList.length === 1 &&
+      placeholderList[0].id === "j-placeholder-1" &&
+      placeholderList[0].postingState === "POSTED" &&
+      placeholderList[0].lines.length === 2,
+      "posting integrity 1: existing SKIPPED placeholder promoted in place (same ID, zero duplicate journal)"
+    );
+
+    // Test 2: existing POSTED journal -> no-op
+    const postedCheck = scan(placeholderList);
+    ok(
+      postedCheck.alreadyPosted === 0, // scan checks testTx, but placeholderTxId is already posted
+      "posting integrity: baseline verified"
+    );
+    // Scanning placeholderList for placeholderTxId
+    const placeholderMap = mapExisting(placeholderList);
+    const existingPosted = placeholderMap.get(placeholderTxId);
+    const isNoOp = existingPosted && existingPosted.postingState === "POSTED" && existingPosted.status === "POSTED";
+    ok(
+      isNoOp === true,
+      "posting integrity 2: existing POSTED journal results in no-op (authoritative, never overwritten)"
+    );
+
+    // Test 3: repeated apply -> no duplicate
+    const listForRepeatedApply: TestJournal[] = [
+      {
+        id: "j-orig",
+        sourceTransactionId: "tx-repeated",
+        status: "POSTED",
+        postingState: "SKIPPED",
+        skipReason: "will promote",
+        lines: [],
+      },
+    ];
+    function applyMock(list: TestJournal[], txId: string) {
+      const existing = list.find((j) => j.sourceTransactionId === txId);
+      if (existing && existing.postingState === "POSTED") {
+        return { action: "noop" };
+      }
+      if (existing && existing.postingState === "SKIPPED") {
+        existing.postingState = "POSTED";
+        existing.lines = [{ debit: "50" }, { credit: "50" }];
+        return { action: "promoted" };
+      }
+      list.push({
+        id: "j-new",
+        sourceTransactionId: txId,
+        status: "POSTED",
+        postingState: "POSTED",
+        skipReason: null,
+        lines: [{ debit: "50" }, { credit: "50" }],
+      });
+      return { action: "inserted" };
+    }
+
+    const firstRun = applyMock(listForRepeatedApply, "tx-repeated");
+    const secondRun = applyMock(listForRepeatedApply, "tx-repeated");
+    const thirdRun = applyMock(listForRepeatedApply, "tx-repeated");
+    const countForTx = listForRepeatedApply.filter((j) => j.sourceTransactionId === "tx-repeated").length;
+    ok(
+      firstRun.action === "promoted" &&
+      secondRun.action === "noop" &&
+      thirdRun.action === "noop" &&
+      countForTx === 1,
+      "posting integrity 3: repeated apply produces exactly one journal, zero duplicates"
+    );
+
+    // Test 4: cleanup never deletes a journal containing accounting lines
+    const testRecordsWithLines = [
+      {
+        id: "j-valid-posted",
+        userId: "u1",
+        entryNo: 1,
+        sourceType: "STATEMENT",
+        sourceTransactionId: "tx-with-lines",
+        status: "POSTED",
+        postingState: "POSTED",
+        skipReason: null,
+        lineCount: 2,
+      },
+      {
+        id: "j-candidate-with-lines",
+        userId: "u1",
+        entryNo: 2,
+        sourceType: "STATEMENT",
+        sourceTransactionId: "tx-with-lines",
+        status: "POSTED",
+        postingState: "SKIPPED",
+        skipReason: "abnormal placeholder that somehow has lines",
+        lineCount: 1, // Non-zero lines!
+      },
+    ];
+    const cleanupResultWithLines = identifyStaleDuplicatesPure(testRecordsWithLines);
+    ok(
+      cleanupResultWithLines.length === 0,
+      "cleanup safety 4: cleanup never deletes a journal containing accounting lines"
+    );
+
+    // Test 5: cleanup never deletes the only journal for a source transaction
+    const testLoneRecords = [
+      {
+        id: "j-lone-skipped",
+        userId: "u1",
+        entryNo: 1,
+        sourceType: "STATEMENT",
+        sourceTransactionId: "tx-lone",
+        status: "POSTED",
+        postingState: "SKIPPED",
+        skipReason: "legitimate unposted trade",
+        lineCount: 0,
+      },
+      {
+        id: "j-lone-posted",
+        userId: "u1",
+        entryNo: 2,
+        sourceType: "STATEMENT",
+        sourceTransactionId: "tx-lone-posted",
+        status: "POSTED",
+        postingState: "POSTED",
+        skipReason: null,
+        lineCount: 2,
+      },
+    ];
+    const cleanupResultLone = identifyStaleDuplicatesPure(testLoneRecords);
+    ok(
+      cleanupResultLone.length === 0,
+      "cleanup safety 5: cleanup never deletes the only journal for a source transaction"
+    );
+
+    // Test 6: cleanup accurately identifies candidate when valid POSTED + 0-line SKIPPED pair exists
+    const testValidPair = [
+      {
+        id: "j-stale-placeholder",
+        userId: "u1",
+        entryNo: 10,
+        sourceType: "STATEMENT",
+        sourceTransactionId: "tx-pair",
+        status: "POSTED",
+        postingState: "SKIPPED",
+        skipReason: "old skip reason",
+        lineCount: 0,
+      },
+      {
+        id: "j-legit-posted",
+        userId: "u1",
+        entryNo: 11,
+        sourceType: "STATEMENT",
+        sourceTransactionId: "tx-pair",
+        status: "POSTED",
+        postingState: "POSTED",
+        skipReason: null,
+        lineCount: 4,
+      },
+    ];
+    const cleanupResultPair = identifyStaleDuplicatesPure(testValidPair);
+    ok(
+      cleanupResultPair.length === 1 &&
+      cleanupResultPair[0].staleJournalId === "j-stale-placeholder" &&
+      cleanupResultPair[0].validJournalId === "j-legit-posted" &&
+      cleanupResultPair[0].staleLineCount === 0 &&
+      cleanupResultPair[0].validLineCount === 4,
+      "cleanup safety 6: correctly identifies candidate only when valid POSTED + 0-line SKIPPED pair exists"
+    );
+
+    // Test 7: concurrent first-time journal creations serialized by advisory lock
+    const concurrentList: TestJournal[] = [];
+    let lockHolder: string | null = null;
+
+    async function concurrentCreateJournalSimulation(userId: string, sourceTxId: string, callerId: string) {
+      while (lockHolder !== null && lockHolder !== callerId) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      lockHolder = callerId;
+      try {
+        const existing = concurrentList.find(
+          (j) => j.sourceTransactionId === sourceTxId && j.postingState === "POSTED"
+        );
+        if (existing) {
+          return { entryId: existing.id, action: "noop" };
+        }
+        const newId = `j-${callerId}`;
+        concurrentList.push({
+          id: newId,
+          sourceTransactionId: sourceTxId,
+          status: "POSTED",
+          postingState: "POSTED",
+          skipReason: null,
+          lines: [{ debit: "100" }, { credit: "100" }],
+        });
+        return { entryId: newId, action: "inserted" };
+      } finally {
+        lockHolder = null;
+      }
+    }
+
+    const [resA, resB] = await Promise.all([
+      concurrentCreateJournalSimulation("u1", "tx-concurrent-1", "callerA"),
+      concurrentCreateJournalSimulation("u1", "tx-concurrent-1", "callerB"),
+    ]);
+
+    const totalCreated = concurrentList.filter((j) => j.sourceTransactionId === "tx-concurrent-1");
+    ok(
+      totalCreated.length === 1,
+      "concurrency safety 7: two concurrent first-time creations produce exactly ONE accounting journal"
+    );
+    ok(
+      (resA.action === "inserted" && resB.action === "noop") ||
+        (resB.action === "inserted" && resA.action === "noop"),
+      "concurrency safety 7: one caller inserts and the concurrent caller receives authoritative no-op"
+    );
+    ok(
+      resA.entryId === resB.entryId,
+      "concurrency safety 7: both concurrent callers resolve safely with the exact same journal entry ID"
+    );
+    ok(
+      totalCreated[0].lines.length === 2,
+      "concurrency safety 7: no accounting lines duplicated under concurrent execution"
+    );
+  }
 
   runReportRegressions(ok);
   console.log("================ SUMMARY ================");

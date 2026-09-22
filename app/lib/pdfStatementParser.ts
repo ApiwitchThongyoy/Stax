@@ -257,6 +257,8 @@ interface RawTradeEvent {
   description: string;
   currency: string;
   fees: number; // signed commission + VAT for this trade (may be a negative rebate)
+  commission?: number;
+  vat?: number;
   gross: number; // broker Gross Amount, printed VERBATIM (may differ from unit price * quantity)
   exchange: string;
 }
@@ -681,6 +683,8 @@ export function parseStatementRows(
         description: [resolvedSymbol, name?.trim()].filter(Boolean).join(" ").trim(),
         currency: currentCurrency,
         fees: tradeFees,
+        commission: comm,
+        vat,
         gross,
         exchange: exchange.trim(),
       });
@@ -718,6 +722,8 @@ export function parseStatementRows(
             netAmount: ev.net,
             grossAmount: ev.gross,
             fees: ev.fees,
+            commission: ev.commission,
+            vat: ev.vat,
           })
         : null;
     const { sellBasis } = applyAverageCostTrade(
@@ -731,13 +737,13 @@ export function parseStatementRows(
     );
 
     if (ev.side === "SELL" && sellBasis !== null) {
-      // ใช้ "Net Amount" ที่โบรกเกอร์ระบุ (หักค่าธรรมเนียมแล้ว) เป็นยอดขายสุทธิ (authoritative)
-      // แทนการสร้างยอดใหม่เอง: realized  = netProceeds - avgCost*qty
-      // Shared decimal calculation; the pipeline converts rounded gain to THB.
-      const calculated = realizedAmounts(ev.net, new Decimal(sellBasis).mul(ev.qty), null);
+      // Gross proceeds for trading gain/loss; fees/VAT expensed separately in GL:
+      // realizedTradingGainLoss = gross proceeds - cost basis sold
+      const grossProceeds = ev.gross && ev.gross > 0 ? ev.gross : ev.net;
+      const calculated = realizedAmounts(grossProceeds, new Decimal(sellBasis).mul(ev.qty), null);
       pnlAmount = Number(calculated.realizedGainLoss);
       realizedMeta = {
-        proceeds: ev.net,
+        proceeds: grossProceeds,
         costBasis: new Decimal(sellBasis).mul(ev.qty).toNumber(),
         realizedGainLoss: pnlAmount,
       };
