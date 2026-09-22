@@ -140,7 +140,9 @@ const StaxLogo: React.FC<StaxLogoProps> = ({
               marginBottom: "12px",
             }}
           >
-            Smart Tax & Accounting
+            Intelligent Financial Accounting and
+            <br />
+            Foreign Investment Ledger System
           </div>
           <div
             style={{
@@ -158,7 +160,9 @@ const StaxLogo: React.FC<StaxLogoProps> = ({
               letterSpacing: "0.2px",
             }}
           >
-            ระบบบัญชีและประเมินภาษีอัจฉริยะ
+            ระบบบันทึกสรุปบัญชีการเงิน
+            <br />
+            และติดตามการลงทุนต่างประเทศ
           </div>
         </>
       )}
