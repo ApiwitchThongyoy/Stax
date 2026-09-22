@@ -482,6 +482,8 @@ export async function createJournalEntry(
             entryNo: journalEntries.entryNo,
             postingState: journalEntries.postingState,
             status: journalEntries.status,
+            sourceType: journalEntries.sourceType,
+            description: journalEntries.description,
           })
           .from(journalEntries)
           .where(
@@ -494,14 +496,24 @@ export async function createJournalEntry(
           .execute();
 
         const existingPosted = existingRows.find(
-          (r) => r.postingState === "POSTED" && r.status === "POSTED"
+          (r) =>
+            r.postingState === "POSTED" &&
+            r.status === "POSTED" &&
+            !r.description.startsWith("กลับรายการ:") &&
+            (entry.sourceType ? r.sourceType === entry.sourceType : true)
         );
         if (existingPosted) {
           // Active POSTED journal already exists: treat as authoritative, never duplicate
           return { entryId: existingPosted.id, entryNo: existingPosted.entryNo };
         }
 
-        const existingStub = existingRows.find((r) => r.postingState === "SKIPPED");
+        const existingStub = existingRows.find(
+          (r) =>
+            r.postingState === "SKIPPED" &&
+            r.status === "POSTED" &&
+            !r.description.startsWith("กลับรายการ:") &&
+            (entry.sourceType ? r.sourceType === entry.sourceType : true)
+        );
         if (existingStub) {
           // Reuse/promote the existing SKIPPED placeholder in place
           await tx

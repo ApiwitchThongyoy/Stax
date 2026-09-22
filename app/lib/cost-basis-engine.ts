@@ -149,7 +149,7 @@ export function applyAverageCostTrade(
           : NaN;
     if (!Number.isFinite(acq) || acq <= 0) return { sellBasis: null };
     const prev = map[key];
-    if (!prev || prev.quantity <= 0) {
+    if (!prev || prev.quantity <= 0 || prev.cumQuantity <= 0) {
       // Fresh (or fully liquidated) position: this BUY establishes the baseline.
       const unit = new Decimal(acq).div(new Decimal(qty)).toNumber();
       map[key] = {
@@ -161,26 +161,22 @@ export function applyAverageCostTrade(
       return { sellBasis: null };
     }
 
-    // Moving Average Cost:
+    // Webull Average Cost:
     // On BUY:
-    // newLiveCostBasis = previousLiveCostBasis + acquisitionCost
-    // newLiveQuantity = previousLiveQuantity + buyQuantity
-    // newAverageCost = newLiveCostBasis / newLiveQuantity
-    const prevLiveQty = prev.quantity;
-    const prevLiveCost =
-      prev.cumCost > 0
-        ? prev.cumCost
-        : new Decimal(prev.quantity).mul(new Decimal(prev.avgCost)).toNumber();
-
-    const newLiveQuantity = new Decimal(prevLiveQty).plus(new Decimal(qty)).toNumber();
-    const newLiveCost = new Decimal(prevLiveCost).plus(new Decimal(acq)).toNumber();
-    const newAvgCost = new Decimal(newLiveCost).div(new Decimal(newLiveQuantity)).toNumber();
+    // cumCost += acquisitionCost
+    // cumQuantity += buyQuantity
+    // liveQuantity += buyQuantity
+    // avgCost = cumCost / cumQuantity
+    const cumQuantity = new Decimal(prev.cumQuantity).plus(new Decimal(qty)).toNumber();
+    const cumCost = new Decimal(prev.cumCost).plus(new Decimal(acq)).toNumber();
+    const newLiveQuantity = new Decimal(prev.quantity).plus(new Decimal(qty)).toNumber();
+    const newAvgCost = new Decimal(cumCost).div(new Decimal(cumQuantity)).toNumber();
 
     map[key] = {
       quantity: newLiveQuantity,
       avgCost: newAvgCost,
-      cumQuantity: newLiveQuantity,
-      cumCost: newLiveCost,
+      cumQuantity,
+      cumCost,
     };
     return { sellBasis: null };
   }
@@ -211,30 +207,18 @@ export function applyAverageCostTrade(
     return { sellBasis: null };
   }
 
-  // On partial SELL:
-  // costBasisSold = currentAverageCost * soldQuantity
-  // newLiveCostBasis = previousLiveCostBasis - costBasisSold
-  // newLiveQuantity = previousLiveQuantity - soldQuantity
-  const costBasisSold = new Decimal(basis).mul(new Decimal(qty));
-  const prevLiveCost =
-    pos.cumCost > 0
-      ? new Decimal(pos.cumCost)
-      : new Decimal(availQty).mul(new Decimal(basis));
-  const newLiveCost = Decimal.max(0, prevLiveCost.minus(costBasisSold)).toNumber();
-
   const remainingQty = new Decimal(availQty).minus(new Decimal(qty));
   if (remainingQty.lte(1e-6)) {
     // Full liquidation: reset qty & basis cleanly to 0 (no floating point residue)
     delete map[key];
   } else {
     // Partial SELL: remaining avg cost stays unchanged immediately after SELL,
-    // and live cost basis removes the sold cost basis so a subsequent BUY
-    // computes its average from the REMAINING live position.
+    // only live quantity is reduced. Lifetime accumulators cumQuantity and cumCost are NOT reduced by SELL.
     map[key] = {
       quantity: remainingQty.toNumber(),
       avgCost: basis,
-      cumQuantity: remainingQty.toNumber(),
-      cumCost: newLiveCost,
+      cumQuantity: pos.cumQuantity,
+      cumCost: pos.cumCost,
     };
   }
 

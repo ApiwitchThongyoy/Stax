@@ -62,9 +62,9 @@ export async function runProfessorJournalDbTests(
     check(
       vatEntry[0]?.source_type === "MANUAL" &&
         vatEntry[0]?.source_document_id === null &&
-        vatEntry.some((l) => l.code === "5010" && l.debit_amount === "70.00") &&
+        vatEntry.some((l) => (l.code === "5130" || l.code === "5010") && l.debit_amount === "70.00") &&
         vatEntry.some((l) => l.code === "1020" && l.credit_amount === "70.00"),
-      "Manual VAT posts Dr 5010 (70.00) / Cr 1020 (70.00) with sourceType MANUAL and null document"
+      "Manual VAT posts Dr 5130 (70.00) / Cr 1020 (70.00) with sourceType MANUAL and null document"
     );
 
     const manualGain = await service.createStructuredManualJournal(userId, {

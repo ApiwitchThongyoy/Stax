@@ -2472,60 +2472,65 @@ async function main() {
   // ---- Critical Verification: Moving Average Cost Sequence (regression case) ----
   // 1. BUY 10 shares @ 10 USD -> quantity=10, costBasis=100, avgCost=10
   // 2. SELL 5 shares -> quantity=5, remainingCostBasis=50, avgCost=10, costBasisSold=50
-  // 3. BUY 5 shares @ 20 USD -> quantity=10, live costBasis=150, avgCost=15 (MUST NOT be 13.3333)
+  // 3. BUY 5 shares @ 20 USD -> quantity=10, cumCost=200, cumQuantity=15, avgCost=13.3333 (Webull lifetime average cost)
   const regMap: CostBasisMap = {};
   applyAverageCostTrade(regMap, "REG_TEST", "BUY", 10, 10);
   ok(
     regMap.REG_TEST?.quantity === 10 &&
       regMap.REG_TEST?.avgCost === 10 &&
-      regMap.REG_TEST?.cumCost === 100,
-    "regression case step 1: BUY 10 @ 10 -> qty 10, costBasis 100, avgCost 10"
+      regMap.REG_TEST?.cumCost === 100 &&
+      regMap.REG_TEST?.cumQuantity === 10,
+    "regression case step 1: BUY 10 @ 10 -> qty 10, cumCost 100, cumQuantity 10, avgCost 10"
   );
   const regSellRes = applyAverageCostTrade(regMap, "REG_TEST", "SELL", 5, 12);
   const regBasisSold = (regSellRes.sellBasis ?? 0) * 5;
   ok(
     regMap.REG_TEST?.quantity === 5 &&
       regMap.REG_TEST?.avgCost === 10 &&
-      regMap.REG_TEST?.cumCost === 50 &&
+      regMap.REG_TEST?.cumCost === 100 &&
+      regMap.REG_TEST?.cumQuantity === 10 &&
       regBasisSold === 50,
-    "regression case step 2: SELL 5 -> qty 5, remainingCostBasis 50, avgCost 10, costBasisSold 50"
+    "regression case step 2: SELL 5 -> qty 5, cumCost 100 (not reduced by SELL), avgCost 10, costBasisSold 50"
   );
   applyAverageCostTrade(regMap, "REG_TEST", "BUY", 5, 20);
   ok(
     regMap.REG_TEST?.quantity === 10 &&
-      regMap.REG_TEST?.cumCost === 150 &&
-      Math.abs((regMap.REG_TEST?.avgCost ?? 0) - 15) < 1e-6 &&
-      Math.abs((regMap.REG_TEST?.avgCost ?? 0) - 13.3333) > 0.5,
-    "regression case step 3: BUY 5 @ 20 -> qty 10, live costBasis 150, avgCost 15 (MUST NOT be 13.3333)"
+      regMap.REG_TEST?.cumCost === 200 &&
+      regMap.REG_TEST?.cumQuantity === 15 &&
+      Math.abs((regMap.REG_TEST?.avgCost ?? 0) - 200 / 15) < 1e-6,
+    "regression case step 3: BUY 5 @ 20 -> qty 10, cumCost 200, cumQuantity 15, avgCost 13.3333 (Webull lifetime avg)"
   );
 
   // Commission handling with the same sequence:
-  // 1. BUY 10 @ 10 + commission 1.00 -> acquisitionCost = 101.00, avgCost = 10.10, live costBasis = 101.00
-  // 2. SELL 5 -> costBasisSold = 50.50, remaining qty = 5, remaining costBasis = 50.50, avgCost = 10.10
-  // 3. BUY 5 @ 20 + commission 0.50 -> acquisitionCost = 100.50, live qty = 10, live costBasis = 151.00, avgCost = 15.10
+  // 1. BUY 10 @ 10 + commission 1.00 -> acquisitionCost = 101.00, avgCost = 10.10, cumCost = 101.00, cumQuantity = 10
+  // 2. SELL 5 -> costBasisSold = 50.50, remaining qty = 5, cumCost = 101.00, cumQuantity = 10, avgCost = 10.10
+  // 3. BUY 5 @ 20 + commission 0.50 -> acquisitionCost = 100.50, live qty = 10, cumCost = 201.50, cumQuantity = 15, avgCost = 13.4333
   const regCommMap: CostBasisMap = {};
   applyAverageCostTrade(regCommMap, "REG_COMM", "BUY", 10, 10, undefined, 101);
   ok(
     regCommMap.REG_COMM?.quantity === 10 &&
       regCommMap.REG_COMM?.cumCost === 101 &&
+      regCommMap.REG_COMM?.cumQuantity === 10 &&
       regCommMap.REG_COMM?.avgCost === 10.1,
-    "regression comm step 1: BUY 10 @ 10 with comm 1 -> qty 10, costBasis 101, avgCost 10.10"
+    "regression comm step 1: BUY 10 @ 10 with comm 1 -> qty 10, cumCost 101, cumQuantity 10, avgCost 10.10"
   );
   const regSellCommRes = applyAverageCostTrade(regCommMap, "REG_COMM", "SELL", 5, 15);
   const regCommBasisSold = (regSellCommRes.sellBasis ?? 0) * 5;
   ok(
     regCommMap.REG_COMM?.quantity === 5 &&
       regCommMap.REG_COMM?.avgCost === 10.1 &&
-      regCommMap.REG_COMM?.cumCost === 50.5 &&
+      regCommMap.REG_COMM?.cumCost === 101 &&
+      regCommMap.REG_COMM?.cumQuantity === 10 &&
       regCommBasisSold === 50.5,
-    "regression comm step 2: SELL 5 -> qty 5, remainingCostBasis 50.50, avgCost 10.10, costBasisSold 50.50"
+    "regression comm step 2: SELL 5 -> qty 5, cumCost 101 (not reduced by SELL), avgCost 10.10, costBasisSold 50.50"
   );
   applyAverageCostTrade(regCommMap, "REG_COMM", "BUY", 5, 20, undefined, 100.5);
   ok(
     regCommMap.REG_COMM?.quantity === 10 &&
-      regCommMap.REG_COMM?.cumCost === 151 &&
-      regCommMap.REG_COMM?.avgCost === 15.1,
-    "regression comm step 3: BUY 5 @ 20 with comm 0.5 -> qty 10, live costBasis 151, avgCost 15.10"
+      regCommMap.REG_COMM?.cumCost === 201.5 &&
+      regCommMap.REG_COMM?.cumQuantity === 15 &&
+      Math.abs((regCommMap.REG_COMM?.avgCost ?? 0) - 201.5 / 15) < 1e-6,
+    "regression comm step 3: BUY 5 @ 20 with comm 0.5 -> qty 10, cumCost 201.5, cumQuantity 15, avgCost 13.4333"
   );
 
   // === RECONCILIATION APPLY PERSISTENCE & IDEMPOTENCY REGRESSION TEST ===

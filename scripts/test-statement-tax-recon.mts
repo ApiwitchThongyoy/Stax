@@ -769,10 +769,10 @@ async function main() {
     "backfill state is per-symbol: HHH fills, III (no BUY) stays non-computable"
   );
 
-  // ---- Moving Average Cost: SELL removes sold cost basis so later BUY does not blend sold shares ----
+  // ---- Webull Average Cost: SELL does not change the divisor (avg) ----
   // buy 1000@300, sell 500, buy 200@350:
-  //   after sell 500: remaining 500 @ 300 = 150000;
-  //   after buy 200 @ 350: (150000 + 70000) / 700 = 220000 / 700 = 314.285714...
+  //   old running avg = 314.29 (partial-sell math lowers the remaining avg);
+  //   Webull avg = (300000 + 70000) / 1200 = 308.33 (fees excluded, avg kept).
   const webullReplay = recomputeCostBasisMap([
     { symbol: "WBL", transactionDate: "2026-01-02", side: "BUY", quantity: "1000", unitPrice: "300.00" },
     { symbol: "WBL", transactionDate: "2026-01-05", side: "SELL", quantity: "500", unitPrice: "330.00" },
@@ -780,67 +780,72 @@ async function main() {
   ]);
   ok(
     webullReplay.WBL?.quantity === 700 &&
-      Math.abs((webullReplay.WBL?.avgCost ?? NaN) - (220000 / 700)) < 1e-6,
-    "moving avg = (150000 + 70000) / 700 = 314.29 (sold 500 shares do not affect later BUY avg)"
+      Math.abs((webullReplay.WBL?.avgCost ?? NaN) - 308.333333333) < 1e-6,
+    "Webull avg = cumulative cost / cumulative BUY qty = 308.33 (not the old 314.29 running avg)"
   );
 
   // ---- Critical Verification: Moving Average Cost sequence ----
   // 1. BUY 10 shares @ 10 USD -> quantity=10, costBasis=100, avgCost=10
   // 2. SELL 5 shares -> quantity=5, remainingCostBasis=50, avgCost=10, costBasisSold=50
-  // 3. BUY 5 shares @ 20 USD -> quantity=10, live costBasis=150, avgCost=15 (MUST NOT be 13.3333)
+  // 3. BUY 5 shares @ 20 USD -> quantity=10, cumCost=200, cumQuantity=15, avgCost=13.3333 (Webull lifetime average cost)
   const mapSeq: CostBasisMap = {};
   applyAverageCostTrade(mapSeq, "CASE1", "BUY", 10, 10);
   ok(
     mapSeq.CASE1?.quantity === 10 &&
       mapSeq.CASE1?.avgCost === 10 &&
-      mapSeq.CASE1?.cumCost === 100,
-    "case1 step 1: BUY 10 @ 10 -> qty 10, costBasis 100, avgCost 10"
+      mapSeq.CASE1?.cumCost === 100 &&
+      mapSeq.CASE1?.cumQuantity === 10,
+    "case1 step 1: BUY 10 @ 10 -> qty 10, cumCost 100, cumQuantity 10, avgCost 10"
   );
   const sellRes = applyAverageCostTrade(mapSeq, "CASE1", "SELL", 5, 12);
   const costBasisSold = (sellRes.sellBasis ?? 0) * 5;
   ok(
     mapSeq.CASE1?.quantity === 5 &&
       mapSeq.CASE1?.avgCost === 10 &&
-      mapSeq.CASE1?.cumCost === 50 &&
+      mapSeq.CASE1?.cumCost === 100 &&
+      mapSeq.CASE1?.cumQuantity === 10 &&
       costBasisSold === 50,
-    "case1 step 2: SELL 5 -> qty 5, remainingCostBasis 50, avgCost 10, costBasisSold 50"
+    "case1 step 2: SELL 5 -> qty 5, cumCost 100 (not reduced by SELL), avgCost 10, costBasisSold 50"
   );
   applyAverageCostTrade(mapSeq, "CASE1", "BUY", 5, 20);
   ok(
     mapSeq.CASE1?.quantity === 10 &&
-      mapSeq.CASE1?.cumCost === 150 &&
-      Math.abs((mapSeq.CASE1?.avgCost ?? 0) - 15) < 1e-6 &&
-      Math.abs((mapSeq.CASE1?.avgCost ?? 0) - 13.3333) > 0.5,
-    "case1 step 3: BUY 5 @ 20 -> qty 10, live costBasis 150, avgCost 15 (MUST NOT be 13.3333)"
+      mapSeq.CASE1?.cumCost === 200 &&
+      mapSeq.CASE1?.cumQuantity === 15 &&
+      Math.abs((mapSeq.CASE1?.avgCost ?? 0) - 200 / 15) < 1e-6,
+    "case1 step 3: BUY 5 @ 20 -> qty 10, cumCost 200, cumQuantity 15, avgCost 13.3333 (Webull lifetime avg)"
   );
 
   // Commission handling with the same sequence:
-  // 1. BUY 10 @ 10 + commission 1.00 -> acquisitionCost = 101.00, avgCost = 10.10, live costBasis = 101.00
-  // 2. SELL 5 -> costBasisSold = 50.50, remaining qty = 5, remaining costBasis = 50.50, avgCost = 10.10
-  // 3. BUY 5 @ 20 + commission 0.50 -> acquisitionCost = 100.50, live qty = 10, live costBasis = 151.00, avgCost = 15.10
+  // 1. BUY 10 @ 10 + commission 1.00 -> acquisitionCost = 101.00, avgCost = 10.10, cumCost = 101.00, cumQuantity = 10
+  // 2. SELL 5 -> costBasisSold = 50.50, remaining qty = 5, cumCost = 101.00, cumQuantity = 10, avgCost = 10.10
+  // 3. BUY 5 @ 20 + commission 0.50 -> acquisitionCost = 100.50, live qty = 10, cumCost = 201.50, cumQuantity = 15, avgCost = 13.4333
   const mapComm: CostBasisMap = {};
   applyAverageCostTrade(mapComm, "COMM", "BUY", 10, 10, undefined, 101);
   ok(
     mapComm.COMM?.quantity === 10 &&
       mapComm.COMM?.cumCost === 101 &&
+      mapComm.COMM?.cumQuantity === 10 &&
       mapComm.COMM?.avgCost === 10.1,
-    "comm step 1: BUY 10 @ 10 with comm 1 -> qty 10, costBasis 101, avgCost 10.10"
+    "comm step 1: BUY 10 @ 10 with comm 1 -> qty 10, cumCost 101, cumQuantity 10, avgCost 10.10"
   );
   const sellCommRes = applyAverageCostTrade(mapComm, "COMM", "SELL", 5, 15);
   const commBasisSold = (sellCommRes.sellBasis ?? 0) * 5;
   ok(
     mapComm.COMM?.quantity === 5 &&
       mapComm.COMM?.avgCost === 10.1 &&
-      mapComm.COMM?.cumCost === 50.5 &&
+      mapComm.COMM?.cumCost === 101 &&
+      mapComm.COMM?.cumQuantity === 10 &&
       commBasisSold === 50.5,
-    "comm step 2: SELL 5 -> qty 5, remainingCostBasis 50.50, avgCost 10.10, costBasisSold 50.50"
+    "comm step 2: SELL 5 -> qty 5, cumCost 101 (not reduced by SELL), avgCost 10.10, costBasisSold 50.50"
   );
   applyAverageCostTrade(mapComm, "COMM", "BUY", 5, 20, undefined, 100.5);
   ok(
     mapComm.COMM?.quantity === 10 &&
-      mapComm.COMM?.cumCost === 151 &&
-      mapComm.COMM?.avgCost === 15.1,
-    "comm step 3: BUY 5 @ 20 with comm 0.5 -> qty 10, live costBasis 151, avgCost 15.10"
+      mapComm.COMM?.cumCost === 201.5 &&
+      mapComm.COMM?.cumQuantity === 15 &&
+      Math.abs((mapComm.COMM?.avgCost ?? 0) - 201.5 / 15) < 1e-6,
+    "comm step 3: BUY 5 @ 20 with comm 0.5 -> qty 10, cumCost 201.5, cumQuantity 15, avgCost 13.4333"
   );
   const webullDivergence = computeGainLossBackfill([
     bfRow({
