@@ -11,7 +11,11 @@ import {
 import { db } from "~/lib/drizzle-db";
 import { documents } from "~/db/schema";
 import { computeContentHash, buildDuplicatePayload } from "~/lib/statement-hash";
-import { extractTextFromPdfBytes } from "~/lib/pdf-text-extractor";
+import {
+  extractTextFromPdfBytes,
+  getCachedPdfText,
+  setCachedPdfText,
+} from "~/lib/pdf-text-extractor";
 import {
   buildStatementTransactions,
   applyFxRateFallback,
@@ -264,12 +268,20 @@ async function rebuildStatementImport(input: {
     });
   };
 
-  let extraction;
-  try {
-    extraction = await extractTextFromPdfBytes(new Uint8Array(await file.arrayBuffer()));
-  } catch (extractError) {
-    console.error("Statement rebuild: extractTextFromPdfBytes threw", extractError);
-    return duplicateResponse();
+  let extraction: { ok: true; text: string; pageCount: number } | { ok: false; status: number; message: string };
+  const cachedExtraction = getCachedPdfText(contentHash);
+  if (cachedExtraction) {
+    extraction = { ok: true, text: cachedExtraction.text, pageCount: cachedExtraction.pageCount };
+  } else {
+    try {
+      extraction = await extractTextFromPdfBytes(new Uint8Array(await file.arrayBuffer()));
+      if (extraction.ok) {
+        setCachedPdfText(contentHash, { text: extraction.text, pageCount: extraction.pageCount });
+      }
+    } catch (extractError) {
+      console.error("Statement rebuild: extractTextFromPdfBytes threw", extractError);
+      return duplicateResponse();
+    }
   }
   if (!extraction.ok) {
     return duplicateResponse();
@@ -498,17 +510,25 @@ export async function action({ request }: Route.ActionArgs) {
 
   // Extract before creating metadata/storage: corrupt or textless PDFs must
   // not leave a document behind when extraction returns an error response.
-  let extraction;
-  try {
-    extraction = await extractTextFromPdfBytes(new Uint8Array(await file.arrayBuffer()));
-  } catch (extractError) {
-    console.error("Statement upload: text extraction failed", {
-      errorName: extractError instanceof Error ? extractError.name : "UnknownError",
-    });
-    return Response.json(
-      { success: false, message: "Failed to extract text from the PDF" },
-      { status: 500 }
-    );
+  let extraction: { ok: true; text: string; pageCount: number } | { ok: false; status: number; message: string };
+  const cachedExtraction = getCachedPdfText(contentHash);
+  if (cachedExtraction) {
+    extraction = { ok: true, text: cachedExtraction.text, pageCount: cachedExtraction.pageCount };
+  } else {
+    try {
+      extraction = await extractTextFromPdfBytes(new Uint8Array(await file.arrayBuffer()));
+      if (extraction.ok) {
+        setCachedPdfText(contentHash, { text: extraction.text, pageCount: extraction.pageCount });
+      }
+    } catch (extractError) {
+      console.error("Statement upload: text extraction failed", {
+        errorName: extractError instanceof Error ? extractError.name : "UnknownError",
+      });
+      return Response.json(
+        { success: false, message: "Failed to extract text from the PDF" },
+        { status: 500 }
+      );
+    }
   }
   if (!extraction.ok) {
     return Response.json(

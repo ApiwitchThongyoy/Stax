@@ -304,9 +304,19 @@ export default function AccountCategoryView({
     setSelected(null);
     setForm(emptyAddForm(type));
     setFormError("");
-    void loadAccounts();
+    // If viewing a specific transaction detail directly, defer loading all category accounts until needed
+    if (!initialTxId && !selectedTxId) {
+      void loadAccounts();
+    }
     return () => { categoryRequest.current++; };
-  }, [type, loadAccounts]);
+  }, [type, loadAccounts, initialTxId, selectedTxId]);
+
+  // Lazily load category accounts when returning from transaction detail if not already loaded
+  useEffect(() => {
+    if (!selectedTxId && !categorySummary && loadState !== "loading") {
+      void loadAccounts();
+    }
+  }, [selectedTxId, categorySummary, loadState, loadAccounts]);
 
   // ---- ดูรายละเอียดบัญชี ----
   const loadDetail = useCallback(async () => {

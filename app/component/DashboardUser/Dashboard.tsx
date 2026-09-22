@@ -73,6 +73,21 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const [targetLedgerTxId, setTargetLedgerTxId] = useState<string | null>(null);
   const location = useLocation();
 
+  // Keep-Alive Tab Cache: mount tabs lazily on first visit and keep them mounted
+  // in memory to eliminate refetch storms, skeleton flashes, and tab lag (0ms switching)
+  const [visitedNavs, setVisitedNavs] = useState<Set<NavId>>(
+    () => new Set(["dashboard", activeNav])
+  );
+
+  useEffect(() => {
+    setVisitedNavs((prev) => {
+      if (prev.has(activeNav)) return prev;
+      const next = new Set(prev);
+      next.add(activeNav);
+      return next;
+    });
+  }, [activeNav]);
+
   // Server-authoritative data for หน้าหลัก (ไม่มี session-import state แยก
   // ค่านี้เป็นแหล่งเดียวกับที่หน้าอื่นใช้)
   const [serverTransactions, setServerTransactions] = useState<Transaction[]>(
@@ -82,10 +97,12 @@ export default function Dashboard({ userEmail }: DashboardProps) {
     []
   );
   const [ledgerError, setLedgerError] = useState<string | null>(null);
+  const [dataRevision, setDataRevision] = useState(0);
 
   const refreshServerData = useCallback(async () => {
     if (!user?.accessToken) return;
     setLedgerError(null);
+    setDataRevision((prev) => prev + 1);
     try {
       const [rows, docs] = await Promise.all([
         fetchCapitalLedger(user.accessToken),
@@ -101,6 +118,17 @@ export default function Dashboard({ userEmail }: DashboardProps) {
       );
     }
   }, [user?.accessToken]);
+
+  const handleDataChanged = useCallback(() => {
+    setDataRevision((prev) => prev + 1);
+    void refreshServerData();
+  }, [refreshServerData]);
+
+  // When authenticated user changes, clear cached tabs to avoid cross-user state leaks
+  useEffect(() => {
+    setVisitedNavs(new Set(["dashboard"]));
+    setActiveNav("dashboard");
+  }, [user?.id]);
 
   useEffect(() => {
     void refreshServerData();
@@ -302,8 +330,12 @@ export default function Dashboard({ userEmail }: DashboardProps) {
             />
           ) : (
             <>
-              {activeNav === "dashboard" && (
-                <>
+              {visitedNavs.has("dashboard") && (
+                <div
+                  key={`dashboard-${dataRevision}`}
+                  className={activeNav === "dashboard" ? "block" : "hidden"}
+                  hidden={activeNav !== "dashboard"}
+                >
                   {ledgerError && (
                     <div className="bg-amber-50 border border-amber-200 text-amber-700 text-sm px-4 py-3 rounded-lg">
                       โหลดข้อมูลสำหรับหน้าหลักไม่สำเร็จ: {ledgerError}
@@ -317,67 +349,108 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                       onOpenSymbol={(symbol) => setSelectedSymbol(symbol)}
                     />
                   )}
-                </>
+                </div>
               )}
 
-              {activeNav === "gl" && (
-                <GeneralLedgerNew
-                  activeTab={glTab}
-                  targetTxId={targetLedgerTxId}
-                  onSelectTab={(t) => {
-                    setGlTab(t);
-                    setActiveNav("gl");
-                  }}
-                  onNavigateToArchive={() => setActiveNav("archive")}
-                  onOpenSymbol={(symbol) => setSelectedSymbol(symbol)}
-                  onNavigateToJournal={(entryNo) => {
-                    setJournalSearchQuery(`#${entryNo}`);
-                    setActiveNav("journal");
-                  }}
-                />
+              {visitedNavs.has("gl") && (
+                <div
+                  key={`gl-${dataRevision}`}
+                  className={activeNav === "gl" ? "block" : "hidden"}
+                  hidden={activeNav !== "gl"}
+                >
+                  <GeneralLedgerNew
+                    activeTab={glTab}
+                    targetTxId={targetLedgerTxId}
+                    onSelectTab={(t) => {
+                      setGlTab(t);
+                      setActiveNav("gl");
+                    }}
+                    onNavigateToArchive={() => setActiveNav("archive")}
+                    onOpenSymbol={(symbol) => setSelectedSymbol(symbol)}
+                    onNavigateToJournal={(entryNo) => {
+                      setJournalSearchQuery(`#${entryNo}`);
+                      setActiveNav("journal");
+                    }}
+                  />
+                </div>
               )}
 
-              {activeNav === "journal" && (
-                <JournalPage
-                  initialSearch={journalSearchQuery}
-                  onNavigateToArchive={() => setActiveNav("archive")}
-                  onNavigateToLedger={(sourceTransactionId, category) => {
-                    setTargetLedgerTxId(sourceTransactionId);
-                    if (category) {
-                      setGlTab(category);
-                    } else {
-                      setGlTab("ASSET");
-                    }
-                    setActiveNav("gl");
-                  }}
-                />
+              {visitedNavs.has("journal") && (
+                <div
+                  key={`journal-${dataRevision}`}
+                  className={activeNav === "journal" ? "block" : "hidden"}
+                  hidden={activeNav !== "journal"}
+                >
+                  <JournalPage
+                    initialSearch={journalSearchQuery}
+                    onNavigateToArchive={() => setActiveNav("archive")}
+                    onNavigateToLedger={(sourceTransactionId, category) => {
+                      setTargetLedgerTxId(sourceTransactionId);
+                      if (category) {
+                        setGlTab(category);
+                      } else {
+                        setGlTab("ASSET");
+                      }
+                      setActiveNav("gl");
+                    }}
+                    onDataChanged={handleDataChanged}
+                  />
+                </div>
               )}
 
-              {activeNav === "upload" && (
-                <StatementUploadPage
-                  onNavigateToArchive={() => setActiveNav("archive")}
-                  onNavigateToOverview={() => {
-                    setGlTab("overview");
-                    setActiveNav("gl");
-                  }}
-                  onImportSuccess={refreshServerData}
-                />
+              {visitedNavs.has("upload") && (
+                <div
+                  className={activeNav === "upload" ? "block" : "hidden"}
+                  hidden={activeNav !== "upload"}
+                >
+                  <StatementUploadPage
+                    onNavigateToArchive={() => setActiveNav("archive")}
+                    onNavigateToOverview={() => {
+                      setGlTab("overview");
+                      setActiveNav("gl");
+                    }}
+                    onImportSuccess={refreshServerData}
+                  />
+                </div>
               )}
 
-              {activeNav === "archive" && <StatementArchivePage />}
-
-              {activeNav === "cashflow" && (
-                <CashFlowPage onBack={() => setActiveNav("dashboard")} />
+              {visitedNavs.has("archive") && (
+                <div
+                  key={`archive-${dataRevision}`}
+                  className={activeNav === "archive" ? "block" : "hidden"}
+                  hidden={activeNav !== "archive"}
+                >
+                  <StatementArchivePage />
+                </div>
               )}
 
-              {activeNav === "trading" && (
-                <TradingJournalPage
-                  onOpenSymbol={(symbol) => setSelectedSymbol(symbol)}
-                />
+              {visitedNavs.has("cashflow") && (
+                <div
+                  className={activeNav === "cashflow" ? "block" : "hidden"}
+                  hidden={activeNav !== "cashflow"}
+                >
+                  <CashFlowPage onBack={() => setActiveNav("dashboard")} />
+                </div>
               )}
 
-              {activeNav === "settings" && (
-                <SettingsPage onLogout={handleLogout} />
+              {visitedNavs.has("trading") && (
+                <div
+                  className={activeNav === "trading" ? "block" : "hidden"}
+                  hidden={activeNav !== "trading"}
+                >
+                  <TradingJournalPage
+                    onOpenSymbol={(symbol) => setSelectedSymbol(symbol)}
+                  />
+                </div>
+              )}
+
+              {visitedNavs.has("settings") && (
+                <div
+                  className={activeNav === "settings" ? "block" : "hidden"}
+                  hidden={activeNav !== "settings"}
+                >
+                  <SettingsPage onLogout={handleLogout} />
+                </div>
               )}
             </>
           )}

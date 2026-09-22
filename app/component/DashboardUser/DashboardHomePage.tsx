@@ -152,21 +152,22 @@ export default function DashboardHomePage({
     setHoldings(holdingsValue);
     setCashSummary(c.status === "fulfilled" ? c.value : null);
     setMonthlyClosing(m.status === "fulfilled" ? m.value : null);
-    if (holdingsValue && holdingsValue.length > 0) {
-      const q = await Promise.allSettled([
-        fetchStockQuotes(
-          accessToken,
-          holdingsValue.map((x) => x.symbol)
-        ),
-      ]);
-      setQuotes(q[0].status === "fulfilled" ? q[0].value : []);
-    } else {
-      setQuotes([]);
-    }
     if (s.status === "rejected" && h.status === "rejected") {
       setError("โหลดข้อมูลภาพรวมไม่สำเร็จ (เซิร์ฟเวอร์ไม่ตอบกลับ)");
     }
+    // Release loading skeleton immediately so financial position and monthly trend render instantly
     setLoading(false);
+
+    if (holdingsValue && holdingsValue.length > 0) {
+      void fetchStockQuotes(
+        accessToken,
+        holdingsValue.map((x) => x.symbol)
+      )
+        .then((data) => setQuotes(data))
+        .catch(() => setQuotes([]));
+    } else {
+      setQuotes([]);
+    }
   }, [accessToken]);
 
   useEffect(() => {

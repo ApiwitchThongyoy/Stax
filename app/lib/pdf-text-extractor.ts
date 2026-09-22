@@ -38,6 +38,50 @@ export type PdfTextExtractionResult =
   | { ok: true; text: string; pageCount: number }
   | { ok: false; status: number; message: string };
 
+interface CachedExtraction {
+  text: string;
+  pageCount: number;
+  expiresAt: number;
+}
+const extractionCache = new Map<string, CachedExtraction>();
+const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const MAX_CACHE_ENTRIES = 50;
+
+/** Retrieve cached extracted text by content hash if still valid. */
+export function getCachedPdfText(
+  contentHash: string
+): { text: string; pageCount: number } | null {
+  const cached = extractionCache.get(contentHash);
+  if (!cached) return null;
+  if (Date.now() > cached.expiresAt) {
+    extractionCache.delete(contentHash);
+    return null;
+  }
+  return { text: cached.text, pageCount: cached.pageCount };
+}
+
+/** Store successfully extracted text in memory cache by content hash. */
+export function setCachedPdfText(
+  contentHash: string,
+  result: { text: string; pageCount: number }
+): void {
+  if (extractionCache.size >= MAX_CACHE_ENTRIES) {
+    const oldestKey = extractionCache.keys().next().value;
+    if (oldestKey) extractionCache.delete(oldestKey);
+  }
+  extractionCache.set(contentHash, {
+    text: result.text,
+    pageCount: result.pageCount,
+    expiresAt: Date.now() + CACHE_TTL_MS,
+  });
+}
+
+/** Clear the in-memory extraction cache (for tests / restart simulation). */
+export function clearPdfExtractionCacheForTest(): void {
+  extractionCache.clear();
+}
+
+
 /** A single positioned text run on a page, in PDF coordinate space. */
 export interface PdfTextItem {
   x: number;

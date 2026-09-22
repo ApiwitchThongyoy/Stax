@@ -2250,10 +2250,11 @@ export async function listJournalEntries(
   to?: string,
   filters?: JournalEntryListFilters
 ): Promise<PersistedJournalEntry[]> {
+  const isSkippedOnly = filters?.postingState === "SKIPPED";
   const [accountRows, headers, raw] = await Promise.all([
     getAccounts(userId),
     fetchJournalHeaders(userId, from, to, filters),
-    fetchRawLines(userId, from, to),
+    isSkippedOnly ? Promise.resolve([]) : fetchRawLines(userId, from, to),
   ]);
   const accountMap = toAccountMap(accountRows);
 

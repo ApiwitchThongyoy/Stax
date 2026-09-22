@@ -3293,6 +3293,60 @@ async function main() {
       resB.updates.length === 0,
       "Manual BUY test 7: Multi-tenant isolation: User A's Manual BUY is never visible to User B's reconciliation"
     );
+
+    // =========================================================================
+    // TASK 5 INVARIANT: SKIPPED journal entries are guaranteed to have zero lines
+    // =========================================================================
+    const skippedCandidate = validateJournalEntry({
+      entryDate: "2026-03-01",
+      description: "SKIPPED test entry",
+      sourceType: "STATEMENT",
+      sourceTransactionId: "tx-skipped-invariant-test",
+      postingState: "SKIPPED",
+      skipReason: "non-computable cost basis",
+      lines: [
+        {
+          accountId: "1020",
+          currency: "USD",
+          debit: "100.00",
+          fxRateEffective: "35.00",
+        },
+        {
+          accountId: "1110",
+          currency: "USD",
+          credit: "100.00",
+          fxRateEffective: "35.00",
+        },
+      ],
+    });
+    ok(skippedCandidate.ok, "SKIPPED candidate validates successfully");
+    if (skippedCandidate.ok) {
+      ok(
+        skippedCandidate.entry.postingState === "SKIPPED",
+        "SKIPPED candidate maintains postingState = SKIPPED"
+      );
+      ok(
+        skippedCandidate.entry.lines.length === 0,
+        "TASK 5 INVARIANT: validateJournalEntry guarantees SKIPPED entries have 0 lines (lines array forced empty)"
+      );
+    }
+
+    const skippedWithoutLines = validateJournalEntry({
+      entryDate: "2026-03-01",
+      description: "SKIPPED entry with no lines passed",
+      sourceType: "STATEMENT",
+      sourceTransactionId: "tx-skipped-empty-lines",
+      postingState: "SKIPPED",
+      skipReason: "reference row",
+      lines: [],
+    });
+    ok(skippedWithoutLines.ok, "SKIPPED entry with lines: [] validates successfully");
+    if (skippedWithoutLines.ok) {
+      ok(
+        skippedWithoutLines.entry.lines.length === 0,
+        "SKIPPED entry with lines: [] has 0 lines"
+      );
+    }
   }
 
   runReportRegressions(ok);

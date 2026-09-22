@@ -21,7 +21,11 @@
 import {
   extractPdfTextRows,
   extractTextFromPdfBytes,
+  getCachedPdfText,
+  setCachedPdfText,
+  clearPdfExtractionCacheForTest,
 } from "../app/lib/pdf-text-extractor";
+import { computeContentHash } from "../app/lib/statement-hash";
 
 let passed = 0;
 let failed = 0;
@@ -222,6 +226,38 @@ async function main() {
   for (const term of brokerVocabulary) {
     const re = new RegExp(`\\b${term.replace(/ /g, "\\s+")}`, "i");
     ok(!re.test(extractorSrc), `extractor source has no broker vocabulary: "${term}"`);
+  }
+
+  // 10. PDF in-memory extraction cache is optional optimization only.
+  //     Verify:
+  //     - Preview writes to cache with contentHash key (SHA-256 of bytes)
+  //     - getCachedPdfText returns cached result on cache hit
+  //     - Cache miss (server restart / cleared cache / eviction) falls back to normal extraction
+  //     - Cache clear between Preview and Upload succeeds normally and extracts identical text
+  clearPdfExtractionCacheForTest();
+  const testBytes = genericPdf;
+  const hash = computeContentHash(testBytes);
+  ok(getCachedPdfText(hash) === null, "empty cache returns null on lookup");
+
+  // Step A: Preview extracts and caches
+  const previewResult = await extractTextFromPdfBytes(testBytes);
+  ok(previewResult.ok, "preview extraction succeeds");
+  if (previewResult.ok) {
+    setCachedPdfText(hash, { text: previewResult.text, pageCount: previewResult.pageCount });
+  }
+  const hit = getCachedPdfText(hash);
+  ok(hit !== null && hit.text === (previewResult as any).text, "cache hit returns identical text");
+
+  // Step B: Simulate server restart / instance change / cache expiration
+  clearPdfExtractionCacheForTest();
+  ok(getCachedPdfText(hash) === null, "cleared cache returns null (restart simulation)");
+
+  // Step C: Upload on cache miss must fall back to normal extraction and succeed
+  const uploadResult = await extractTextFromPdfBytes(testBytes);
+  ok(uploadResult.ok, "upload on cache miss succeeds normally");
+  if (uploadResult.ok && previewResult.ok) {
+    ok(uploadResult.text === previewResult.text, "upload extracted text matches preview exactly");
+    ok(uploadResult.pageCount === previewResult.pageCount, "upload pageCount matches preview");
   }
 
   // Summary

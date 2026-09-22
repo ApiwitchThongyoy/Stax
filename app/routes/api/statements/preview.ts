@@ -8,7 +8,10 @@ import {
   validatePdfFile,
 } from "~/lib/storage/statement-storage";
 import { computeContentHash, buildDuplicatePayload } from "~/lib/statement-hash";
-import { extractTextFromPdfBytes } from "~/lib/pdf-text-extractor";
+import {
+  extractTextFromPdfBytes,
+  setCachedPdfText,
+} from "~/lib/pdf-text-extractor";
 import {
   applyFxRateFallback,
   buildStatementTransactions,
@@ -153,6 +156,11 @@ export async function action({ request }: Route.ActionArgs) {
       { status: extraction.status }
     );
   }
+
+  setCachedPdfText(contentHash, {
+    text: extraction.text,
+    pageCount: extraction.pageCount,
+  });
 
   // Deterministic in-memory pipeline. The documentId below is preview-only:
   // it links the rows the UI shows, never persisted (the real import generates

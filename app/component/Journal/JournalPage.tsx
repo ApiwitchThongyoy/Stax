@@ -53,6 +53,7 @@ interface JournalPageProps {
     sourceTransactionId: string,
     category?: "ASSET" | "LIABILITY" | "EQUITY" | "INCOME" | "EXPENSE"
   ) => void;
+  onDataChanged?: () => void;
 }
 
 const SIDE_LABELS: Record<string, string> = {
@@ -191,6 +192,7 @@ export default function JournalPage({
   initialSearch,
   onNavigateToArchive,
   onNavigateToLedger,
+  onDataChanged,
 }: JournalPageProps) {
   const { user } = useAuth();
   const [entries, setEntries] = useState<GeneralLedgerJournalEntry[]>([]);
@@ -236,6 +238,7 @@ export default function JournalPage({
     setToastMessage(msg);
     setTimeout(() => setToastMessage(""), 4000);
     void loadAll();
+    onDataChanged?.();
   };
 
   const loadAll = useCallback(async () => {

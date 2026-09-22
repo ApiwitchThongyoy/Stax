@@ -572,7 +572,8 @@ export function validateJournalEntry(
   const lines: ValidatedJournalLine[] = [];
   const byCurrency: Record<string, { debit: Decimal; credit: Decimal }> = {};
 
-  input.lines.forEach((line, i) => {
+  if (!isSkipped && Array.isArray(input.lines)) {
+    input.lines.forEach((line, i) => {
     const idx = `line[${i}]`;
     const currency = (line.currency ?? "").trim().toUpperCase();
     if (!isValidCurrency(currency)) {
@@ -647,6 +648,7 @@ export function validateJournalEntry(
     else bucket.credit = bucket.credit.plus(amount);
     byCurrency[currency] = bucket;
   });
+  }
 
   if (errors.length > 0) return { ok: false, errors };
 
@@ -799,7 +801,7 @@ export function validateJournalEntry(
       sourceType: input.sourceType ?? "MANUAL",
       sourceDocumentId: input.sourceDocumentId ?? null,
       sourceTransactionId: input.sourceTransactionId ?? null,
-      lines,
+      lines: isSkipped ? [] : lines,
       postingState: isSkipped ? "SKIPPED" : "POSTED",
       skipReason: input.skipReason ?? null,
       detail,

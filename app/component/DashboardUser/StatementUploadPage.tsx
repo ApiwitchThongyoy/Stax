@@ -180,7 +180,9 @@ export default function StatementUploadPage({
   };
 
   const advanceThrough = useCallback(() => {
-    const duration = 700;
+    // Fast, lightweight step transitions without artificial delays (saving 3+ seconds)
+    // so UI remains responsive and reaches terminal status as soon as server responds
+    const duration = 80;
     settle(duration, () => setPhase("storing"));
     settle(duration * 2, () => setPhase("extracting"));
     settle(duration * 3, () => setPhase("parsing"));
@@ -878,10 +880,15 @@ export default function StatementUploadPage({
               <button
                 type="button"
                 onClick={handlePreviewConfirm}
-                className="inline-flex items-center gap-1.5 bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium px-4 py-2 rounded-lg transition"
+                disabled={isRunning}
+                className="inline-flex items-center gap-1.5 bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium px-4 py-2 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                OK — นำเข้า {preview?.rows?.length ?? 0} รายการ
+                {isRunning ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                )}
+                {isRunning ? "กำลังนำเข้า..." : `OK — นำเข้า ${preview?.rows?.length ?? 0} รายการ`}
               </button>
             </div>
           </div>
