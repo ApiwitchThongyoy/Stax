@@ -1383,6 +1383,17 @@ export async function reconcileStatementDeletion(
   await reconcileStatementState(userId, affectedSymbols, tx);
 }
 
+/**
+ * Reconcile cost basis, gain/loss, journal lines, and cost_basis_state for affected symbols.
+ */
+export async function reconcileAffectedInvestmentState(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  userId: string,
+  affectedSymbols: Set<string>,
+): Promise<void> {
+  await reconcileStatementState(userId, affectedSymbols, tx);
+}
+
 /** Reconcile in a fresh transaction after a committed statement import. */
 export async function reconcileStatementImport(
   userId: string,
@@ -1446,8 +1457,8 @@ async function reconcileStatementState(
       await tx.delete(journalEntryLines).where(and(eq(journalEntryLines.userId, userId),
         eq(journalEntryLines.journalEntryId, journal.id)));
       await tx.update(journalEntries).set({
-        ...update, averageCost: entry.detail.averageCost,
-        postingState: entry.postingState, skipReason: entry.skipReason, updatedAt: new Date().toISOString(),
+        ...update, averageCost: entry.detail.averageCost ?? null,
+        postingState: entry.postingState, skipReason: entry.skipReason ?? null, updatedAt: new Date().toISOString(),
       }).where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, journal.id)));
       for (const line of entry.lines) {
         await tx.insert(journalEntryLines).values({
@@ -3271,7 +3282,8 @@ export interface StructuredManualJournalInput {
  */
 export async function createStructuredManualJournal(
   userId: string,
-  input: StructuredManualJournalInput
+  input: StructuredManualJournalInput,
+  conn: Conn = db
 ): Promise<CreateEntryResult> {
   const ccy = (input.currency || "THB").toUpperCase();
   const fx = input.fxRateEffective || (ccy === "THB" ? "1" : "35");
@@ -3284,27 +3296,21 @@ export async function createStructuredManualJournal(
     case "BUY": {
       category = "asset";
       side = "BUY";
+      type = "CASH_OUT";
       const gross = input.grossAmount || (input.quantity && input.unitPrice ? new Decimal(input.quantity).times(input.unitPrice).toFixed(2) : input.amount || "0");
       const fee = input.fees || "0";
       const net = input.netAmount || (new Decimal(gross).plus(fee).toFixed(2));
       const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
 
+      // BUY acquisition cost must equal netAmount (grossAmount + fees), matching Statement BUY policy
+      // (capitalize fee into 1110 Investment, do not separate into 5010).
       postingLines.push({
         accountId: "1110",
         currency: ccy,
-        debit: gross,
+        debit: net,
         fxRateEffective: fx,
         memo: input.symbol ? `${input.symbol} ${input.quantity ?? ""} @ ${input.unitPrice ?? ""}`.trim() : "ซื้อหุ้น",
       });
-      if (new Decimal(fee).gt(0)) {
-        postingLines.push({
-          accountId: "5010",
-          currency: ccy,
-          debit: fee,
-          fxRateEffective: fx,
-          memo: "ค่าธรรมเนียมการซื้อ",
-        });
-      }
       postingLines.push({
         accountId: cashCode,
         currency: ccy,
@@ -3615,38 +3621,94 @@ export async function createStructuredManualJournal(
     }
   }
 
-  const result = await createJournalEntry(userId, {
-    entryDate: input.entryDate,
-    description: input.description,
-    sourceType: "MANUAL",
-    detail: {
-      ...emptyTradeDetail(),
-      category,
-      symbol: input.symbol ?? null,
-      side,
-      quantity: input.quantity ?? null,
-      unitPrice: input.unitPrice ?? null,
-      grossAmount: input.grossAmount ?? null,
-      fees: input.fees ?? null,
-      netAmount: input.netAmount ?? null,
-      currency: ccy,
-      amount: input.amount ?? null,
-      fxRateEffective: fx,
-      isFxConversion: input.transactionType === "FX",
-      exchangeFromCurrency: input.fromCurrency ?? null,
-      exchangeFromAmount: input.fromAmount ?? null,
-      exchangeRate: input.exchangeRate ?? null,
-    },
-    lines: postingLines,
-  });
+  const executeCreation = async (tx: TxClient): Promise<CreateEntryResult> => {
+    let capitalTransactionId: string | undefined;
+    const normalizedSymbol = input.symbol ? input.symbol.trim().toUpperCase() : null;
 
-  if (result.ok && input.note?.trim()) {
-    await db
-      .update(journalEntries)
-      .set({ note: input.note.trim() })
-      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, result.entryId)))
-      .execute();
+    if (input.transactionType === "BUY") {
+      capitalTransactionId = randomUUID();
+      const gross = input.grossAmount || (input.quantity && input.unitPrice ? new Decimal(input.quantity).times(input.unitPrice).toFixed(2) : input.amount || "0");
+      const fee = input.fees || "0";
+      const net = input.netAmount || (new Decimal(gross).plus(fee).toFixed(2));
+
+      await tx.insert(capitalTransactions).values({
+        transactionId: capitalTransactionId,
+        userId,
+        amountForeign: net,
+        currency: ccy,
+        transactionDate: input.entryDate,
+        fxRateEffective: fx,
+        fxRateStatement: ccy === "THB" ? "1" : fx,
+        amountThb: new Decimal(net).times(fx).toFixed(2),
+        type: "CASH_OUT",
+        sourceType: "MANUAL",
+        category: "asset",
+        section: normalizedSymbol ? `ซื้อหุ้น:${normalizedSymbol}` : "ซื้อหุ้น",
+        symbol: normalizedSymbol,
+        side: "BUY",
+        quantity: input.quantity ? String(input.quantity) : null,
+        unitPrice: input.unitPrice ? String(input.unitPrice) : null,
+        grossAmount: gross,
+        fees: fee,
+        netAmount: net,
+        isMonthlyFeeAggregate: false,
+      }).execute();
+    }
+
+    const result = await createJournalEntry(
+      userId,
+      {
+        entryDate: input.entryDate,
+        description: input.description,
+        sourceType: "MANUAL",
+        sourceTransactionId: capitalTransactionId,
+        detail: {
+          ...emptyTradeDetail(),
+          category,
+          symbol: normalizedSymbol ?? input.symbol ?? null,
+          side,
+          quantity: input.quantity ?? null,
+          unitPrice: input.unitPrice ?? null,
+          grossAmount: input.grossAmount ?? null,
+          fees: input.fees ?? null,
+          netAmount: input.netAmount ?? null,
+          currency: ccy,
+          amount: input.amount ?? null,
+          fxRateEffective: fx,
+          isFxConversion: input.transactionType === "FX",
+          exchangeFromCurrency: input.fromCurrency ?? null,
+          exchangeFromAmount: input.fromAmount ?? null,
+          exchangeRate: input.exchangeRate ?? null,
+        },
+        lines: postingLines,
+      },
+      tx
+    );
+
+    if (!result.ok) {
+      throw new Error(result.errors?.join("; ") || "Failed to persist journal entry");
+    }
+
+    if (input.note?.trim()) {
+      await tx
+        .update(journalEntries)
+        .set({ note: input.note.trim() })
+        .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, result.entryId)))
+        .execute();
+    }
+
+    if (input.transactionType === "BUY" && normalizedSymbol) {
+      await reconcileStatementState(userId, new Set([normalizedSymbol]), tx);
+    }
+
+    return result;
+  };
+
+  try {
+    return await (conn === db
+      ? db.transaction(async (tx) => executeCreation(tx))
+      : executeCreation(conn as TxClient));
+  } catch (error: any) {
+    return { ok: false, errors: [error?.message || "Failed to persist journal entry"] };
   }
-
-  return result;
 }

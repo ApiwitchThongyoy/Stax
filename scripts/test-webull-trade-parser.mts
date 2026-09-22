@@ -103,12 +103,12 @@ function main() {
     "f1: SELL qty/price parsed");
   ok(f1Sell !== undefined && f1Sell.netAmount === 1497.93 && f1Sell.grossAmount === 1500,
     "f1: SELL net is the authoritative statement value (not recomputed)");
-  ok(f1Sell !== undefined && approx(f1Sell.proceeds ?? NaN, 1500),
-    "f1: proceeds = gross proceeds (fees expensed separately)");
+  ok(f1Sell !== undefined && approx(f1Sell.proceeds ?? NaN, 1497.93),
+    "f1: proceeds = net proceeds (fees already netted)");
   ok(f1Sell !== undefined && approx(f1Sell.costBasis ?? NaN, 750.63, 0.01),
     "f1: costBasis = running avg (15.0125) * qty (50) = 750.63");
-  ok(f1Sell !== undefined && approx(f1Sell.realizedGainLoss ?? NaN, 749.37, 0.02),
-    "f1: realizedGainLoss = gross - costBasis = 749.37 (computable)");
+  ok(f1Sell !== undefined && approx(f1Sell.realizedGainLoss ?? NaN, 747.30, 0.02),
+    "f1: realizedGainLoss = net proceeds - costBasis = 747.30 (computable)");
   ok(f1Sell !== undefined && f1Sell.rate === "35.42",
     "f1: SELL rate uses the statement FX header (USD/THB = 35.42)");
   ok(approx(f1.updatedCostBasis.VRMAX?.quantity ?? NaN, 150),
@@ -116,7 +116,7 @@ function main() {
   ok(approx(f1.updatedCostBasis.VRMAX?.avgCost ?? NaN, 15.0125, 0.001),
     "f1: cost basis avgCost unchanged by SELL (15.0125)");
   const f1Gain = gainRow(f1.transactions, "VRMAX");
-  ok(f1Gain !== undefined && approx(f1Gain.pnlAmount ?? NaN, 749.37, 0.02) && f1Gain.included === true,
+  ok(f1Gain !== undefined && approx(f1Gain.pnlAmount ?? NaN, 747.30, 0.02) && f1Gain.included === true,
     "f1: computable SELL also emits a REAL income gain row (included)");
 
   // ---- 2. Signed fees: negative commission = rebate, net used verbatim ----
@@ -134,8 +134,8 @@ function main() {
     "f2: negative fee is kept negative (rebate, NOT Math.abs'd)");
   ok(f2Sell !== undefined && f2Sell.netAmount === 45.48,
     "f2: broker net 45.48 used verbatim even though Gross-Comm = 45.60");
-  ok(f2Sell !== undefined && approx(f2Sell.realizedGainLoss ?? NaN, 3.48),
-    "f2: realized = gross 45.54 - (21.03 * 2) = 3.48 (portfolio-summary seed)");
+  ok(f2Sell !== undefined && approx(f2Sell.realizedGainLoss ?? NaN, 3.42),
+    "f2: realized = net proceeds 45.48 - (21.03 * 2) = 3.42 (portfolio-summary seed)");
   ok(f2Sell !== undefined && f2Sell.exchange === "AMEX",
     "f2: exchange AMEX carried");
 

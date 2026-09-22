@@ -474,41 +474,11 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
         };
       }
 
-      // Selling fee & VAT recorded separately as expenses (5010 & 5130)
-      let sellingFee = new Decimal(0);
-      let sellingVat = new Decimal(0);
-      if (row.fees != null) {
-        const totalFees = new Decimal(row.fees).abs();
-        if (totalFees.gt(0)) {
-          sellingFee = totalFees.div(1.07).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
-          sellingVat = totalFees.minus(sellingFee);
-          if (sellingVat.lt(0)) sellingVat = new Decimal(0);
-        }
-      }
+      // Authoritative net proceeds (cash received)
+      const netCash = row.proceeds != null && new Decimal(row.proceeds).isFinite()
+        ? new Decimal(row.proceeds)
+        : new Decimal(amount);
 
-      const basisDec = new Decimal(costBasis).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
-
-      // Determine gross proceeds and trading gain/loss
-      let tradingGainLoss: Decimal;
-      let gross: Decimal;
-
-      if (row.grossAmount != null && new Decimal(row.grossAmount).isFinite()) {
-        gross = new Decimal(row.grossAmount);
-        tradingGainLoss = gross.minus(basisDec);
-      } else if (row.realizedGainLoss != null && new Decimal(row.realizedGainLoss).isFinite()) {
-        tradingGainLoss = new Decimal(row.realizedGainLoss);
-        gross = basisDec.plus(tradingGainLoss);
-      } else if (row.proceeds != null && new Decimal(row.proceeds).isFinite()) {
-        const proc = new Decimal(row.proceeds);
-        gross = proc.plus(sellingFee).plus(sellingVat);
-        tradingGainLoss = gross.minus(basisDec);
-      } else {
-        const netCandidate = new Decimal(amount);
-        gross = netCandidate.plus(sellingFee).plus(sellingVat);
-        tradingGainLoss = gross.minus(basisDec);
-      }
-
-      const netCash = gross.minus(sellingFee).minus(sellingVat);
       if (!netCash.isFinite() || netCash.lte(0)) {
         return {
           ok: false,
@@ -516,22 +486,24 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
         };
       }
 
+      const basisDec = new Decimal(costBasis).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+      // SELL FEE POLICY: realizedGainLoss = NET PROCEEDS - COST BASIS.
+      // The SELL fee is ALREADY netted inside net proceeds, so it is NEVER expensed
+      // separately as 5010/5130 — doing so would double-count the fee and/or unbalance the entry.
+      const tradingGainLoss = row.realizedGainLoss != null && new Decimal(row.realizedGainLoss).isFinite()
+        ? new Decimal(row.realizedGainLoss).toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+        : netCash.minus(basisDec).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+
       const lines: JournalLineInput[] = [
         leg(cash, "debit", netCash.toFixed(2), row),
       ];
-      if (sellingFee.gt(0)) {
-        lines.push(leg(FEE_EXPENSE, "debit", sellingFee.toFixed(2), row, "ค่านายหน้าขายหุ้น"));
-      }
-      if (sellingVat.gt(0)) {
-        lines.push(leg(VAT_EXPENSE, "debit", sellingVat.toFixed(2), row, "VAT จากค่าธรรมเนียม"));
-      }
 
       if (tradingGainLoss.gt(0)) {
-        // Gain on sale
+        // Gain on sale: Dr Cash (net), Cr Investment (basis), Cr Gain (tradingGainLoss)
         lines.push(leg(INVEST_STOCKS, "credit", basisDec.toFixed(2), row));
         lines.push(leg(GAIN_INCOME, "credit", tradingGainLoss.toFixed(2), row, row.symbol));
       } else if (tradingGainLoss.lt(0)) {
-        // Loss on sale
+        // Loss on sale: Dr Cash (net), Dr Loss (|tradingGainLoss|), Cr Investment (basis)
         lines.push(leg(LOSS_EXPENSE, "debit", tradingGainLoss.abs().toFixed(2), row, row.symbol));
         lines.push(leg(INVEST_STOCKS, "credit", basisDec.toFixed(2), row));
       } else {
@@ -541,7 +513,7 @@ function postCapitalRowUnchecked(row: ValidatedCapitalRow): CapitalPostingResult
 
       return {
         ok: true,
-        note: "sell with realized gain/loss split, fee, and vat",
+        note: "sell with realized gain/loss split",
         entry: {
           entryDate: row.transactionDate,
           description: descriptionFor(row),

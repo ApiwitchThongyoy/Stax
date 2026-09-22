@@ -737,13 +737,13 @@ export function parseStatementRows(
     );
 
     if (ev.side === "SELL" && sellBasis !== null) {
-      // Gross proceeds for trading gain/loss; fees/VAT expensed separately in GL:
-      // realizedTradingGainLoss = gross proceeds - cost basis sold
-      const grossProceeds = ev.gross && ev.gross > 0 ? ev.gross : ev.net;
-      const calculated = realizedAmounts(grossProceeds, new Decimal(sellBasis).mul(ev.qty), null);
+      // SELL FEE POLICY: realizedGainLoss = NET PROCEEDS - COST BASIS
+      // The SELL fee is ALREADY netted inside net proceeds (authoritative).
+      const netProceeds = ev.net;
+      const calculated = realizedAmounts(netProceeds, new Decimal(sellBasis).mul(ev.qty), null);
       pnlAmount = Number(calculated.realizedGainLoss);
       realizedMeta = {
-        proceeds: grossProceeds,
+        proceeds: netProceeds,
         costBasis: new Decimal(sellBasis).mul(ev.qty).toNumber(),
         realizedGainLoss: pnlAmount,
       };

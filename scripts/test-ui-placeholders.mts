@@ -2531,6 +2531,12 @@ ok(
 );
 
 ok(
+  journalActionModals.includes("การเพิ่มรายการซื้อย้อนหลังจะถูกนำไปคำนวณต้นทุนของรายการขายภายหลังโดยอัตโนมัติ") &&
+    journalActionModals.includes("เพิ่มรายการเรียบร้อยแล้ว และคำนวณต้นทุนรายการขายที่เกี่ยวข้องใหม่แล้ว"),
+  "Manual BUY modal displays automatic cost basis calculation note and tailored success notification"
+);
+
+ok(
   journalActionModals.includes("ประวัติการแก้ไข") &&
     journalActionModals.includes("ข้อมูลเดิมก่อนแก้ไข") &&
     journalActionModals.includes("ข้อมูลใหม่หลังแก้ไข"),

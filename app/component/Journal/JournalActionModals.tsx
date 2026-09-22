@@ -690,7 +690,11 @@ export function ManualJournalEntryModal({
     setIsSaving(false);
 
     if (res.ok) {
-      onSuccess("เพิ่มรายการเรียบร้อยแล้ว");
+      const successMessage =
+        type === "BUY"
+          ? "เพิ่มรายการเรียบร้อยแล้ว และคำนวณต้นทุนรายการขายที่เกี่ยวข้องใหม่แล้ว"
+          : "เพิ่มรายการเรียบร้อยแล้ว";
+      onSuccess(successMessage);
       onClose();
     } else {
       setConfirmStep(false);
@@ -850,6 +854,12 @@ export function ManualJournalEntryModal({
                       />
                     </div>
                   </div>
+                  {type === "BUY" && (
+                    <div className="p-2.5 bg-blue-50/80 border border-blue-200 rounded-lg text-blue-800 text-[11px] flex items-start gap-2">
+                      <Info className="w-3.5 h-3.5 mt-0.5 shrink-0 text-blue-600" />
+                      <span>การเพิ่มรายการซื้อย้อนหลังจะถูกนำไปคำนวณต้นทุนของรายการขายภายหลังโดยอัตโนมัติ</span>
+                    </div>
+                  )}
                 </div>
               )}
 
