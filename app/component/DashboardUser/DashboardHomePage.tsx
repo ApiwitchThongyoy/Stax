@@ -6,7 +6,21 @@ import {
   RefreshCw,
   UploadCloud,
   Wallet,
+  TrendingUp,
+  TrendingDown,
+  Layers,
+  Landmark,
+  LineChart as LineChartIcon,
 } from "lucide-react";
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip as RechartsTooltip,
+  CartesianGrid,
+} from "recharts";
 import { useAuth } from "../../lib/auth";
 import type { Transaction } from "../../lib/Financeutils";
 import {
@@ -17,11 +31,13 @@ import {
   type CashSummaryExchangeTotal,
   type CostBasisHolding,
   type GeneralLedgerSummary,
+  type GeneralLedgerMonthlyClosing,
   type ServerDocumentMeta,
   type StockPriceQuote,
   fetchCashSummary,
   fetchCostBasis,
   fetchLedgerSummary,
+  fetchMonthlyClosing,
   fetchStockQuotes,
   holdingCurrencyCode,
   holdingMarketValue,
@@ -29,6 +45,7 @@ import {
   holdingUnrealizedPnl,
   quoteForSymbol,
 } from "../../lib/server-api";
+import { formatBaht } from "../Ledger/shared";
 import PortfolioChart from "./PortfolioChart";
 
 export type DashboardNav = "gl" | "upload" | "archive" | "cashflow";
@@ -63,6 +80,9 @@ export default function DashboardHomePage({
   const [holdings, setHoldings] = useState<CostBasisHolding[] | null>(null);
   const [quotes, setQuotes] = useState<StockPriceQuote[]>([]);
   const [cashSummary, setCashSummary] = useState<CashSummary | null>(null);
+  const [monthlyClosing, setMonthlyClosing] =
+    useState<GeneralLedgerMonthlyClosing | null>(null);
+  const [compareCash, setCompareCash] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -121,15 +141,17 @@ export default function DashboardHomePage({
     if (!accessToken) return;
     setLoading(true);
     setError(null);
-    const [s, h, c] = await Promise.allSettled([
+    const [s, h, c, m] = await Promise.allSettled([
       fetchLedgerSummary(accessToken),
       fetchCostBasis(accessToken),
       fetchCashSummary(accessToken),
+      fetchMonthlyClosing(accessToken),
     ]);
     setSummary(s.status === "fulfilled" ? s.value : null);
     const holdingsValue = h.status === "fulfilled" ? h.value : null;
     setHoldings(holdingsValue);
     setCashSummary(c.status === "fulfilled" ? c.value : null);
+    setMonthlyClosing(m.status === "fulfilled" ? m.value : null);
     if (holdingsValue && holdingsValue.length > 0) {
       const q = await Promise.allSettled([
         fetchStockQuotes(
@@ -150,6 +172,65 @@ export default function DashboardHomePage({
   useEffect(() => {
     void load();
   }, [load]);
+
+  // ---- ข้อมูลสรุปสถานะการเงินรวม (THB ทั้งหมด, ดึงจากระบบบัญชีจริง) ----
+  const assetAccounts = useMemo(() => {
+    return (
+      summary?.groups
+        ?.filter((g) => g.type === "ASSET")
+        .flatMap((g) => g.accounts) ?? []
+    );
+  }, [summary]);
+
+  const netWealthThb = useMemo(() => {
+    if (!summary?.totalsThb?.assets) return "0.00";
+    const assets = Number(summary.totalsThb.assets) || 0;
+    const liabilities = Number(summary.totalsThb.liabilities) || 0;
+    return (assets - liabilities).toFixed(2);
+  }, [summary]);
+
+  const totalCashThb = useMemo(() => {
+    const cashAccs = assetAccounts.filter((a) => a.code.startsWith("10"));
+    return cashAccs.reduce(
+      (sum, a) => sum + (Number(a.balanceThb) || 0),
+      0
+    );
+  }, [assetAccounts]);
+
+  const totalInvestmentThb = useMemo(() => {
+    const invAccs = assetAccounts.filter((a) => a.code.startsWith("11"));
+    return invAccs.reduce(
+      (sum, a) => sum + (Number(a.balanceThb) || 0),
+      0
+    );
+  }, [assetAccounts]);
+
+  const netGainLossThb = useMemo(() => {
+    return summary?.totalsThb?.netIncome ?? "0.00";
+  }, [summary]);
+
+  // ---- ข้อมูลกราฟแนวโน้มสถานะการเงิน (THB จาก monthly closing จริง) ----
+  const financialTrendData = useMemo(() => {
+    const months = monthlyClosing?.months ?? [];
+    if (months.length === 0) {
+      if (summary?.totalsThb?.assets) {
+        return [
+          {
+            label: "ปัจจุบัน",
+            totalAssets: Number(summary.totalsThb.assets) || 0,
+            cash: totalCashThb,
+          },
+        ];
+      }
+      return [];
+    }
+
+    return months.map((m) => ({
+      label: m.month,
+      totalAssets: Number(m.totalAssetsThb) || 0,
+      cash: Number(m.totalCashThb) || 0,
+    }));
+  }, [monthlyClosing, summary, totalCashThb]);
 
   const cashRows = cashSummary?.rows ?? [];
 
@@ -395,6 +476,233 @@ export default function DashboardHomePage({
             </section>
 
           <div className="space-y-6">
+            {/* TASK 2 & TASK 3: สรุปสถานะการเงินรวม (Financial Position Summary) & กราฟแนวโน้ม */}
+            <section className="bg-white rounded-xl border border-gray-100 overflow-hidden bg-clip-border">
+              {/* Header */}
+              <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4 border-b border-gray-100 bg-linear-to-r from-blue-900/5 via-transparent to-transparent">
+                <div className="flex items-center gap-2">
+                  <Landmark className="w-4 h-4 text-blue-900" />
+                  <h2 className="text-sm font-semibold text-gray-800">
+                    สรุปสถานะการเงินรวม (Financial Position)
+                  </h2>
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-100/70 text-blue-900 font-medium">
+                    THB Base
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setCompareCash(!compareCash)}
+                    className={`inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg border transition ${
+                      compareCash
+                        ? "bg-blue-50 border-blue-200 text-blue-900 shadow-xs"
+                        : "bg-white border-gray-200 text-gray-600 hover:bg-gray-50"
+                    }`}
+                    title="สลับการแสดงเส้นกราฟเงินสดเทียบกับมูลค่ารวม"
+                  >
+                    <Layers className="w-3.5 h-3.5" />
+                    เปรียบเทียบเงินสด
+                    <span
+                      className={`ml-1 text-[10px] px-1.5 py-0.2 rounded font-semibold ${
+                        compareCash ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-500"
+                      }`}
+                    >
+                      {compareCash ? "เปิด" : "ปิด"}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onNavigate("gl")}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-blue-900 hover:text-blue-700 transition"
+                  >
+                    ดูงบดุล
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* 4 Value Cards (Webull Assets style, STAX theme) */}
+              <div className="p-5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  {/* 1. มูลค่ารวม */}
+                  <div className="p-4 rounded-xl border border-gray-100 bg-gray-50/50 hover:bg-gray-50 transition">
+                    <p className="text-xs text-gray-500 font-medium mb-1">
+                      มูลค่ารวม (Net Financial Position)
+                    </p>
+                    <p className="text-2xl font-bold text-gray-900 tracking-tight">
+                      {formatBaht(netWealthThb)}
+                    </p>
+                    <p className="text-[11px] text-gray-400 mt-1">
+                      สินทรัพย์สุทธิรวมทุกสกุลแปลงเป็นบาท
+                    </p>
+                  </div>
+
+                  {/* 2. เงินสดรวม */}
+                  <div className="p-4 rounded-xl border border-gray-100 bg-gray-50/50 hover:bg-gray-50 transition">
+                    <div className="flex items-center justify-between mb-1">
+                      <p className="text-xs text-gray-500 font-medium">
+                        เงินสดรวม (Total Cash)
+                      </p>
+                      <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                    </div>
+                    <p className="text-2xl font-bold text-gray-900 tracking-tight">
+                      {formatBaht(totalCashThb)}
+                    </p>
+                    <p className="text-[11px] text-gray-400 mt-1">
+                      เงินสดและเงินฝากในบัญชีโบรกเกอร์ (THB)
+                    </p>
+                  </div>
+
+                  {/* 3. มูลค่าเงินลงทุน */}
+                  <div className="p-4 rounded-xl border border-gray-100 bg-gray-50/50 hover:bg-gray-50 transition">
+                    <p className="text-xs text-gray-500 font-medium mb-1">
+                      มูลค่าเงินลงทุน (Investment Value)
+                    </p>
+                    <p className="text-2xl font-bold text-gray-900 tracking-tight">
+                      {formatBaht(totalInvestmentThb)}
+                    </p>
+                    <p className="text-[11px] text-gray-400 mt-1">
+                      เงินลงทุนในหลักทรัพย์ตามต้นทุน (THB)
+                    </p>
+                  </div>
+
+                  {/* 4. กำไร/ขาดทุน */}
+                  <div className="p-4 rounded-xl border border-gray-100 bg-gray-50/50 hover:bg-gray-50 transition">
+                    <div className="flex items-center justify-between mb-1">
+                      <p className="text-xs text-gray-500 font-medium">
+                        กำไร/ขาดทุนสะสม (Realized P&L)
+                      </p>
+                      {Number(netGainLossThb) >= 0 ? (
+                        <TrendingUp className="w-3.5 h-3.5 text-emerald-600" />
+                      ) : (
+                        <TrendingDown className="w-3.5 h-3.5 text-red-600" />
+                      )}
+                    </div>
+                    <p
+                      className={`text-2xl font-bold tracking-tight ${
+                        Number(netGainLossThb) >= 0
+                          ? "text-emerald-600"
+                          : "text-red-600"
+                      }`}
+                    >
+                      {Number(netGainLossThb) > 0 ? "+" : ""}
+                      {formatBaht(netGainLossThb)}
+                    </p>
+                    <p className="text-[11px] text-gray-400 mt-1">
+                      กำไร/ขาดทุนสุทธิสะสมจากบัญชี (THB)
+                    </p>
+                  </div>
+                </div>
+
+                {/* Trend Chart (TASK 3) */}
+                <div className="mt-6 pt-5 border-t border-gray-100">
+                  <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                    <div className="flex items-center gap-2">
+                      <LineChartIcon className="w-4 h-4 text-blue-900" />
+                      <h3 className="text-xs font-semibold text-gray-800">
+                        แนวโน้มสถานะการเงิน (Financial Trend)
+                      </h3>
+                    </div>
+                    {/* Legend */}
+                    <div className="flex items-center gap-4 text-xs">
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-3 h-0.5 bg-blue-900 rounded" />
+                        <span className="text-gray-600 font-medium">
+                          สินทรัพย์รวม (บาท)
+                        </span>
+                      </div>
+                      {compareCash && (
+                        <div className="flex items-center gap-1.5">
+                          <span className="w-3 h-0.5 bg-emerald-600 border-b border-dashed border-emerald-600" />
+                          <span className="text-emerald-700 font-medium">
+                            เงินสดรวม (บาท)
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {financialTrendData.length === 0 ? (
+                    <div className="py-8 rounded-lg bg-gray-50/60 border border-gray-100 text-center">
+                      <p className="text-xs text-gray-400">
+                        ยังไม่มีข้อมูลประวัติย้อนหลังเพียงพอสำหรับแสดงกราฟแนวโน้ม
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="w-full h-56 pt-2">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart
+                          data={financialTrendData}
+                          margin={{ top: 10, right: 20, left: 10, bottom: 0 }}
+                        >
+                          <CartesianGrid
+                            strokeDasharray="3 3"
+                            vertical={false}
+                            stroke="#f1f5f9"
+                          />
+                          <XAxis
+                            dataKey="label"
+                            tick={{ fontSize: 11, fill: "#64748b" }}
+                            tickLine={false}
+                            axisLine={{ stroke: "#e2e8f0" }}
+                          />
+                          <YAxis
+                            tick={{ fontSize: 11, fill: "#64748b" }}
+                            tickLine={false}
+                            axisLine={false}
+                            tickFormatter={(val) =>
+                              val >= 1_000_000
+                                ? `${(val / 1_000_000).toFixed(1)}M`
+                                : val >= 1_000
+                                ? `${(val / 1_000).toFixed(0)}k`
+                                : `${val}`
+                            }
+                          />
+                          <RechartsTooltip
+                            formatter={(val: any, name: any) => [
+                              `${Number(val || 0).toLocaleString("th-TH", {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              })} บาท`,
+                              name === "totalAssets" ? "สินทรัพย์รวม" : "เงินสดรวม",
+                            ]}
+                            labelFormatter={(lbl) => `ช่วงเวลา: ${lbl}`}
+                            contentStyle={{
+                              borderRadius: "8px",
+                              border: "1px solid #e2e8f0",
+                              boxShadow: "0 2px 8px rgba(0,0,0,0.06)",
+                              fontSize: "12px",
+                            }}
+                          />
+                          <Line
+                            type="monotone"
+                            dataKey="totalAssets"
+                            name="totalAssets"
+                            stroke="#1e3a8a"
+                            strokeWidth={2.5}
+                            dot={{ r: 3, fill: "#1e3a8a" }}
+                            activeDot={{ r: 5 }}
+                          />
+                          {compareCash && (
+                            <Line
+                              type="monotone"
+                              dataKey="cash"
+                              name="cash"
+                              stroke="#059669"
+                              strokeWidth={2}
+                              strokeDasharray="4 4"
+                              dot={{ r: 3, fill: "#059669" }}
+                              activeDot={{ r: 5 }}
+                            />
+                          )}
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
+
             {/* การถือครองหุ้น */}
             <section className="bg-white rounded-xl border border-gray-100 overflow-hidden bg-clip-border">
               <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">

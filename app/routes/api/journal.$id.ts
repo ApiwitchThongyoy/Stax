@@ -57,7 +57,7 @@ export async function loader({ request, params }: Route.LoaderArgs) {
       );
     }
 
-    const history = await getJournalEntryAuditHistory(auth.userId, entryId);
+    const history = await getJournalEntryAuditHistory(auth.userId, entry.id);
     return Response.json(
       {
         success: true,

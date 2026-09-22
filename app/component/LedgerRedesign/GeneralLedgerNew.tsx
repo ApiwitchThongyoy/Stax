@@ -83,6 +83,8 @@ interface GeneralLedgerNewProps {
   onNavigateToArchive?: () => void;
   /** เจาะดูหุ้นรายตัวจากกราฟสัดส่วน (เหมือนหน้าหลัก) */
   onOpenSymbol?: (symbol: string) => void;
+  onNavigateToJournal?: (entryNo: number) => void;
+  targetTxId?: string | null;
 }
 
 export default function GeneralLedgerNew({
@@ -90,6 +92,8 @@ export default function GeneralLedgerNew({
   onSelectTab,
   onNavigateToArchive,
   onOpenSymbol,
+  onNavigateToJournal,
+  targetTxId,
 }: GeneralLedgerNewProps) {
   const isCategory =
     activeTab === "ASSET" ||
@@ -104,6 +108,8 @@ export default function GeneralLedgerNew({
     <AccountCategoryView
       type={activeTab as GeneralLedgerAccountType}
       activeTab={activeTab}
+      onNavigateToJournal={onNavigateToJournal}
+      initialTxId={targetTxId}
       onSelectTab={(t) => {
         if (
           t === "ASSET" ||

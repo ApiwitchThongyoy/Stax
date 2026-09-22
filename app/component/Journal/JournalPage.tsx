@@ -12,6 +12,7 @@ import {
   History,
   CheckCircle2,
   FileText,
+  ScrollText,
 } from "lucide-react";
 import { useAuth } from "../../lib/auth";
 import {
@@ -46,7 +47,12 @@ import {
 } from "../Ledger/shared";
 
 interface JournalPageProps {
+  initialSearch?: string;
   onNavigateToArchive?: () => void;
+  onNavigateToLedger?: (
+    sourceTransactionId: string,
+    category?: "ASSET" | "LIABILITY" | "EQUITY" | "INCOME" | "EXPENSE"
+  ) => void;
 }
 
 const SIDE_LABELS: Record<string, string> = {
@@ -104,6 +110,10 @@ function matchesSearch(
 ): boolean {
   const q = query.trim().toLowerCase();
   if (!q) return true;
+  const hashMatch = q.match(/^#(\d+)$/);
+  if (hashMatch) {
+    return entry.entryNo === Number(hashMatch[1]);
+  }
   const haystack = [
     String(entry.entryNo),
     entry.description,
@@ -177,7 +187,11 @@ function detailRows(
   return rows;
 }
 
-export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
+export default function JournalPage({
+  initialSearch,
+  onNavigateToArchive,
+  onNavigateToLedger,
+}: JournalPageProps) {
   const { user } = useAuth();
   const [entries, setEntries] = useState<GeneralLedgerJournalEntry[]>([]);
   const [loadState, setLoadState] = useState<"loading" | "success" | "error">(
@@ -199,7 +213,13 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
   const [appliedPosting, setAppliedPosting] = useState<"" | "POSTED" | "SKIPPED">(
     ""
   );
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(initialSearch ?? "");
+
+  useEffect(() => {
+    if (initialSearch !== undefined) {
+      setQuery(initialSearch);
+    }
+  }, [initialSearch]);
   const [showLegend, setShowLegend] = useState(false);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [reverseTarget, setReverseTarget] =
@@ -875,6 +895,28 @@ export default function JournalPage({ onNavigateToArchive }: JournalPageProps) {
                                       ))}
                                     </div>
                                   </>
+                                )}
+                                {entry.sourceTransactionId && onNavigateToLedger && (
+                                  <div className="mt-4 pt-3 border-t border-gray-200/80 flex flex-wrap items-center justify-between gap-2">
+                                    <span className="text-xs text-gray-500">
+                                      รหัสธุรกรรมต้นทาง:{" "}
+                                      <code className="text-[11px] font-mono bg-white px-1.5 py-0.5 rounded border border-gray-200">
+                                        {entry.sourceTransactionId}
+                                      </code>
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const catInfo = classifyEntryCategory(entry);
+                                        onNavigateToLedger(entry.sourceTransactionId!, catInfo.categoryId);
+                                      }}
+                                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium transition shadow-xs"
+                                    >
+                                      <ScrollText className="w-3.5 h-3.5" />
+                                      ดูธุรกรรมในบัญชีแยกประเภท
+                                      <ArrowRight className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
                                 )}
                               </td>
                             </tr>

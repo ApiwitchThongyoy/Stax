@@ -401,10 +401,7 @@ export default function StatementArchivePage({
                     <div className="flex items-center gap-2">
                       <FolderOpen className="w-4 h-4 text-blue-800 shrink-0" />
                       <span className="text-sm font-medium text-gray-800">
-                        {key}
-                      </span>
-                      <span className="text-xs text-gray-400">
-                        ({files.length} ไฟล์)
+                        อัปโหลดเมื่อ {key} ({files.length} ไฟล์)
                       </span>
                     </div>
                     {isOpen ? (

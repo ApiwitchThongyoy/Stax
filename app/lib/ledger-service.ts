@@ -6,7 +6,7 @@ import { roundMoney, moneyInThb } from "./accounting-amounts";
 // is stored as a decimal string; the pure engine (general-ledger.ts) stays
 // entirely framework/DB-free so all invariants are tested without a database.
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gte, ilike, inArray, lte, max, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, inArray, lte, max, or, sql, type SQL } from "drizzle-orm";
 import { Decimal } from "decimal.js";
 import { db } from "./drizzle-db";
 import { assertOwnedReferences } from "./resource-ownership";
@@ -2790,7 +2790,22 @@ export async function getJournalEntryById(
   userId: string,
   entryId: string
 ): Promise<PersistedJournalEntry | null> {
-  const [accountRows, headerRows, lineRows] = await Promise.all([
+  const trimmed = entryId.trim();
+  const isNumber = /^\d+$/.test(trimmed.replace(/^#/, "").trim());
+  const entryNoVal = isNumber ? Number(trimmed.replace(/^#/, "").trim()) : null;
+
+  const headerWhere =
+    entryNoVal != null
+      ? and(eq(journalEntries.userId, userId), eq(journalEntries.entryNo, entryNoVal))
+      : and(
+          eq(journalEntries.userId, userId),
+          or(
+            eq(journalEntries.id, trimmed),
+            eq(journalEntries.sourceTransactionId, trimmed)
+          )
+        );
+
+  const [accountRows, headerRows] = await Promise.all([
     getAccounts(userId),
     db
       .select({
@@ -2835,31 +2850,39 @@ export async function getJournalEntryById(
         note: journalEntries.note,
       })
       .from(journalEntries)
-      .where(and(eq(journalEntries.userId, userId), eq(journalEntries.id, entryId)))
+      .where(headerWhere)
+      .orderBy(asc(journalEntries.status), desc(journalEntries.createdAt))
       .limit(1)
-      .execute(),
-    db
-      .select({
-        id: journalEntryLines.id,
-        journalEntryId: journalEntryLines.journalEntryId,
-        accountId: journalEntryLines.accountId,
-        currency: journalEntryLines.currency,
-        debitAmount: journalEntryLines.debitAmount,
-        creditAmount: journalEntryLines.creditAmount,
-        amountThb: journalEntryLines.amountThb,
-        fxRateEffective: journalEntryLines.fxRateEffective,
-        fxRateStatement: journalEntryLines.fxRateStatement,
-        fxRateProvider: journalEntryLines.fxRateProvider,
-        memo: journalEntryLines.memo,
-      })
-      .from(journalEntryLines)
-      .where(and(eq(journalEntryLines.userId, userId), eq(journalEntryLines.journalEntryId, entryId)))
-      .orderBy(asc(journalEntryLines.id))
       .execute(),
   ]);
 
   const header = headerRows[0];
   if (!header) return null;
+
+  const lineRows = await db
+    .select({
+      id: journalEntryLines.id,
+      journalEntryId: journalEntryLines.journalEntryId,
+      accountId: journalEntryLines.accountId,
+      currency: journalEntryLines.currency,
+      debitAmount: journalEntryLines.debitAmount,
+      creditAmount: journalEntryLines.creditAmount,
+      amountThb: journalEntryLines.amountThb,
+      fxRateEffective: journalEntryLines.fxRateEffective,
+      fxRateStatement: journalEntryLines.fxRateStatement,
+      fxRateProvider: journalEntryLines.fxRateProvider,
+      memo: journalEntryLines.memo,
+    })
+    .from(journalEntryLines)
+    .where(
+      and(
+        eq(journalEntryLines.userId, userId),
+        eq(journalEntryLines.journalEntryId, header.id)
+      )
+    )
+    .orderBy(asc(journalEntryLines.id))
+    .execute();
+
   const accountMap = toAccountMap(accountRows);
   const grouped = new Map<string, { entry: any; lines: any[] }>();
   grouped.set(header.id, { entry: header, lines: lineRows });

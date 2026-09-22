@@ -1229,6 +1229,8 @@ export interface MonthlyClosingMonthResult {
   balancedThb: boolean | null;
   /** Number of POSTED journal lines in the month. */
   lineCount: number;
+  totalAssetsThb?: string | null;
+  totalCashThb?: string | null;
 }
 
 export interface MonthlyClosingContinuityIssue {
@@ -1355,6 +1357,19 @@ export function buildMonthlyClosing(
       }
       prevClosingsByAccount.set(key, r.closing);
     }
+    const bs = balanceSheet(
+      linesUpToEnd.map((l) => ({
+        accountId: l.accountId,
+        side: l.side,
+        amount: l.amount,
+        amountThb: l.amountThb ?? null,
+      } as ReportLine)),
+      accountMap
+    );
+    const totalAssetsThb = bs.totalAssetsThb ?? null;
+    const cashRows = bs.assets.filter((r) => r.code.startsWith("10"));
+    const totalCashThb = sumMoney(cashRows.map((r) => r.balanceThb));
+
     monthResults.push({
       month,
       rows: summary.rows,
@@ -1362,6 +1377,8 @@ export function buildMonthlyClosing(
       balanced: tb.balanced,
       balancedThb,
       lineCount: monthOnly.length,
+      totalAssetsThb,
+      totalCashThb,
     });
   }
 

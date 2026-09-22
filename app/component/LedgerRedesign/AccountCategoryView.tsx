@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router";
-import { Plus, X, Landmark, ArrowLeft, Wallet, Percent, Receipt, PiggyBank, Table2, ChevronLeft, ChevronRight, Search } from "lucide-react";
+import { Plus, X, Landmark, ArrowLeft, Wallet, Percent, Receipt, PiggyBank, Table2, ChevronLeft, ChevronRight, Search, BookOpenText, NotebookPen, ArrowRight } from "lucide-react";
 import { useAuth } from "../../lib/auth";
 import {
   useSuspendedAccount,
@@ -10,6 +10,7 @@ import {
   fetchAccountLedger,
   fetchAccountCategorySummary,
   fetchUserTransaction,
+  fetchJournalEntryDetail,
   ownerSignedFromDebitPositive,
   ownerSignedFromNormalSide,
   type CapitalLedgerRow,
@@ -17,9 +18,11 @@ import {
   type GeneralLedgerAccountCategoryRow,
   type GeneralLedgerAccountCategorySummary,
   type GeneralLedgerAccountType,
+  type GeneralLedgerJournalEntry,
   type GeneralLedgerLineView,
   type GeneralLedgerSymbolSummary,
 } from "../../lib/server-api";
+import { classifyEntryCategory } from "../../lib/general-ledger";
 import {
   AccountTypeBadge,
   formatAmount,
@@ -49,6 +52,8 @@ interface AccountCategoryViewProps {
   type: GeneralLedgerAccountType;
   activeTab: string;
   onSelectTab: (tab: string) => void;
+  onNavigateToJournal?: (entryNo: number) => void;
+  initialTxId?: string | null;
 }
 
 interface AddForm {
@@ -75,10 +80,11 @@ function TxField({ label, children }: { label: string; children: ReactNode }) {
 }
 
 /** Money fields read straight from the record (raw else "-"). */
-function showMoney(value?: string | null): string {
+function showMoney(value?: string | number | null): string {
   if (value == null || value === "") return "-";
-  if (/^-?\d+(\.\d+)?$/.test(value)) return formatAmount(value);
-  return value;
+  const s = String(value);
+  if (/^-?\d+(\.\d+)?$/.test(s)) return formatAmount(s);
+  return s;
 }
 
 /** สรุปตามหมวด: ฝั่งขาย/ซื้อ ตัวใหญ่ */
@@ -132,6 +138,8 @@ export default function AccountCategoryView({
   type,
   activeTab,
   onSelectTab,
+  onNavigateToJournal,
+  initialTxId,
 }: AccountCategoryViewProps) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
@@ -184,6 +192,53 @@ export default function AccountCategoryView({
     "loading"
   );
   const [txError, setTxError] = useState("");
+
+  // ---- ดูข้อมูลสมุดรายวันของรายการ ----
+  const [journalEntry, setJournalEntry] =
+    useState<GeneralLedgerJournalEntry | null>(null);
+  const [journalState, setJournalState] = useState<
+    "idle" | "loading" | "success" | "error"
+  >("idle");
+  const [journalError, setJournalError] = useState("");
+
+  useEffect(() => {
+    if (initialTxId) {
+      setSelectedTxId(initialTxId);
+    }
+  }, [initialTxId]);
+
+  const loadJournalRecord = useCallback(async () => {
+    if (!selectedTxId || !user?.accessToken) {
+      setJournalEntry(null);
+      setJournalState("idle");
+      return;
+    }
+    setJournalState("loading");
+    setJournalError("");
+    try {
+      const matchingLine = lines.find(
+        (l) => l.sourceTransactionId === selectedTxId
+      );
+      const res = await fetchJournalEntryDetail(
+        user.accessToken,
+        matchingLine?.journalEntryId ?? selectedTxId
+      );
+      setJournalEntry(res.entry);
+      setJournalState("success");
+    } catch {
+      setJournalState("error");
+      setJournalError("ยังไม่มีข้อมูลสมุดรายวันสำหรับรายการนี้");
+    }
+  }, [selectedTxId, user?.accessToken, lines]);
+
+  useEffect(() => {
+    if (selectedTxId) {
+      void loadJournalRecord();
+    } else {
+      setJournalEntry(null);
+      setJournalState("idle");
+    }
+  }, [selectedTxId, loadJournalRecord]);
 
   // รายการธุรกรรมที่ view ได้ในหน้านี้ (เฉพาะแถวที่มี sourceTransactionId)
   // เรียงตามลำดับตาราง → ปุ่ม ก่อนหน้า/ถัดไป ไล่ดูได้โดยไม่ต้องกลับไปกลับมา
@@ -515,6 +570,151 @@ export default function AccountCategoryView({
                   </div>
                 )}
               </div>
+
+              {/* ส่วนตรงกลาง: ข้อมูลสมุดรายวันของรายการนั้น */}
+              <div className="border-b border-gray-100 bg-blue-50/20 p-6">
+                <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                  <div className="flex items-center gap-2">
+                    <BookOpenText className="w-4 h-4 text-blue-900" />
+                    <h3 className="text-sm font-semibold text-gray-800">
+                      ข้อมูลสมุดรายวัน (Journal Entry)
+                    </h3>
+                    {journalEntry && (
+                      <span className="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 font-semibold">
+                        #{journalEntry.entryNo}
+                      </span>
+                    )}
+                  </div>
+                  {journalEntry && onNavigateToJournal && (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateToJournal(journalEntry.entryNo)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-900 hover:bg-blue-950 text-white text-xs font-medium transition shadow-xs"
+                      title={`คลิกเพื่อดูรายการ #${journalEntry.entryNo} ในสมุดรายวัน`}
+                    >
+                      <NotebookPen className="w-3.5 h-3.5" />
+                      ดูในสมุดรายวัน
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {journalState === "loading" ? (
+                  <div className="py-4 text-center text-xs text-gray-400 animate-pulse">
+                    กำลังโหลดข้อมูลสมุดรายวัน...
+                  </div>
+                ) : journalState === "error" || !journalEntry ? (
+                  <div className="py-3 px-4 rounded-lg bg-gray-50 border border-gray-200/60 text-xs text-gray-500">
+                    {journalError || "ยังไม่มีข้อมูลคู่บัญชีสมุดรายวันสำหรับรายการนี้"}
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {/* Grid metadata */}
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 bg-white p-3.5 rounded-lg border border-gray-100 text-xs">
+                      <div>
+                        <span className="text-gray-400 block text-[11px]">เลขที่สมุดรายวัน</span>
+                        <span className="font-semibold text-gray-800">#{journalEntry.entryNo}</span>
+                      </div>
+                      <div>
+                        <span className="text-gray-400 block text-[11px]">วันที่บันทึก</span>
+                        <span className="font-medium text-gray-700">{journalEntry.entryDate}</span>
+                      </div>
+                      <div>
+                        <span className="text-gray-400 block text-[11px]">หมวดหมู่</span>
+                        <span className="font-medium text-gray-700">
+                          {classifyEntryCategory(journalEntry).label}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-400 block text-[11px]">แหล่งที่มา</span>
+                        <span className="font-medium text-gray-700">
+                          {journalEntry.sourceType === "STATEMENT" ? "Statement" : "เพิ่มเอง (Manual)"}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-400 block text-[11px]">สถานะ</span>
+                        <span className="font-medium">
+                          {journalEntry.postingState === "POSTED" ? (
+                            <span className="text-emerald-700 font-semibold">ลงบัญชีแล้ว (POSTED)</span>
+                          ) : (
+                            <span className="text-amber-700 font-semibold">บันทึกแล้ว (ยังไม่มีคู่บัญชี)</span>
+                          )}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-400 block text-[11px]">จำนวนเงิน THB</span>
+                        <span className="font-bold text-gray-900">
+                          {showMoney(
+                            journalEntry.lines && journalEntry.lines.length > 0
+                              ? journalEntry.lines
+                                  .filter((ln) => ln.side === "DEBIT")
+                                  .reduce((sum, ln) => sum + (Number(ln.amountThb) || 0), 0)
+                              : rec.amountThb
+                          )} บาท
+                        </span>
+                      </div>
+                      <div className="col-span-2 sm:col-span-3 lg:col-span-2">
+                        <span className="text-gray-400 block text-[11px]">คำอธิบาย</span>
+                        <span className="font-medium text-gray-800">{journalEntry.description}</span>
+                      </div>
+                    </div>
+
+                    {/* Breakdown table (บัญชีที่ลง, เดบิต, เครดิต) */}
+                    {journalEntry.lines && journalEntry.lines.length > 0 ? (
+                      <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-gray-50 border-b border-gray-200 text-gray-500 font-medium">
+                            <tr>
+                              <th className="px-3 py-2">รหัส / บัญชีที่ลง</th>
+                              <th className="px-3 py-2">ด้าน</th>
+                              <th className="px-3 py-2 text-right">เดบิต</th>
+                              <th className="px-3 py-2 text-right">เครดิต</th>
+                              <th className="px-3 py-2 text-right">จำนวนเงิน THB</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-100">
+                            {journalEntry.lines.map((ln) => (
+                              <tr key={ln.id} className="hover:bg-gray-50/50">
+                                <td className="px-3 py-2">
+                                  <span className="font-semibold text-blue-900 mr-1.5">{ln.accountCode}</span>
+                                  <span className="text-gray-700">{ln.accountName}</span>
+                                </td>
+                                <td className="px-3 py-2">
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                                      ln.side === "DEBIT"
+                                        ? "bg-blue-50 text-blue-700"
+                                        : "bg-purple-50 text-purple-700"
+                                    }`}
+                                  >
+                                    {ln.side === "DEBIT" ? "เดบิต (Dr)" : "เครดิต (Cr)"}
+                                  </span>
+                                </td>
+                                <td className="px-3 py-2 text-right font-medium text-gray-800">
+                                  {ln.side === "DEBIT" ? `${formatAmount(ln.amount)} ${ln.currency}` : "-"}
+                                </td>
+                                <td className="px-3 py-2 text-right font-medium text-gray-800">
+                                  {ln.side === "CREDIT" ? `${formatAmount(ln.amount)} ${ln.currency}` : "-"}
+                                </td>
+                                <td className="px-3 py-2 text-right font-semibold text-gray-900">
+                                  {formatAmount(ln.amountThb)} บาท
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-500 italic bg-white p-3 rounded-lg border border-gray-100">
+                        {journalEntry.skipReason
+                          ? `รายการนี้บันทึกเป็นข้อมูลอ้างอิง: ${journalEntry.skipReason}`
+                          : "รายการนี้ยังไม่มีการลงคู่บัญชีเดบิต/เครดิต"}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <h3 className="px-6 py-3 text-sm font-semibold text-gray-800 border-b border-gray-100">
                 รายละเอียดธุรกรรม
               </h3>

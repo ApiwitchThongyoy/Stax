@@ -139,6 +139,10 @@ export default function JournalTab({ onNavigateToArchive }: JournalTabProps) {
   const matchesSearch = (entry: GeneralLedgerJournalEntry, q: string) => {
     const needle = q.trim().toLowerCase();
     if (!needle) return true;
+    const hashMatch = needle.match(/^#(\d+)$/);
+    if (hashMatch) {
+      return entry.entryNo === Number(hashMatch[1]);
+    }
     const haystack = [
       String(entry.entryNo),
       entry.description,

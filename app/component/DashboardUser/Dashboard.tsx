@@ -69,6 +69,8 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   const [activeNav, setActiveNav] = useState<NavId>("dashboard");
   const [glTab, setGlTab] = useState<GlTab>("overview");
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  const [journalSearchQuery, setJournalSearchQuery] = useState("");
+  const [targetLedgerTxId, setTargetLedgerTxId] = useState<string | null>(null);
   const location = useLocation();
 
   // Server-authoritative data for หน้าหลัก (ไม่มี session-import state แยก
@@ -321,18 +323,33 @@ export default function Dashboard({ userEmail }: DashboardProps) {
               {activeNav === "gl" && (
                 <GeneralLedgerNew
                   activeTab={glTab}
+                  targetTxId={targetLedgerTxId}
                   onSelectTab={(t) => {
                     setGlTab(t);
                     setActiveNav("gl");
                   }}
                   onNavigateToArchive={() => setActiveNav("archive")}
                   onOpenSymbol={(symbol) => setSelectedSymbol(symbol)}
+                  onNavigateToJournal={(entryNo) => {
+                    setJournalSearchQuery(`#${entryNo}`);
+                    setActiveNav("journal");
+                  }}
                 />
               )}
 
               {activeNav === "journal" && (
                 <JournalPage
+                  initialSearch={journalSearchQuery}
                   onNavigateToArchive={() => setActiveNav("archive")}
+                  onNavigateToLedger={(sourceTransactionId, category) => {
+                    setTargetLedgerTxId(sourceTransactionId);
+                    if (category) {
+                      setGlTab(category);
+                    } else {
+                      setGlTab("ASSET");
+                    }
+                    setActiveNav("gl");
+                  }}
                 />
               )}
 
