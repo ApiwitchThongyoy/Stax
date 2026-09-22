@@ -61,6 +61,7 @@ export const DEFAULT_CHART_OF_ACCOUNTS: AccountDef[] = [
   { code: "5020", name: "รายได้/ค่าใช้จ่าย - จากอัตราแลกเปลี่ยน", type: "EXPENSE", currency: "THB" },
   { code: "5110", name: "ค่าใช้จ่าย - ภาษีหัก ณ ที่จ่าย", type: "EXPENSE", currency: "USD" },
   { code: "5120", name: "ค่าใช้จ่าย - ขาดทุนจากการขายหลักทรัพย์", type: "EXPENSE", currency: "USD" },
+  { code: "5130", name: "ค่าใช้จ่าย - ภาษีมูลค่าเพิ่ม (VAT)", type: "EXPENSE", currency: "USD" },
 ];
 
 /** Memo carried by the auto THB rounding-adjustment leg the posting engine
@@ -282,7 +283,11 @@ export function isReferenceOnlySkip(skipReason?: string | null): boolean {
     s.includes("fee and vat summary row") ||
     s.includes("fee and vat aggregate") ||
     s.includes("fees already in the trade postings") ||
-    s.includes("fees already inside the buy acquisition cost");
+    s.includes("fees already inside") ||
+    s.includes("child fee") ||
+    s.includes("child vat") ||
+    s.includes("trade fee/vat child") ||
+    s.includes("reference-only");
 
   // 2. Realized gain/loss already posted via the SELL row:
   const isRealizedGainDuplicate =

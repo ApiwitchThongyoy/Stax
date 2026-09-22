@@ -1,17 +1,22 @@
-// Webull Average-Cost cost-basis engine (pure, DB-free).
+// Moving Average-Cost cost-basis engine (pure, DB-free).
 //
-// Matches Webull's documented "Average Cost" mode for positions:
-//   average cost = accumulated open-position amount / accumulated open-position quantity
+// Matches Webull / standard Moving Average Cost mode for positions:
+//   average cost = live open cost basis / live open quantity
 // where:
-//   - every BUY accumulates the AUTHORITATIVE acquisition cost (the broker's
-//     Net Amount, i.e. gross + commissions/VAT — fees INCLUDED) into the
-//     numerator and the denominator (qty), so the per-share average is a
-//     lifetime weighted average of everything bought. Callers that only have a
-//     unit price fall back to price×qty (see buyAcquisitionCost).
-//   - a SELL does NOT touch the accumulator — the divisor and the average stay the
-//     same; only the live open `quantity` is reduced.
-//   - once the position is fully liquidated the entry is dropped (Webull resets
-//     both average and dilated cost to 0), so the next BUY starts a fresh average.
+//   - On BUY:
+//       newLiveCostBasis = previousLiveCostBasis + acquisitionCost
+//       newLiveQuantity = previousLiveQuantity + buyQuantity
+//       newAverageCost = newLiveCostBasis / newLiveQuantity
+//   - On partial SELL:
+//       costBasisSold = currentAverageCost * soldQuantity
+//       newLiveCostBasis = previousLiveCostBasis - costBasisSold
+//       newLiveQuantity = previousLiveQuantity - soldQuantity
+//     The remaining average cost stays unchanged immediately after SELL.
+//   - On subsequent BUY:
+//     Average cost is calculated from the REMAINING live cost basis and
+//     remaining live quantity, never contaminated by sold historical shares.
+//   - Once fully liquidated (quantity = 0), position is cleanly reset to 0
+//     so the next BUY starts a fresh baseline.
 //
 // Implementation notes:
 //   - Plain-number math mirrors the historical parser behaviour (an 8-decimal
@@ -46,36 +51,57 @@ export interface BuyAcquisitionCostInput {
   grossAmount?: number | null;
   /** Signed commissions+VAT (negative = rebate). */
   fees?: number | null;
+  /** Direct commission if available separately. */
+  commission?: number | null;
+  /** Direct VAT if available separately. */
+  vat?: number | null;
 }
+
+import { Decimal } from "decimal.js";
 
 function finiteOrNull(value: number | null | undefined): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 /**
- * The authoritative TOTAL acquisition cost of a BUY — commissions/VAT INCLUDED.
- *
- * Preference order (first trustworthy value wins):
- *   1. the broker's Net Amount (the cash actually paid out),
- *   2. Gross Amount + signed fees (the statement's own Net Amount definition),
- *   3. quantity × unitPrice (legacy fallback when only a price is known).
- * Returns null when none can be derived (honest non-computable).
- *
- * This is the single definition every consumer must use (parser, replay,
- * backfill/recompute, trading journal) so the recorded cost basis and the
- * posted investment account can never disagree.
+ * The authoritative TOTAL acquisition cost of a BUY — capitalized into cost basis.
+ * Gross purchase amount + commission/fee component (excluding VAT).
+ * Example: TSLY Gross 110.40 + Fee 0.11 = 110.51.
  */
 export function buyAcquisitionCost(input: BuyAcquisitionCostInput): number | null {
-  const net = finiteOrNull(input.netAmount);
-  if (net !== null && net > 0) return net;
   const gross = finiteOrNull(input.grossAmount);
-  if (gross !== null && gross > 0) {
-    const total = gross + (finiteOrNull(input.fees) ?? 0);
-    if (total > 0) return total;
-  }
+  const fees = finiteOrNull(input.fees);
+  const commInput = finiteOrNull(input.commission);
+  const vatInput = finiteOrNull(input.vat);
+  const net = finiteOrNull(input.netAmount);
   const qty = finiteOrNull(input.quantity);
   const price = finiteOrNull(input.unitPrice);
-  if (qty !== null && qty > 0 && price !== null && price > 0) return qty * price;
+
+  const vat = vatInput !== null && vatInput > 0 ? new Decimal(vatInput) : new Decimal(0);
+  const comm = commInput !== null && commInput > 0 ? new Decimal(commInput) : null;
+
+  // 1. If explicit commission is provided: gross + commission
+  if (gross !== null && gross > 0 && comm !== null) {
+    return new Decimal(gross).plus(comm).toNumber();
+  }
+
+  // 2. If net amount is provided: net - vat (capitalizes commission, excludes VAT)
+  if (net !== null && net > 0) {
+    return new Decimal(net).minus(vat).toNumber();
+  }
+
+  // 3. If gross is provided with fees:
+  if (gross !== null && gross > 0) {
+    if (fees !== null) {
+      return new Decimal(gross).plus(new Decimal(fees).minus(vat)).toNumber();
+    }
+    return gross;
+  }
+
+  // 4. Fallback to qty * price
+  if (qty !== null && qty > 0 && price !== null && price > 0) {
+    return new Decimal(qty).mul(new Decimal(price)).toNumber();
+  }
   return null;
 }
 export type CostBasisMap = Record<string, CostBasisPosition>;
@@ -119,13 +145,13 @@ export function applyAverageCostTrade(
       acquisitionCost != null && Number.isFinite(acquisitionCost) && acquisitionCost > 0
         ? acquisitionCost
         : priceOk
-          ? qty * price
+          ? new Decimal(qty).mul(new Decimal(price)).toNumber()
           : NaN;
     if (!Number.isFinite(acq) || acq <= 0) return { sellBasis: null };
-    const unit = acq / qty;
     const prev = map[key];
-    if (!prev || prev.cumQuantity <= 0) {
+    if (!prev || prev.quantity <= 0) {
       // Fresh (or fully liquidated) position: this BUY establishes the baseline.
+      const unit = new Decimal(acq).div(new Decimal(qty)).toNumber();
       map[key] = {
         quantity: qty,
         avgCost: unit,
@@ -134,47 +160,85 @@ export function applyAverageCostTrade(
       };
       return { sellBasis: null };
     }
-    const cumQuantity = prev.cumQuantity + qty;
-    const cumCost = prev.cumCost + acq;
+
+    // Moving Average Cost:
+    // On BUY:
+    // newLiveCostBasis = previousLiveCostBasis + acquisitionCost
+    // newLiveQuantity = previousLiveQuantity + buyQuantity
+    // newAverageCost = newLiveCostBasis / newLiveQuantity
+    const prevLiveQty = prev.quantity;
+    const prevLiveCost =
+      prev.cumCost > 0
+        ? prev.cumCost
+        : new Decimal(prev.quantity).mul(new Decimal(prev.avgCost)).toNumber();
+
+    const newLiveQuantity = new Decimal(prevLiveQty).plus(new Decimal(qty)).toNumber();
+    const newLiveCost = new Decimal(prevLiveCost).plus(new Decimal(acq)).toNumber();
+    const newAvgCost = new Decimal(newLiveCost).div(new Decimal(newLiveQuantity)).toNumber();
+
     map[key] = {
-      quantity: prev.quantity + qty,
-      avgCost: cumQuantity > 0 ? cumCost / cumQuantity : unit,
-      cumQuantity,
-      cumCost,
+      quantity: newLiveQuantity,
+      avgCost: newAvgCost,
+      cumQuantity: newLiveQuantity,
+      cumCost: newLiveCost,
     };
     return { sellBasis: null };
   }
 
-  // SELL — reduce the live quantity; the accumulator and average are untouched.
+  // SELL
   let pos = map[key];
-  let availQty = pos ? pos.quantity : 0;
-  let basis: number | undefined = pos && pos.cumQuantity > 0 ? pos.avgCost : undefined;
-  if (basis === undefined && seed && seed.quantity > 0) {
+  if ((!pos || pos.quantity <= 0) && seed && seed.quantity > 0) {
     pos = {
       quantity: seed.quantity,
       avgCost: seed.avgCost,
       cumQuantity: seed.quantity,
-      cumCost: seed.quantity * seed.avgCost,
+      cumCost: new Decimal(seed.quantity).mul(new Decimal(seed.avgCost)).toNumber(),
     };
     map[key] = pos;
-    availQty = pos.quantity;
-    basis = pos.avgCost;
   }
-  if (pos) {
-    const remaining = Math.max(pos.quantity - qty, 0);
-    if (remaining <= 0) {
-      // Full liquidation: drop the entry so the next BUY restarts at 0 (Webull).
-      delete map[key];
-    } else {
-      map[key] = { ...pos, quantity: remaining };
-    }
+
+  const availQty = pos ? pos.quantity : 0;
+  const basis = pos ? pos.avgCost : undefined;
+
+  // Oversell: soldQty > availableQty rejects/skips without creating fake negative holdings
+  if (
+    !pos ||
+    basis === undefined ||
+    !Number.isFinite(basis) ||
+    availQty <= 0 ||
+    qty > availQty + 1e-6
+  ) {
+    return { sellBasis: null };
   }
-  const computable =
-    basis !== undefined &&
-    Number.isFinite(basis) &&
-    availQty > 0 &&
-    availQty >= qty;
-  return { sellBasis: computable ? (basis as number) : null };
+
+  // On partial SELL:
+  // costBasisSold = currentAverageCost * soldQuantity
+  // newLiveCostBasis = previousLiveCostBasis - costBasisSold
+  // newLiveQuantity = previousLiveQuantity - soldQuantity
+  const costBasisSold = new Decimal(basis).mul(new Decimal(qty));
+  const prevLiveCost =
+    pos.cumCost > 0
+      ? new Decimal(pos.cumCost)
+      : new Decimal(availQty).mul(new Decimal(basis));
+  const newLiveCost = Decimal.max(0, prevLiveCost.minus(costBasisSold)).toNumber();
+
+  const remainingQty = new Decimal(availQty).minus(new Decimal(qty));
+  if (remainingQty.lte(1e-6)) {
+    // Full liquidation: reset qty & basis cleanly to 0 (no floating point residue)
+    delete map[key];
+  } else {
+    // Partial SELL: remaining avg cost stays unchanged immediately after SELL,
+    // and live cost basis removes the sold cost basis so a subsequent BUY
+    // computes its average from the REMAINING live position.
+    map[key] = {
+      quantity: remainingQty.toNumber(),
+      avgCost: basis,
+      cumQuantity: remainingQty.toNumber(),
+      cumCost: newLiveCost,
+    };
+  }
+
+  return { sellBasis: basis };
 }
 
 /** Full-liquidation / never-maintained entry check for map cleanup. */

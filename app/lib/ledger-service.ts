@@ -250,7 +250,7 @@ interface ResolvedAccount {
  * engine is pure/DB-free), manual entries reference them by id; this one map
  * accepts either and normalizes to the UUID `account_id` the schema requires.
  */
-async function loadAccountLookup(
+export async function loadAccountLookup(
   userId: string,
   conn: Conn = db
 ): Promise<Map<string, ResolvedAccount>> {
@@ -269,7 +269,7 @@ async function loadAccountLookup(
  * user's real account UUID, failing cleanly on unknown/inactive accounts. Never
  * throws — returns structured errors like the pure validator does.
  */
-function resolveEntryAccountIds(
+export function resolveEntryAccountIds(
   input: JournalEntryInput,
   lookup: Map<string, ResolvedAccount>
 ): { ok: true; lines: JournalLineInput[] } | { ok: false; errors: string[] } {
@@ -411,20 +411,21 @@ async function persistJournalEntry(
 /** Persist one validated entry with its lines inside a transaction. */
 export async function createJournalEntry(
   userId: string,
-  input: JournalEntryInput
+  input: JournalEntryInput,
+  conn: Conn = db
 ): Promise<CreateEntryResult> {
-  let lookup = await loadAccountLookup(userId);
+  let lookup = await loadAccountLookup(userId, conn);
   // Existing users who registered before the default chart-of-accounts seeder
   // existed have no accounts yet. Lazy-seed once (idempotent) so their first
   // manual entry and statement postings work instead of failing "unknown account".
   if (lookup.size === 0) {
-    const seeded = await seedDefaultChartOfAccounts(userId);
-    if (seeded > 0) lookup = await loadAccountLookup(userId);
+    const seeded = await seedDefaultChartOfAccounts(userId, conn);
+    if (seeded > 0) lookup = await loadAccountLookup(userId, conn);
   } else if (!lookup.has("3020")) {
     // Grown CoA: per-code idempotent seed adds newly-introduced defaults (3020
     // THB owner capital) to existing users without touching custom accounts.
-    const seeded = await seedDefaultChartOfAccounts(userId);
-    if (seeded > 0) lookup = await loadAccountLookup(userId);
+    const seeded = await seedDefaultChartOfAccounts(userId, conn);
+    if (seeded > 0) lookup = await loadAccountLookup(userId, conn);
   }
   const resolved = resolveEntryAccountIds(input, lookup);
   if (!resolved.ok) {
@@ -465,10 +466,131 @@ export async function createJournalEntry(
   const now = new Date().toISOString();
 
   try {
-    const entryNo = await db.transaction(async (tx) =>
-      persistJournalEntry(tx, userId, entry, entryId, null, now)
-    );
-    return { ok: true, entryId, entryNo };
+    const executePersist = async (tx: TxClient): Promise<{ entryId: string; entryNo: number }> => {
+      const isReversal = entry.description.startsWith("กลับรายการ:");
+      if (entry.sourceTransactionId && !isReversal) {
+        // Serialize concurrent first-time journal creations for this (userId, sourceTransactionId)
+        // BEFORE checking existing rows so that two simultaneous creations cannot both observe
+        // zero rows and both INSERT. The advisory lock is transaction-scoped and auto-releases on commit/rollback.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${userId}), hashtext(${entry.sourceTransactionId}))`
+        );
+
+        const existingRows = await tx
+          .select({
+            id: journalEntries.id,
+            entryNo: journalEntries.entryNo,
+            postingState: journalEntries.postingState,
+            status: journalEntries.status,
+          })
+          .from(journalEntries)
+          .where(
+            and(
+              eq(journalEntries.userId, userId),
+              eq(journalEntries.sourceTransactionId, entry.sourceTransactionId)
+            )
+          )
+          .for("update")
+          .execute();
+
+        const existingPosted = existingRows.find(
+          (r) => r.postingState === "POSTED" && r.status === "POSTED"
+        );
+        if (existingPosted) {
+          // Active POSTED journal already exists: treat as authoritative, never duplicate
+          return { entryId: existingPosted.id, entryNo: existingPosted.entryNo };
+        }
+
+        const existingStub = existingRows.find((r) => r.postingState === "SKIPPED");
+        if (existingStub) {
+          // Reuse/promote the existing SKIPPED placeholder in place
+          await tx
+            .update(journalEntries)
+            .set({
+              entryDate: entry.entryDate,
+              description: entry.description,
+              sourceType: entry.sourceType,
+              sourceDocumentId: entry.sourceDocumentId,
+              status: "POSTED",
+              category: entry.detail.category,
+              section: entry.detail.section,
+              symbol: entry.detail.symbol,
+              side: entry.detail.side,
+              exchange: entry.detail.exchange,
+              quantity: entry.detail.quantity,
+              unitPrice: entry.detail.unitPrice,
+              grossAmount: entry.detail.grossAmount,
+              fees: entry.detail.fees,
+              netAmount: entry.detail.netAmount,
+              proceeds: entry.detail.proceeds,
+              costBasis: entry.detail.costBasis,
+              realizedGainLoss: entry.detail.realizedGainLoss,
+              realizedGainLossThb: entry.detail.realizedGainLossThb,
+              averageCost: entry.detail.averageCost,
+              currency: entry.detail.currency,
+              amount: entry.detail.amount,
+              amountThb: entry.detail.amountThb,
+              fxRateEffective: entry.detail.fxRateEffective,
+              fxRateStatement: entry.detail.fxRateStatement,
+              isFxConversion: entry.detail.isFxConversion,
+              exchangeFromCurrency: entry.detail.exchangeFromCurrency,
+              exchangeFromAmount: entry.detail.exchangeFromAmount,
+              exchangeRate: entry.detail.exchangeRate,
+              isMonthlyFeeAggregate: entry.detail.isMonthlyFeeAggregate,
+              postingState: entry.postingState,
+              skipReason: entry.skipReason,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(journalEntries.userId, userId),
+                eq(journalEntries.id, existingStub.id)
+              )
+            )
+            .execute();
+
+          await tx
+            .delete(journalEntryLines)
+            .where(
+              and(
+                eq(journalEntryLines.userId, userId),
+                eq(journalEntryLines.journalEntryId, existingStub.id)
+              )
+            )
+            .execute();
+
+          for (const line of entry.lines) {
+            await tx
+              .insert(journalEntryLines)
+              .values({
+                id: randomUUID(),
+                journalEntryId: existingStub.id,
+                userId,
+                accountId: line.accountId,
+                currency: line.currency,
+                debitAmount: line.side === "DEBIT" ? line.amount : null,
+                creditAmount: line.side === "CREDIT" ? line.amount : null,
+                amountThb: line.amountThb,
+                fxRateEffective: line.fxRateEffective,
+                fxRateStatement: line.fxRateStatement,
+                fxRateProvider: line.fxRateProvider,
+                memo: line.memo,
+              })
+              .execute();
+          }
+
+          return { entryId: existingStub.id, entryNo: existingStub.entryNo };
+        }
+      }
+
+      const entryNo = await persistJournalEntry(tx, userId, entry, entryId, null, now);
+      return { entryId, entryNo };
+    };
+
+    const res = await (conn === db
+      ? db.transaction(async (tx) => executePersist(tx))
+      : executePersist(conn as TxClient));
+    return { ok: true, entryId: res.entryId, entryNo: res.entryNo };
   } catch (error) {
     console.error("createJournalEntry: failed to persist entry", safeErrorLog(error));
     return { ok: false, errors: ["Failed to persist journal entry"] };
@@ -3381,7 +3503,7 @@ export async function createStructuredManualJournal(
       const cashCode = input.cashAccountCode || (ccy === "THB" ? "1010" : "1020");
 
       postingLines.push({
-        accountId: "5010",
+        accountId: "5130",
         currency: ccy,
         debit: amt,
         fxRateEffective: fx,

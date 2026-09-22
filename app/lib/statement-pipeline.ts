@@ -191,10 +191,21 @@ export function mapToCapitalRow(
   // to 2dp first and gainThb is derived from that ROUNDED gain, so the pair is
   // always consistent (gainThb === round2(round2(gain) × fx)). See
   // realizedUpdateFor below for the canonical statement of this invariant.
-  const net = t.netAmount ?? t.proceeds;
-  const realized = t.side === "SELL" && t.costBasis != null && Number.isFinite(t.costBasis)
-    && t.costBasis >= 0 && net != null && Number.isFinite(net)
-    ? realizedAmounts(net, t.costBasis, fxRateEffective) : null;
+  // Trading gain/loss uses proceeds (gross from parser) so selling fees/VAT are not subtracted again:
+  // realizedTradingGainLoss = proceeds - cost basis sold
+  const tradeProceeds =
+    t.proceeds !== undefined && Number.isFinite(t.proceeds) && t.proceeds > 0
+      ? t.proceeds
+      : (t.grossAmount !== undefined && Number.isFinite(t.grossAmount) && t.grossAmount > 0 ? t.grossAmount : t.netAmount);
+  const realized =
+    t.side === "SELL" &&
+    t.costBasis != null &&
+    Number.isFinite(t.costBasis) &&
+    t.costBasis >= 0 &&
+    tradeProceeds != null &&
+    Number.isFinite(tradeProceeds)
+      ? realizedAmounts(tradeProceeds, t.costBasis, fxRateEffective)
+      : null;
 
   // Symbol/ticker. Trade rows carry `t.symbol` directly (preserved verbatim);
   // dividend income rows embed the ticker in the section label
