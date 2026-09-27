@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   BookOpenText,
-  CalendarDays,
   Coins,
   NotebookPen,
   RefreshCw,
@@ -378,7 +377,6 @@ export default function TradingJournalPage({ onOpenSymbol }: Props) {
               {entries.length} รายการ
             </span>
           </div>
-          <CalendarDays className="w-4 h-4 text-gray-300" />
         </div>
         {entries.length === 0 ? (
           <div className="px-5 py-10 text-center">
