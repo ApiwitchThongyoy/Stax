@@ -133,11 +133,25 @@ for (const [name, src] of [
     `${name} body scrolls vertically within the constrained shell`
   );
   ok(
-    src.includes('shrink-0 flex-col') &&
-      src.includes("border-r border-gray-100") &&
-      src.includes("flex-1 px-3 py-4") &&
-      src.includes("border-t border-gray-100"),
-    `${name} sidebar is a non-scrolling flex column with anchored footer/profile`
+    src.includes("border-r border-gray-100") &&
+      src.includes("px-3 py-4 border-t border-gray-100"),
+    `${name} sidebar is a flex column with a bordered, anchored footer/profile block`
+  );
+  // On short viewports the USER dashboard sidebar must stay inside the viewport
+  // and let ONLY the middle navigation list scroll; the logo header and the
+  // Settings/Help/profile block stay fixed and visible. The admin shell is out
+  // of scope for that change and must keep its existing layout.
+  ok(
+    name === "ADMIN Dashboard"
+      ? src.includes("flex-1 px-3 py-4 space-y-1")
+      : src.includes(
+            "flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-3 py-4"
+          ) &&
+        src.includes("shrink-0 px-3 py-4 border-t border-gray-100") &&
+        src.includes("shrink-0 flex items-center gap-2.5 px-5 py-5 border-b"),
+    name === "USER Dashboard"
+      ? "USER Dashboard sidebar scrolls only the nav (flex-1 min-h-0 overflow-y-auto overflow-x-hidden) with a fixed header + fixed footer"
+      : "ADMIN Dashboard sidebar nav layout unchanged"
   );
 }
 

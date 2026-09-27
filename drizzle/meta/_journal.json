@@ -197,6 +197,13 @@
       "when": 1790467200000,
       "tag": "0028_add_statement_identity",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1790553600000,
+      "tag": "0029_add_refresh_sessions_and_otp",
+      "breakpoints": true
     }
   ]
 }

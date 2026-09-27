@@ -33,19 +33,40 @@ async function main() {
     const client = postgres(databaseUrl, { max: 1 });
     const register = await import("../app/routes/api/auth/register");
     const login = await import("../app/routes/api/auth/login");
+    const requestOtpRoute = await import("../app/routes/api/auth/register/request-otp");
+    // Registration is OTP-gated, so the real flow must request a code first.
+    // AUTH_DEV_SHOW_OTP makes the server return it, which is the only supported
+    // way to obtain a code without a mail provider.
+    process.env.AUTH_DEV_SHOW_OTP = "1";
     const email = `auth-${randomUUID()}@test.local`;
     const password = "EmailCase!234";
-    const request = (route: string, inputEmail: string, inputPassword = password) => new Request(
+    const request = (route: string, inputEmail: string, inputPassword = password, otp?: string) => new Request(
       `http://test.local/api/v1/auth/${route}`,
       { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: inputEmail, password: inputPassword }) }
+        body: JSON.stringify({ email: inputEmail, password: inputPassword, otp }) }
     );
+
+    /** Register is impossible without a valid code, so always mint one first. */
+    const mintOtp = async (forEmail: string): Promise<string> => {
+      const res = await requestOtpRoute.action({ request: request("register/request-otp", forEmail, password) } as never);
+      const body = await res.json();
+      const code: string | undefined = body?.data?.devOtp;
+      assert.equal(typeof code, "string", "request-otp must return a code when AUTH_DEV_SHOW_OTP is set");
+      return code as string;
+    };
+
     try {
-      const registered = await register.action({ request: request("register", ` \t${email.replace("auth-", "AuTh-").replace("test.local", "Test.LOCAL")} \n`) } as never);
+      const otpForMixedCase = await mintOtp(` \t${email.replace("auth-", "AuTh-").replace("test.local", "Test.LOCAL")} \n`);
+      const registered = await register.action({ request: request("register", ` \t${email.replace("auth-", "AuTh-").replace("test.local", "Test.LOCAL")} \n`, password, otpForMixedCase) } as never);
       const body = await registered.json();
       check(registered.status === 201 && body.data?.user?.email === email, "Register accepts mixed case and outer whitespace, returns canonical email");
       const [stored] = await client`SELECT email FROM "User" WHERE id = ${body.data.user.id}`;
       check(stored?.email === email, "Register stores the trimmed lowercase email in PostgreSQL");
+
+      // The code is single-use: replaying the exact request must fail even though
+      // the address is still valid.
+      const replay = await register.action({ request: request("register", email, password, otpForMixedCase) } as never);
+      check(replay.status !== 201, "a spent registration code cannot create a second account");
 
       for (const inputEmail of [email, email.toUpperCase(), ` \t${email.toUpperCase()}\r\n`]) {
         const response = await login.action({ request: request("login", inputEmail) } as never);
@@ -54,7 +75,8 @@ async function main() {
           result.data?.user?.id === body.data.user.id && result.data?.user?.email === email &&
           typeof result.data?.accessToken === "string", "Login accepts case/whitespace variants and authenticates the registered user");
       }
-      const duplicate = await register.action({ request: request("register", ` ${email.toUpperCase()} `) } as never);
+      const duplicateOtp = await mintOtp(email);
+      const duplicate = await register.action({ request: request("register", ` ${email.toUpperCase()} `, password, duplicateOtp) } as never);
       check(duplicate.status === 409, "case/whitespace variant cannot register a duplicate account");
 
       for (const [inputEmail, inputPassword] of [

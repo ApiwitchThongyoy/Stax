@@ -1,12 +1,22 @@
 import { randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import type { Route } from "./+types/register";
 import { db } from "~/lib/drizzle-db";
-import { users } from "~/db/schema";
+import { emailOtps, users } from "~/db/schema";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
 import { seedDefaultChartOfAccounts } from "~/lib/ledger-service";
 import { normalizeEmail } from "~/lib/normalize-email";
+import { BCRYPT_ROUNDS, checkPasswordPolicy } from "~/lib/password-policy";
+import {
+  OTP_MAX_VERIFY_ATTEMPTS,
+  OtpPurpose,
+  findOutstandingOtp,
+  isValidOtpFormat,
+  otpAttemptOutcome,
+  otpPepper,
+  recordFailedOtpAttempt,
+} from "~/lib/otp";
 import {
   REGISTER_IP_RATE_LIMIT,
   clientIpFromRequest,
@@ -20,10 +30,6 @@ import { safeErrorLog } from "~/lib/safe-error-log";
 
 // Same email format used by login.ts.
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const BCRYPT_ROUNDS = 10;
-// Minimal guard consistent with the project's test credential convention
-// (e.g. "W2UserB!234"). No stricter project requirement is currently defined.
-const PASSWORD_MIN_LENGTH = 8;
 
 export async function loader(_: Route.LoaderArgs) {
   return Response.json(
@@ -50,7 +56,7 @@ export async function action({ request }: Route.ActionArgs) {
     );
   }
 
-  const { email, password } = (body ?? {}) as Record<string, unknown>;
+  const { email, password, otp } = (body ?? {}) as Record<string, unknown>;
 
   if (typeof email !== "string" || typeof password !== "string") {
     return Response.json(
@@ -75,19 +81,34 @@ export async function action({ request }: Route.ActionArgs) {
     );
   }
 
-  if (!password) {
+  // Registration is a TWO-STEP flow: a code must have been issued for this
+  // address (via /auth/register/request-otp) before the account may be created.
+  // Reject a missing/malformed code EARLY and cheaply, before any bcrypt work.
+  if (otp === undefined || otp === null) {
     return Response.json(
-      { success: false, message: "Password is required" },
+      {
+        success: false,
+        message: "A verification code is required. Please request one first.",
+        code: "OTP_REQUIRED",
+      },
+      { status: 400 }
+    );
+  }
+  if (!isValidOtpFormat(otp)) {
+    return Response.json(
+      {
+        success: false,
+        message: "The verification code is invalid or has expired.",
+        code: "OTP_INVALID",
+      },
       { status: 400 }
     );
   }
 
-  if (password.length < PASSWORD_MIN_LENGTH) {
+  const passwordPolicy = checkPasswordPolicy(password);
+  if (!passwordPolicy.ok) {
     return Response.json(
-      {
-        success: false,
-        message: `Password must be at least ${PASSWORD_MIN_LENGTH} characters`,
-      },
+      { success: false, message: passwordPolicy.message },
       { status: 400 }
     );
   }
@@ -160,6 +181,95 @@ export async function action({ request }: Route.ActionArgs) {
     );
   }
 
+  // ---- Verify the emailed code -------------------------------------------------
+  //
+  // This is the step that makes an account provably tied to a mailbox. It runs
+  // AFTER the duplicate-email check (so the existing 409 contract is untouched)
+  // and BEFORE the user row is created, so a wrong code can never leave a
+  // half-registered account behind.
+  //
+  // The pepper is fetched before any comparison; a deployment without a usable
+  // JWT_SECRET fails loudly with a 500 rather than silently verifying against an
+  // unpeppered hash.
+  let pepper: string;
+  try {
+    pepper = otpPepper();
+  } catch (error) {
+    console.error("Register: OTP pepper unavailable", safeErrorLog(error));
+    return Response.json(
+      { success: false, message: "Internal server error" },
+      { status: 500 }
+    );
+  }
+
+  const otpRow = await findOutstandingOtp(normalizedEmail, OtpPurpose.REGISTER);
+  if (!otpRow) {
+    await insertAuditLog({
+      userId: null,
+      action: AuditAction.OTP_VERIFY_FAILED,
+      entityType: "EmailOtp",
+      details: {
+        route: "/api/v1/auth/register",
+        method: "POST",
+        result: "failed",
+        reason: "no_outstanding_code",
+        purpose: OtpPurpose.REGISTER,
+        email: normalizedEmail,
+      },
+    });
+    return Response.json(
+      {
+        success: false,
+        message: "The verification code is invalid or has expired.",
+        code: "OTP_INVALID",
+      },
+      { status: 400 }
+    );
+  }
+
+  const otpNow = new Date();
+  const otpOutcome = otpAttemptOutcome(
+    otpRow,
+    otp,
+    otpNow,
+    pepper,
+    normalizedEmail,
+    OtpPurpose.REGISTER
+  );
+
+  if (otpOutcome !== null) {
+    // Count the miss before answering, and burn the code at the cap. This is the
+    // bound that makes a 1,000,000-value space safe: 5 guesses per issued code.
+    const attempts = await recordFailedOtpAttempt(otpRow.id).catch((error) => {
+      console.error("Register: failed to record OTP attempt", safeErrorLog(error));
+      return OTP_MAX_VERIFY_ATTEMPTS;
+    });
+    await insertAuditLog({
+      userId: null,
+      action: AuditAction.OTP_VERIFY_FAILED,
+      entityType: "EmailOtp",
+      entityId: otpRow.id,
+      details: {
+        route: "/api/v1/auth/register",
+        method: "POST",
+        result: "failed",
+        reason: otpOutcome,
+        purpose: OtpPurpose.REGISTER,
+        attempts,
+        codeBurned: attempts >= OTP_MAX_VERIFY_ATTEMPTS,
+        email: normalizedEmail,
+      },
+    });
+    return Response.json(
+      {
+        success: false,
+        message: "The verification code is invalid or has expired.",
+        code: "OTP_INVALID",
+      },
+      { status: 400 }
+    );
+  }
+
   let passwordHash: string;
   try {
     passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -175,18 +285,83 @@ export async function action({ request }: Route.ActionArgs) {
   const now = new Date();
 
   try {
-    await db
-      .insert(users)
-      .values({
-        id,
-        email: normalizedEmail,
-        passwordHash,
-        role,
-        status,
-        createdAt: now,
-      })
-      .execute();
+    // The user row and the code's consumption commit TOGETHER. Two reasons:
+    //   * A consumed code with no account would burn the user's signup attempt and
+    //     force them to request another one.
+    //   * An account created while the code stays valid would let the same code
+    //     be replayed for a second registration.
+    // The code row is re-checked under FOR UPDATE so a second concurrent
+    // registration with the same code cannot slip a row in between our earlier
+    // hash comparison and this insert.
+    await db.transaction(async (tx) => {
+      const codeRows = await tx
+        .select({ id: emailOtps.id, consumedAt: emailOtps.consumedAt })
+        .from(emailOtps)
+        .where(
+          and(
+            eq(emailOtps.id, otpRow.id),
+            eq(emailOtps.purpose, OtpPurpose.REGISTER),
+            isNull(emailOtps.consumedAt)
+          )
+        )
+        .limit(1)
+        .for("update");
+
+      if (codeRows.length === 0) {
+        // Another request consumed it first. Throwing rolls back so this request
+        // creates no account either.
+        throw new Error("verification code already consumed");
+      }
+
+      await tx
+        .insert(users)
+        .values({
+          id,
+          email: normalizedEmail,
+          passwordHash,
+          role,
+          status,
+          createdAt: now,
+        })
+        .execute();
+
+      // userId is stamped on consumption so the audit trail can tie the code to the
+      // account it created (it is NULL while a registration is still pending).
+      await tx
+        .update(emailOtps)
+        .set({ consumedAt: now, userId: id })
+        .where(eq(emailOtps.id, otpRow.id))
+        .execute();
+    });
   } catch (error) {
+    // The code was consumed by a concurrent registration while this one was
+    // hashing the password. The transaction rolled back, so no account was
+    // created by this request — report it as a spent code, not a server fault.
+    if (error instanceof Error && error.message === "verification code already consumed") {
+      await insertAuditLog({
+        userId: null,
+        action: AuditAction.OTP_VERIFY_FAILED,
+        entityType: "EmailOtp",
+        entityId: otpRow.id,
+        details: {
+          route: "/api/v1/auth/register",
+          method: "POST",
+          result: "failed",
+          reason: "code_already_consumed",
+          purpose: OtpPurpose.REGISTER,
+          email: normalizedEmail,
+        },
+      });
+      return Response.json(
+        {
+          success: false,
+          message: "The verification code is invalid or has expired.",
+          code: "OTP_INVALID",
+        },
+        { status: 400 }
+      );
+    }
+
     // Concurrent registration race: the pre-check above can pass for two
     // requests at once, and the DB's unique constraint (User_email_unique) is
     // the single source of truth. Turn that race into the SAME 409 the

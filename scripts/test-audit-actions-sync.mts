@@ -85,8 +85,8 @@ const check = (name: string, fn: () => void) => {
   console.log(`PASS ${name}`);
 };
 
-check("AuditAction as-const object captures 25 distinct actions", () => {
-  assert.equal(auditActionValues().length, 25);
+check("AuditAction as-const object captures 31 distinct actions", () => {
+  assert.equal(auditActionValues().length, 31);
 });
 check("action field is typed as AuditActionValue (raw strings impossible)", () => {
   const src = readFileSync(join(root, "app", "lib", "audit-log.ts"), "utf8");
@@ -140,7 +140,7 @@ check("every AuditAction value is referenced by at least one call site", () => {
   const unreferenced = values.filter((v) => !refs.has(v));
   // LOGIN_FAILED / STATEMENT_IMPORT have no post-ingress producer today but are
   // valid retained members of the closed set; assert the comparable majority.
-  assert.ok(values.length - unreferenced.length >= 23);
+  assert.ok(values.length - unreferenced.length >= 29);
 });
 
 console.log(`test-audit-actions-sync: ${pass} PASS / 0 FAIL`);

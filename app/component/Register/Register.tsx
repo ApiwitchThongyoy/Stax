@@ -1,24 +1,30 @@
 import { useState, useEffect, useRef } from "react";
-import { Mail, Lock, ShieldCheck,Eye, EyeOff, AlertCircle } from "lucide-react";
+import { Mail, Lock, ShieldCheck,Eye, EyeOff, AlertCircle, KeyRound, Info } from "lucide-react";
 import { Link,useNavigate } from "react-router"
 import StaxLogo from "../Login/StaxLogo";
 import { useAuth } from "../../lib/auth";
 
 const OTP_COOLDOWN_SECONDS = 60;
+const OTP_CODE_LENGTH = 6;
 
 export default function Register() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  const [otp, setOtp] = useState("");
   const [notRobot, setNotRobot] = useState(false);
   const [agreeTerms, setAgreeTerms] = useState(false);
   const [otpCooldown, setOtpCooldown] = useState(0);
+  const [otpRequested, setOtpRequested] = useState(false);
+  const [devOtp, setDevOtp] = useState("");
+  const [sendingOtp, setSendingOtp] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [noticeMessage, setNoticeMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const navigate = useNavigate();
-  const { register } = useAuth();
+  const { register, requestOtp } = useAuth();
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -29,14 +35,12 @@ export default function Register() {
 
   const isValidEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
   const isOtpCoolingDown = otpCooldown > 0;
+  // A code must be exactly 6 digits; anything else is a typo, not a real code.
+  const isOtpValid = new RegExp(`^\\d{${OTP_CODE_LENGTH}}$`).test(otp);
 
-  const handleSendOtp = () => {
-    if (isOtpCoolingDown || !isValidEmail) return;
-
-    // TODO: call your API to send the OTP here
-    // e.g. await sendOtp(email);
-
-    setOtpCooldown(OTP_COOLDOWN_SECONDS);
+  const startCooldown = (seconds: number) => {
+    setOtpCooldown(seconds);
+    if (timerRef.current) clearInterval(timerRef.current);
     timerRef.current = setInterval(() => {
       setOtpCooldown((prev) => {
         if (prev <= 1) {
@@ -46,6 +50,32 @@ export default function Register() {
         return prev - 1;
       });
     }, 1000);
+  };
+
+  const handleSendOtp = async () => {
+    if (isOtpCoolingDown || !isValidEmail || sendingOtp) return;
+
+    setSendingOtp(true);
+    setErrorMessage("");
+    setNoticeMessage("");
+
+    const result = await requestOtp(email, "register");
+    setSendingOtp(false);
+
+    if (!result.success) {
+      setErrorMessage(result.error || "ไม่สามารถส่งรหัสยืนยันได้");
+      return;
+    }
+
+    // The server answers the same way whether or not the address is registered,
+    // so the message is deliberately neutral: it must not confirm that an account
+    // exists.
+    setOtpRequested(true);
+    setDevOtp(result.devOtp ?? "");
+    startCooldown(result.retryAfterSeconds ?? OTP_COOLDOWN_SECONDS);
+    setNoticeMessage(
+      "หากอีเมลนี้สามารถรับรหัสยืนยันได้ รหัสจะถูกส่งไปยังอีเมลดังกล่าว (รหัสมีอายุ 10 นาที)"
+    );
   };
 
   const handleRegister = async () => {
@@ -61,6 +91,10 @@ export default function Register() {
       setErrorMessage("รหัสผ่านและยืนยันรหัสผ่านไม่ตรงกัน");
       return;
     }
+    if (!isOtpValid) {
+      setErrorMessage(`กรุณากรอกรหัสยืนยัน ${OTP_CODE_LENGTH} หลัก`);
+      return;
+    }
     if (!notRobot) {
       setErrorMessage("กรุณายืนยันว่าคุณไม่ใช่โปรแกรมอัตโนมัติ");
       return;
@@ -72,7 +106,7 @@ export default function Register() {
 
     setSubmitting(true);
     setErrorMessage("");
-    const result = await register(email, password);
+    const result = await register(email, password, otp);
     setSubmitting(false);
 
     if (!result.success) {
@@ -130,15 +164,44 @@ export default function Register() {
               <button
                 type="button"
                 onClick={handleSendOtp}
-                disabled={isOtpCoolingDown || !isValidEmail}
+                disabled={isOtpCoolingDown || !isValidEmail || sendingOtp}
                 className={`absolute right-1.5 top-1/2 -translate-y-1/2 text-xs font-medium px-3 py-1.5 rounded-md transition ${
-                  isOtpCoolingDown || !isValidEmail
+                  isOtpCoolingDown || !isValidEmail || sendingOtp
                     ? "bg-gray-200 text-gray-400 cursor-not-allowed"
                     : "bg-emerald-400 hover:bg-emerald-500 text-white cursor-pointer"
                 }`}
               >
-                {isOtpCoolingDown ? `ส่งอีกครั้งใน ${otpCooldown}s` : "ส่ง OTP"}
+                {sendingOtp
+                  ? "กำลังส่ง..."
+                  : isOtpCoolingDown
+                    ? `ส่งอีกครั้งใน ${otpCooldown}s`
+                    : "ส่ง OTP"}
               </button>
+            </div>
+          </div>
+
+          {/* OTP code — required by the server; registration is impossible without it */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1.5">
+              รหัสยืนยัน (OTP)
+            </label>
+            <div className="relative">
+              <KeyRound className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={OTP_CODE_LENGTH}
+                value={otp}
+                onChange={(e) => {
+                  // Digits only, and a max length the OTP format can never
+                  // exceed — a paste of "123 456 789" becomes "123456".
+                  setOtp(e.target.value.replace(/\D/g, "").slice(0, OTP_CODE_LENGTH));
+                  if (errorMessage) setErrorMessage("");
+                }}
+                placeholder={`${OTP_CODE_LENGTH} หลัก`}
+                className="w-full pl-9 pr-3 py-2.5 text-sm bg-white text-gray-900 border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 transition tracking-[0.3em]"
+              />
             </div>
           </div>
 
@@ -235,6 +298,30 @@ export default function Register() {
             <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg bg-red-50 text-red-600 text-sm">
               <AlertCircle className="w-4 h-4 shrink-0" />
               <span>{errorMessage}</span>
+            </div>
+          )}
+
+          {noticeMessage && !errorMessage && (
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-emerald-50 text-emerald-700 text-sm">
+              <Mail className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{noticeMessage}</span>
+            </div>
+          )}
+
+          {/* Development-only: the server returns the code in the response when
+              AUTH_DEV_SHOW_OTP is set, because this project has no mail provider
+              yet. It is never returned in production. */}
+          {devOtp && (
+            <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 text-sm border border-amber-200">
+              <Info className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>
+                <strong>โหมดนักพัฒนา</strong> — รหัสยืนยันของคุณคือ{" "}
+                <strong className="font-mono tracking-widest">{devOtp}</strong>
+                <br />
+                <span className="text-xs">
+                  รหัสนี้จะแสดงเฉพาะเมื่อเปิดใช้งาน AUTH_DEV_SHOW_OTP เท่านั้น
+                </span>
+              </span>
             </div>
           )}
 

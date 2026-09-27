@@ -5,8 +5,14 @@ import type { Route } from "./+types/login";
 import { db } from "../../../lib/drizzle-db";
 import { users } from "~/db/schema";
 import { insertAuditLog, AuditAction } from "~/lib/audit-log";
-import { ACCOUNT_SUSPENDED_MESSAGE } from "~/lib/auth-middleware";
+import { ACCOUNT_SUSPENDED_MESSAGE, ACCESS_TOKEN_AUDIENCE } from "~/lib/auth-middleware";
 import { normalizeEmail } from "~/lib/normalize-email";
+import {
+  ACCESS_TOKEN_TTL_SECONDS,
+  buildRefreshCookieHeader,
+  issueRefreshSession,
+  refreshCookieIsSecure,
+} from "~/lib/refresh-session";
 import {
   LOGIN_EMAIL_RATE_LIMIT,
   LOGIN_IP_RATE_LIMIT,
@@ -23,7 +29,12 @@ import {
 import { safeErrorLog } from "~/lib/safe-error-log";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const ACCESS_TOKEN_EXPIRY = "1h";
+// SHORT-LIVED on purpose. The access JWT is the credential every API call sends,
+// so its blast radius should be small; a long-lived session is provided by the
+// opaque HttpOnly refresh cookie issued below and renewed by
+// POST /api/v1/auth/refresh. The number lives in app/lib/refresh-session.ts so
+// the refresh route and the client scheduler cannot drift from the signer.
+const ACCESS_TOKEN_EXPIRY = `${ACCESS_TOKEN_TTL_SECONDS}s`;
 
 export async function loader(_: Route.LoaderArgs) {
   return Response.json(
@@ -229,7 +240,8 @@ export async function action({ request }: Route.ActionArgs) {
     accessToken = jwt.sign(
       { userId: user.id, email: user.email, role: user.role },
       jwtSecret,
-      { expiresIn: ACCESS_TOKEN_EXPIRY }
+      // The audience is asserted by verifyAuth; see ACCESS_TOKEN_AUDIENCE.
+      { expiresIn: ACCESS_TOKEN_EXPIRY, audience: ACCESS_TOKEN_AUDIENCE }
     );
   } catch (error) {
     console.error("Login: failed to sign access token", safeErrorLog(error));
@@ -273,12 +285,42 @@ export async function action({ request }: Route.ActionArgs) {
     console.error("Login: failed to record last_login_at", safeErrorLog(error));
   }
 
+  // Mint the long-lived refresh session and hand it to the browser as an
+  // HttpOnly cookie. This is what makes the 15-minute access token usable for a
+  // whole working day without retyping the password.
+  //
+  // A failure here must NOT fail the login: the user has already proven their
+  // password, and returning a 500 would lock out a legitimate user over an
+  // auxiliary bookkeeping table (which may not even be migrated yet). We return
+  // the access token alone and let the normal expiry flow handle the session.
+  let setCookie: string | null = null;
+  try {
+    const issued = await issueRefreshSession(user.id);
+    setCookie = buildRefreshCookieHeader(
+      issued.token,
+      issued.maxAgeSeconds,
+      refreshCookieIsSecure(request.headers.get("host"))
+    );
+  } catch (error) {
+    console.error(
+      "Login: failed to issue refresh session",
+      safeErrorLog(error)
+    );
+  }
+
+  const headers: Record<string, string> = {};
+  if (setCookie) headers["Set-Cookie"] = setCookie;
+
   return Response.json(
     {
       success: true,
       message: "Login successful",
       data: {
         accessToken,
+        // Lets the client know a renewable session exists (and that this login
+        // can survive an access-token expiry). It carries no secret: the actual
+        // credential stays in the HttpOnly cookie the browser handles.
+        refreshEnabled: setCookie !== null,
         user: {
           id: user.id,
           email: user.email,
@@ -286,6 +328,6 @@ export async function action({ request }: Route.ActionArgs) {
         },
       },
     },
-    { status: 200 }
+    { status: 200, headers }
   );
 }

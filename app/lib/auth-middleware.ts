@@ -10,6 +10,17 @@ export interface AuthPayload {
   role: string;
 }
 
+/**
+ * Audience carried by session access tokens.
+ *
+ * STAX signs two classes of JWT with the same secret: access tokens and
+ * short-lived password-reset tickets. Verifying the audience here is what
+ * makes the separation deliberate. Without it, a reset ticket would only be
+ * refused because it happens to lack email/role — protection by accident, which
+ * a future claim added to a ticket would silently undo.
+ */
+export const ACCESS_TOKEN_AUDIENCE = "stax-access";
+
 export const ACCOUNT_SUSPENDED_MESSAGE =
   "บัญชีนี้ถูกระงับ โปรดติดต่อผู้ดูแลระบบที่ [email]";
 
@@ -65,7 +76,11 @@ export async function verifyAuth(
 
   let decoded: { userId?: string; email?: string; role?: string };
   try {
-    decoded = jwt.verify(token, jwtSecret) as {
+    // The audience assertion is load-bearing, not decoration: without it any
+    // other JWT signed by this secret would be accepted as a session.
+    decoded = jwt.verify(token, jwtSecret, {
+      audience: ACCESS_TOKEN_AUDIENCE,
+    }) as {
       userId?: string;
       email?: string;
       role?: string;

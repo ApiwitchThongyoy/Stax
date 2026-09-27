@@ -177,8 +177,8 @@ export default function Dashboard({ userEmail }: DashboardProps) {
       }`}
     >
       {/* Sidebar */}
-      <aside className="hidden md:flex w-60 shrink-0 flex-col bg-white border-r border-gray-100">
-        <div className="flex items-center gap-2.5 px-5 py-5 border-b border-gray-100">
+      <aside className="hidden md:flex w-60 shrink-0 h-screen flex-col overflow-hidden bg-white border-r border-gray-100">
+        <div className="shrink-0 flex items-center gap-2.5 px-5 py-5 border-b border-gray-100">
           <div className="w-8 h-8 shrink-0">
             <StaxLogo width="32px" transparent compact />
           </div>
@@ -189,7 +189,12 @@ export default function Dashboard({ userEmail }: DashboardProps) {
           </div>
         </div>
 
-        <nav className="flex-1 px-3 py-4 space-y-1">
+        {/* Only the navigation list scrolls; the logo header above and the
+            Settings / Help / profile block below stay pinned. min-h-0 lets the
+            flex child actually shrink below its content height, and
+            overflow-x-hidden keeps long labels from producing a sideways
+            scrollbar. */}
+        <nav className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-3 py-4 space-y-1">
           {navItems.map((item) => (
             <button
               key={item.id}
@@ -274,7 +279,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
           )}
         </nav>
 
-        <div className="px-3 py-4 border-t border-gray-100 space-y-1">
+        <div className="shrink-0 px-3 py-4 border-t border-gray-100 space-y-1">
           <button
             type="button"
             onClick={() => setActiveNav("settings")}

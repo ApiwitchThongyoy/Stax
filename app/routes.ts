@@ -4,6 +4,9 @@ export default [
   index("routes/Login.tsx"),
   route("login", "routes/Login.tsx", { id: "login-page" }),
   route("register", "routes/Register.tsx"),
+  route("forgot-password", "component/Login/ForgotPassword.tsx", {
+    id: "forgot-password-page",
+  }),
 
   layout("routes/ProtectedLayout.tsx", [
     route("dashboard", "routes/Dashboard.tsx"),
@@ -16,7 +19,30 @@ export default [
   ]),
 
   route("api/v1/auth/login", "routes/api/auth/login.ts"),
+  route("api/v1/auth/logout", "routes/api/auth/logout.ts"),
+  // Session renewal. The refresh cookie is scoped to /api/v1/auth precisely so it
+  // is only ever attached to this one path.
+  route("api/v1/auth/refresh", "routes/api/auth/refresh.ts"),
   route("api/v1/auth/register", "routes/api/auth/register.ts"),
+  // Registration is two-step: a code must exist for the address before
+  // /auth/register will accept it.
+  route(
+    "api/v1/auth/register/request-otp",
+    "routes/api/auth/register/request-otp.ts"
+  ),
+  // Password recovery: request -> verify (mints a short-lived ticket) -> reset.
+  route(
+    "api/v1/auth/forgot-password/request-otp",
+    "routes/api/auth/forgot-password/request-otp.ts"
+  ),
+  route(
+    "api/v1/auth/forgot-password/verify-otp",
+    "routes/api/auth/forgot-password/verify-otp.ts"
+  ),
+  route(
+    "api/v1/auth/forgot-password/reset",
+    "routes/api/auth/forgot-password/reset.ts"
+  ),
   route("api/v1/auth/session", "routes/api/auth/session.ts"),
   route("api/v1/auth/heartbeat", "routes/api/auth/heartbeat.ts"),
 

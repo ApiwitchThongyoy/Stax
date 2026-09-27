@@ -2565,8 +2565,161 @@ ok(
   "GeneralLedger tabs de-emphasize trial balance (removed from primary report tabs, backend preserved)"
 );
 
+// ---------------------------------------------------------------------------
+// 19. Shared date input: the native calendar button is restored (f422822 revert).
+// ---------------------------------------------------------------------------
+const nativeDateInput = read("app/component/DashboardUser/NativeDateInput.tsx");
+ok(
+  nativeDateInput.includes("CalendarDays") &&
+    /import\s*\{[^}]*CalendarDays[^}]*\}\s*from\s*"lucide-react"/.test(
+      nativeDateInput
+    ),
+  "NativeDateInput imports the CalendarDays icon again"
+);
+ok(
+  nativeDateInput.includes("className=\"relative inline-flex items-center\""),
+  "NativeDateInput wraps the field in a relative-positioned inline-flex span"
+);
+ok(
+  nativeDateInput.includes("pr-9") &&
+    nativeDateInput.includes("[&::-webkit-calendar-picker-indicator]:hidden"),
+  "NativeDateInput reserves room with pr-9 and hides the duplicate native indicator"
+);
+ok(
+  nativeDateInput.includes("<button type=\"button\"") &&
+    nativeDateInput.includes(
+      'aria-label={props.type === "month" ? "เปิดปฏิทินเลือกเดือน" : "เปิดปฏิทินเลือกวันที่"}'
+    ),
+  "NativeDateInput renders the calendar button with the month/date aria-label"
+);
+ok(
+  nativeDateInput.includes("disabled={props.disabled || props.readOnly}") &&
+    nativeDateInput.includes(
+      "if (!field || field.disabled || field.readOnly) return;"
+    ),
+  "NativeDateInput calendar button honors disabled/readOnly"
+);
+ok(
+  /onClick=\{open\}/.test(nativeDateInput) &&
+    nativeDateInput.includes("onClick={open}") &&
+    nativeDateInput.includes("field.showPicker?.()"),
+  "NativeDateInput calendar button onClick={open} invokes showPicker()"
+);
+ok(
+  nativeDateInput.includes("className=\"absolute right-1 p-1 rounded") &&
+    nativeDateInput.includes("disabled:opacity-40"),
+  "NativeDateInput calendar button is absolutely positioned at the field's right edge"
+);
+ok(
+  read("app/component/DashboardUser/CashFlowPage.tsx").includes(
+    "<NativeDateInput"
+  ) &&
+    read("app/component/DashboardUser/DashboardHomePage.tsx").includes(
+      "<NativeDateInput"
+    ),
+  "NativeDateInput is still shared by the cash-flow and dashboard cash-card filters"
+);
+ok(
+  read("scripts/test-statement-ui-browser.ps1").includes(
+    'Browser click \'button[aria-label="เปิดปฏิทินเลือกวันที่"]\''
+  ),
+  "Browser test clicks the restored calendar button again"
+);
+
+// ---------------------------------------------------------------------------
+// 20. Trading Journal: no calendar icon in the "บันทึกการซื้อขาย" card header.
+// ---------------------------------------------------------------------------
+{
+  // The page banner also contains "บันทึกการซื้อขาย", so anchor on the card
+  // header specifically: lastIndexOf is the "บันทึกการซื้อขาย" card.
+  const headerIdx = tradingJournalPage.lastIndexOf("บันทึกการซื้อขาย");
+  const headerBlock =
+    headerIdx === -1
+      ? ""
+      : tradingJournalPage.slice(
+          Math.max(0, headerIdx - 400),
+          headerIdx + 400
+        );
+  ok(
+    headerIdx !== -1 &&
+      headerBlock.includes('<section className="bg-white rounded-xl'),
+    "Trading-journal page still has the บันทึกการซื้อขาย card"
+  );
+  ok(
+    !/CalendarDays/.test(headerBlock),
+    "the บันทึกการซื้อขาย card header renders no CalendarDays icon"
+  );
+  ok(
+    !tradingJournalPage.includes("CalendarDays"),
+    "the now-unused CalendarDays import was removed from TradingJournalPage"
+  );
+  ok(
+    headerBlock.includes("BookOpenText") &&
+      headerBlock.includes("{entries.length}"),
+    "the card header keeps its BookOpenText icon and entry-count badge"
+  );
+  ok(
+    !tradingJournalPage.includes("NativeDateInput"),
+    "no calendar picker was added to the Trading Journal page (filters untouched)"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 21. Dashboard sidebar: viewport height with only the middle nav scrolling.
+// ---------------------------------------------------------------------------
+{
+  const aside = dashboard.match(/<aside className="[^"]*">/);
+  const nav = dashboard.match(/<nav className="([^"]*)">/);
+  const header = dashboard.match(
+    /<div className="(shrink-0 flex items-center gap-2\.5 px-5 py-5 border-b[^"]*)">/
+  );
+  const footer = dashboard.match(
+    /<div className="(shrink-0 px-3 py-4 border-t border-gray-100 space-y-1)">/
+  );
+
+  ok(
+    aside !== null && aside[0].includes("flex-col") && aside[0].includes("h-screen"),
+    "sidebar aside is a viewport-height flex column"
+  );
+  ok(
+    aside !== null && aside[0].includes("w-60") && aside[0].includes("shrink-0"),
+    "sidebar width (w-60 / shrink-0) is unchanged"
+  );
+  ok(header !== null, "sidebar logo/header is shrink-0 (stays fixed)");
+  ok(footer !== null, "sidebar Settings/Help/profile block is shrink-0 (stays visible)");
+  ok(
+    nav !== null &&
+      nav[1].includes("flex-1") &&
+      nav[1].includes("min-h-0") &&
+      nav[1].includes("overflow-y-auto") &&
+      nav[1].includes("overflow-x-hidden"),
+    "only the middle <nav> scrolls (flex-1 min-h-0 overflow-y-auto overflow-x-hidden)"
+  );
+  ok(
+    /h-screen w-full bg-gray-50 flex overflow-hidden/.test(dashboard),
+    "the shell stays h-screen with the main column untouched"
+  );
+  ok(
+    dashboard.includes("flex-1 min-w-0 flex flex-col overflow-hidden"),
+    "main content column is unchanged (still the only other scroll container)"
+  );
+  ok(
+    dashboard.indexOf("border-b border-gray-100") <
+      dashboard.indexOf("<nav className=") &&
+      dashboard.indexOf("<nav className=") <
+        dashboard.indexOf("border-t border-gray-100 space-y-1"),
+    "order preserved: fixed logo header -> scrolling nav -> fixed bottom block"
+  );
+  ok(
+    dashboard.includes("ภาพรวมการเงิน") &&
+      dashboard.includes("รายงาน") &&
+      dashboard.includes("ตั้งค่า") &&
+      dashboard.includes("ความช่วยเหลือ"),
+    "all report/category items plus Settings and Help remain inside the scrollable area"
+  );
+}
+
 console.log("\n================ SUMMARY ================");
-console.log(`PASS: ${passed}   FAIL: ${failed}`);
 if (failed > 0) {
   console.log("Failures:\n - " + failures.join("\n - "));
   process.exitCode = 1;

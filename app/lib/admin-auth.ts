@@ -1,4 +1,4 @@
-const ADMIN_SESSION_KEY = "stax_admin_session";
+export const ADMIN_SESSION_KEY = "stax_admin_session";
 
 export interface AdminSessionUser {
   id: string;

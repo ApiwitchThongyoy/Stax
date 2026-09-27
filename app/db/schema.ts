@@ -331,9 +331,10 @@ export const auditLogs = pgTable(
     index("audit_logs_user_id_idx").on(table.userId),
     index("audit_logs_created_at_idx").on(table.createdAt),
     index("audit_logs_action_idx").on(table.action),
-    // Data-integrity closed set (migration 0025), matches audit-log.ts
-    // AuditAction (all 25 actions). NOT VALID in the DB: audit history spans
-    // pre-repo deployments whose exact historical actions are unprovable.
+    // Data-integrity closed set (migration 0025, extended by 0029), matches
+    // audit-log.ts AuditAction (all 31 actions). NOT VALID in the DB: audit
+    // history spans pre-repo deployments whose exact historical actions are
+    // unprovable.
     check(
       "chk_audit_logs_action",
       sql`${table.action} IN (
@@ -345,7 +346,9 @@ export const auditLogs = pgTable(
         'SETTINGS_UPDATE',
         'NOTIFICATION_LIST_VIEW', 'NOTIFICATION_MARK_READ', 'NOTIFICATION_READ_ALL',
         'ACCOUNT_CREATE', 'JOURNAL_ENTRY_CREATE', 'JOURNAL_ENTRY_REVERSE',
-        'CORPORATE_ACTION_CREATE', 'CORPORATE_ACTION_DELETE'
+        'CORPORATE_ACTION_CREATE', 'CORPORATE_ACTION_DELETE',
+        'SESSION_REFRESH', 'SESSION_REFRESH_REJECTED', 'SESSION_REVOKED',
+        'OTP_REQUESTED', 'OTP_VERIFY_FAILED', 'PASSWORD_RESET_SUCCESS'
       )`
     ),
   ]
@@ -393,6 +396,129 @@ export const authRateLimits = pgTable(
     check(
       "chk_auth_rate_limits_attempts_non_negative",
       sql`${table.attempts} >= 0`
+    ),
+  ]
+);
+
+// ---------------------------------------------------------------------------
+// Refresh sessions (migration 0029) — the long-lived credential that lets a
+// short-lived access JWT be renewed without asking for the password again.
+//
+// The browser only ever holds an OPAQUE random token inside an HttpOnly cookie;
+// the server stores NOTHING but its SHA-256 digest, so a database leak cannot be
+// replayed as a live session. `familyId` groups a rotation chain: every renewal
+// issues a NEW row in the same family and revokes its predecessor, so replaying
+// an already-rotated (revoked) token is detectable and revokes the whole family.
+// Explicit logout revokes one session; a password reset revokes all of them.
+export const refreshSessions = pgTable(
+  "refresh_sessions",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    // sha256 hex digest of the opaque token. UNIQUE: the lookup path for every
+    // refresh, and it makes a duplicate-secret INSERT impossible.
+    tokenHash: text("token_hash").notNull(),
+    // Rotation chain id (a fresh random uuid at login). Shared by every token
+    // derived from that login, so reuse detection can revoke the whole chain.
+    familyId: text("family_id").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    // "rotated" | "logout" | "reuse_detected" | "password_reset" |
+    // "account_suspended" | "expired" — WHY a session ended (audit aid).
+    revokedReason: text("revoked_reason"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("refresh_sessions_token_hash_unique").on(table.tokenHash),
+    index("refresh_sessions_user_id_idx").on(table.userId),
+    index("refresh_sessions_family_id_idx").on(table.familyId),
+    index("refresh_sessions_expires_at_idx").on(table.expiresAt),
+    // Data-integrity closed set (migration 0029): only the reasons this app
+    // writes. A NULL revoked_reason means "not revoked".
+    check(
+      "chk_refresh_sessions_revoked_reason",
+      sql`${table.revokedReason} IS NULL OR ${table.revokedReason} IN (
+        'rotated', 'logout', 'reuse_detected', 'password_reset',
+        'account_suspended', 'expired'
+      )`
+    ),
+  ]
+);
+
+// ---------------------------------------------------------------------------
+// One-time passwords (migration 0029) for registration email verification and
+// password reset.
+//
+// A 6-digit code has only 1,000,000 possible values, so storing a bare SHA-256
+// of it would be trivially brute-forced from a database dump. Every digest is
+// therefore peppered with a server-only secret (JWT_SECRET) and bound to the
+// email + purpose, so a dump alone reveals nothing usable. The PLAINTEXT code is
+// never persisted, never logged and never written to an audit detail (audit-log
+// redacts "otp"/"code"-shaped keys as a second line of defence).
+// ---------------------------------------------------------------------------
+export const emailOtps = pgTable(
+  "email_otp",
+  {
+    id: text("id").primaryKey(),
+    // NULL while a registration is still pending (the account does not exist
+    // yet); set to the user id once the code is verified for a password reset.
+    userId: text("user_id").references(() => users.id, {
+      onDelete: "cascade",
+    }),
+    // "REGISTER" | "PASSWORD_RESET"
+    purpose: text("purpose").notNull(),
+    email: text("email").notNull(),
+    // sha256(pepper + ":" + email + ":" + purpose + ":" + code) hex.
+    codeHash: text("code_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    // sha256 hex of the reset ticket that this code was exchanged for, or NULL.
+    //
+    // This is what makes password reset correct rather than merely plausible.
+    // The code is spent at VERIFY time (consumed_at), so a captured code cannot
+    // ever mint a second ticket — but that leaves nothing marking the ticket as
+    // unused, so /forgot-password/reset would happily accept the same ticket
+    // twice. A replayed ticket must not be able to set a different password.
+    //
+    // So the ticket gets its own claim: verify stores its hash here, and reset
+    // performs a conditional UPDATE that clears it, which is atomic — the second
+    // holder of the same ticket updates 0 rows and is refused. NULL for REGISTER
+    // rows, which have no ticket.
+    resetTicketHash: text("reset_ticket_hash"),
+    // Failed verification attempts against THIS code. Once it reaches
+    // MAX_OTP_VERIFY_ATTEMPTS the code is burned (consumed) even if correct.
+    attempts: integer("attempts").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    // Drives the resend cooldown; a resend replaces the row for this
+    // (email, purpose) so only the newest code can ever verify.
+    lastSentAt: timestamp("last_sent_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("email_otp_email_purpose_idx").on(table.email, table.purpose),
+    index("email_otp_user_id_idx").on(table.userId),
+    index("email_otp_expires_at_idx").on(table.expiresAt),
+    check(
+      "chk_email_otp_purpose",
+      sql`${table.purpose} IN ('REGISTER', 'PASSWORD_RESET')`
+    ),
+    check("chk_email_otp_attempts_non_negative", sql`${table.attempts} >= 0`),
+    // A peppered sha256 hex digest is always 64 characters.
+    check("chk_email_otp_code_hash_length", sql`length(${table.codeHash}) = 64`),
+    // NULL, or a peppered sha256 hex digest.
+    check(
+      "chk_email_otp_reset_ticket_hash",
+      sql`${table.resetTicketHash} IS NULL OR length(${table.resetTicketHash}) = 64`
     ),
   ]
 );

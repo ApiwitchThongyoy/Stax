@@ -44,6 +44,18 @@ export const AuditAction = {
   JOURNAL_ENTRY_REVERSE: "JOURNAL_ENTRY_REVERSE",
   CORPORATE_ACTION_CREATE: "CORPORATE_ACTION_CREATE",
   CORPORATE_ACTION_DELETE: "CORPORATE_ACTION_DELETE",
+  // Session renewal (refresh sessions, migration 0029).
+  // SESSION_REFRESH_REJECTED covers every unusable-cookie outcome, so a
+  // brute-force / replay attempt against /auth/refresh is observable. It is
+  // deliberately NOT userId-scoped when the cookie identifies no live user.
+  SESSION_REFRESH: "SESSION_REFRESH",
+  SESSION_REFRESH_REJECTED: "SESSION_REFRESH_REJECTED",
+  SESSION_REVOKED: "SESSION_REVOKED",
+  // One-time passwords (email_otp, migration 0029). OTP_REQUESTED records only
+  // purpose + email, NEVER the code; OTP_VERIFY_FAILED records only the reason.
+  OTP_REQUESTED: "OTP_REQUESTED",
+  OTP_VERIFY_FAILED: "OTP_VERIFY_FAILED",
+  PASSWORD_RESET_SUCCESS: "PASSWORD_RESET_SUCCESS",
 } as const;
 
 const FORBIDDEN_KEYS = [
@@ -64,6 +76,14 @@ const FORBIDDEN_KEYS = [
   "statementtext",
   "file_content",
   "filecontent",
+  // One-time passwords (migration 0029). Nothing in this app is ever supposed to
+  // write a plaintext OTP or a password-reset ticket into an audit row, so these
+  // are a hard second line of defence rather than the primary protection (the
+  // real one is that app/lib/otp.ts only ever holds a peppered hash).
+  "otp",
+  "code_hash",
+  "codehash",
+  "ticket",
 ];
 
 function sanitizeDetails(

@@ -27,6 +27,36 @@ export const REGISTER_IP_RATE_LIMIT: AuthRateLimitConfig = {
   maxAttempts: 10,
 };
 
+// --- OTP / session renewal budgets (migration 0029 flows) --------------------
+//
+// The per-ROW attempt counter in app/lib/otp.ts is what actually bounds guessing
+// (5 tries per issued code). These windows are the coarse, per-caller budgets
+// that stop someone from driving unbounded request volume at all.
+export const OTP_REQUEST_IP_RATE_LIMIT: AuthRateLimitConfig = {
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  maxAttempts: 20,
+};
+
+export const OTP_REQUEST_EMAIL_RATE_LIMIT: AuthRateLimitConfig = {
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  maxAttempts: 5,
+};
+
+export const OTP_VERIFY_IP_RATE_LIMIT: AuthRateLimitConfig = {
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  maxAttempts: 40,
+};
+
+// /api/v1/auth/refresh is called AUTOMATICALLY by every open tab (and on every
+// reload), so its budget must be far above the human-action budgets above — a
+// user with 20 tabs reloading through the day would otherwise throttle
+// themselves into a signed-out state. It exists to stop a script hammering the
+// endpoint or brute-forcing cookie values, not to ration normal use.
+export const REFRESH_IP_RATE_LIMIT: AuthRateLimitConfig = {
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  maxAttempts: 240,
+};
+
 export const RATE_LIMIT_PURGE_CHANCE = 1 / 50;
 export const RATE_LIMIT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
@@ -54,6 +84,40 @@ export function loginEmailKey(email: string): string {
  */
 export function registerIpKey(ip: string): string {
   return `register-ip:${ip}`;
+}
+
+/**
+ * OTP-request budget, per-IP. Shares the "register-" namespace spirit but is its
+ * own bucket so requesting a code never eats a registration attempt and vice
+ * versa: the two flows are independent and coupling them would let one starve
+ * the other.
+ */
+export function otpRequestIpKey(ip: string): string {
+  return `otp-request-ip:${ip}`;
+}
+
+/**
+ * OTP-request budget, per (email, purpose).
+ *
+ * The purpose is part of the key on purpose: an attacker must not be able to
+ * exhaust a victim's PASSWORD_RESET budget by spamming registration codes (or
+ * vice versa) and thereby block the victim from recovering their own account.
+ */
+export function otpRequestEmailKey(email: string, purpose: string): string {
+  return `otp-request-email:${purpose}:${email}`;
+}
+
+/** OTP-verification budget, per-IP (the per-code cap lives on the OTP row). */
+export function otpVerifyIpKey(ip: string): string {
+  return `otp-verify-ip:${ip}`;
+}
+
+/**
+ * Session-refresh budget, per-IP. See REFRESH_IP_RATE_LIMIT for why the cap is
+ * high: this endpoint is machine-called, not human-called.
+ */
+export function refreshIpKey(ip: string): string {
+  return `refresh-ip:${ip}`;
 }
 
 /**

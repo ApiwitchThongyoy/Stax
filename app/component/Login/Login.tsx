@@ -164,6 +164,15 @@ export default function StaxLoginPage() {
               <span aria-hidden="true">›</span>
             </button>
 
+            <p className="text-center text-sm mt-3">
+              <Link
+                to="/forgot-password"
+                className="text-gray-500 hover:text-blue-800 hover:underline"
+              >
+                ลืมรหัสผ่าน?
+              </Link>
+            </p>
+
             <p className="text-center text-sm text-gray-500 mt-6">
               ยังไม่มีบัญชี?{" "}
               <Link
