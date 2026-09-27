@@ -50,19 +50,20 @@ Browser find text 'Delete one document' click
 Assert-Browser "if (!document.querySelector('h1').textContent.includes('Mira Fixture')) throw Error('Remaining identity lost'); return 'PASS one deletion retains source identity';"
 Browser find text 'Delete all documents' click
 Assert-Browser "if (!document.querySelector('h1').textContent.includes('fixture-user@example.test') || document.querySelector('#statement-account-details')) throw Error('Stale identity'); return 'PASS final deletion clears identity';"
+Assert-Browser "if (document.querySelector('button[aria-label]')) throw Error('Calendar button still present'); return 'PASS no extra calendar button';"
 Browser find text 'ตัดยอด ณ วันที่' click
-Browser click 'button[aria-label="เปิดปฏิทินเลือกวันที่"]'
+Browser click 'input[type=date]'
 Browser press Escape
-Assert-Browser "if (Number(document.querySelector('#picker-calls').textContent) < 1) throw Error('Picker not called'); return 'PASS calendar icon invokes native picker';"
-Browser click 'button[aria-label="เปิดปฏิทินเลือกวันที่"]'
+Assert-Browser "if (Number(document.querySelector('#picker-calls').textContent) < 1) throw Error('Picker not called'); return 'PASS clicking the date field invokes the native picker';"
+Browser click 'input[type=date]'
 Browser press ArrowRight
 Browser press Enter
 Assert-Browser "if (!document.querySelector('input[type=date]').value || !JSON.parse(document.querySelector('#requests').textContent).at(-1).includes('asOf=' + document.querySelector('input[type=date]').value)) throw Error('Stale date sent'); return 'PASS selected date reaches existing API filter';"
 Browser find text 'Cash fixture' click
 Browser find text 'ตัดยอด ณ วันที่' click
-Browser click 'button[aria-label="เปิดปฏิทินเลือกวันที่"]'
+Browser click 'input[type=date]'
 Browser press Escape
-Browser click 'button[aria-label="เปิดปฏิทินเลือกวันที่"]'
+Browser click 'input[type=date]'
 Browser press ArrowRight
 Browser press Enter
 Assert-Browser "if (!document.querySelector('input[type=date]').value || !JSON.parse(document.querySelector('#requests').textContent).at(-1).includes('asOf=' + document.querySelector('input[type=date]').value)) throw Error('Cash filter failed'); return 'PASS CashFlow native picker and state';"
