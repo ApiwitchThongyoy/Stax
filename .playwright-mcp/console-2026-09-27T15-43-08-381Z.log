@@ -1,0 +1,2 @@
+[    1077ms] [VERBOSE] [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o @ https://stax-delta.vercel.app/login:0
+[   21567ms] [ERROR] Failed to load resource: the server responded with a status of 401 () @ https://stax-delta.vercel.app/api/v1/auth/login:0

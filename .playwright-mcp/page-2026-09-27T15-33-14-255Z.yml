@@ -1,0 +1,38 @@
+- generic [ref=e2]:
+  - generic [ref=e20]:
+    - generic [ref=e22]:
+      - img [ref=e24]:
+        - generic [ref=e36]: S
+        - generic [ref=e37]: x
+      - generic [ref=e38]: STAX
+      - generic [ref=e39]: Intelligent Financial Accounting andForeign Investment Ledger System
+      - generic [ref=e41]: ระบบบันทึกสรุปบัญชีการเงินและติดตามการลงทุนต่างประเทศ
+    - generic [ref=e43]:
+      - generic [ref=e44]: อีเมลผู้ใช้งาน
+      - textbox "name@company.com" [ref=e49]: test01db@gmail.com
+      - generic [ref=e50]:
+        - generic [ref=e51]: รหัสผ่าน
+        - button "ลืมรหัสผ่าน?" [ref=e52] [cursor=pointer]
+      - generic [ref=e53]:
+        - textbox "••••••••" [ref=e57]: maxmazaza
+        - button "แสดงรหัสผ่าน" [ref=e58]:
+          - img [aria-hidden] [ref=e59] [cursor=pointer]
+      - generic [ref=e62] [cursor=pointer]:
+        - checkbox "จดจำฉันในระบบ" [ref=e63]
+        - generic [ref=e64]: จดจำฉันในระบบ
+      - button "เข้าสู่ระบบ" [ref=e65]:
+        - text: เข้าสู่ระบบ
+        - generic [aria-hidden] [ref=e66]: ›
+      - paragraph [ref=e67]:
+        - link "ลืมรหัสผ่าน?" [ref=e68] [cursor=pointer]:
+          - /url: /forgot-password
+      - paragraph [ref=e69]:
+        - text: ยังไม่มีบัญชี?
+        - link "สมัครสมาชิกที่นี่" [ref=e70] [cursor=pointer]:
+          - /url: /register
+  - generic [ref=e71]:
+    - paragraph [ref=e72]: © 2026 STAX Financial Management. All Rights Reserved.
+    - paragraph [ref=e73]:
+      - button "Privacy Policy" [ref=e74]
+      - text: ·
+      - button "Terms of Service" [ref=e75]

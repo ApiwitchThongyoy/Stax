@@ -1,0 +1,196 @@
+- generic [ref=e1]:
+  - generic [ref=e76]:
+    - complementary [ref=e77]:
+      - generic [ref=e78]:
+        - img [ref=e82]:
+          - generic [ref=e94]: S
+          - generic [ref=e95]: x
+        - paragraph [ref=e97]: STAX
+      - navigation [ref=e98]:
+        - button "หน้าหลัก" [ref=e99]
+        - button "สมุดบันทึกการซื้อขาย" [ref=e105]
+        - button "สมุดรายวัน" [ref=e108]
+        - button "บัญชีแยกประเภท" [ref=e112]
+        - button "อัปโหลด Statement" [ref=e116]
+        - button "คลัง Statement" [ref=e120]
+        - button "เงินเข้า/ออก" [ref=e124]
+        - generic [ref=e5381]:
+          - paragraph [ref=e5382]: ภาพรวม
+          - button "ภาพรวมการเงิน" [ref=e5383]
+          - paragraph [ref=e5384]: หมวดหมู่
+          - button "สินทรัพย์" [ref=e5385]
+          - button "หนี้สิน" [ref=e5386]
+          - button "ส่วนทุน" [ref=e5387]
+          - button "รายได้" [ref=e5388]
+          - button "ค่าใช้จ่าย" [ref=e5389]
+          - paragraph [ref=e5391]: รายงาน
+          - button "บันทึกรายการ" [ref=e5392]
+          - button "งบทดลอง" [active] [ref=e5393]
+          - button "งบกำไรขาดทุน" [ref=e5394]
+          - button "งบดุล" [ref=e5395]
+      - generic [ref=e128]:
+        - button "ตั้งค่า" [ref=e129]
+        - button "ความช่วยเหลือ" [ref=e133]
+        - generic [ref=e137]:
+          - generic [ref=e138]: T
+          - generic [ref=e139]:
+            - paragraph [ref=e140]: Test01db
+            - paragraph [ref=e141]: test01db@gmail.com
+    - generic [ref=e142]:
+      - banner [ref=e143]:
+        - generic [ref=e144]:
+          - button "การแจ้งเตือน" [ref=e146]:
+            - generic [ref=e150]: "19"
+          - button "ตั้งค่า" [ref=e151]
+          - button "สลับเป็นโหมดมืด" [ref=e155]
+      - main [ref=e158]:
+        - generic [ref=e5396]:
+          - generic [ref=e5830]:
+            - paragraph [ref=e5831]: Trial Balance
+            - heading "งบทดลอง" [level=1] [ref=e5832]
+            - paragraph [ref=e5833]: สรุปยอดเดบิต/เครดิตของทุกบัญชีเพื่อตรวจสอบความสมดุลของระบบบัญชีแบบคู่
+          - generic [ref=e5835]:
+            - generic [ref=e5836]:
+              - generic [ref=e5837]: จากวันที่
+              - textbox "จากวันที่" [ref=e5838]: 2025-01-01
+            - generic [ref=e5839]:
+              - generic [ref=e5840]: ถึงวันที่
+              - textbox "ถึงวันที่" [ref=e5841]: 2026-09-27
+            - button "ค้นหา" [ref=e5842]
+            - button "ล้าง" [ref=e5846]
+          - generic [ref=e5848]:
+            - generic [ref=e5849]:
+              - heading "งบทดลอง" [level=2] [ref=e5850]
+              - generic [ref=e5851]: งบทดลองสมดุล
+            - table [ref=e5853]:
+              - rowgroup [ref=e5854]:
+                - row [ref=e5855]:
+                  - columnheader "รหัส" [ref=e5856]
+                  - columnheader "ชื่อบัญชี" [ref=e5857]
+                  - columnheader "ประเภท" [ref=e5858]
+                  - columnheader "สกุล" [ref=e5859]
+                  - columnheader "เดบิต" [ref=e5860]
+                  - columnheader "เครดิต" [ref=e5861]
+                  - columnheader "คงเหลือ" [ref=e5862]
+              - rowgroup [ref=e5863]:
+                - row [ref=e5864]:
+                  - cell "1010" [ref=e5865]
+                  - cell "เงินสด - บัญชีไทย" [ref=e5866]
+                  - cell "สินทรัพย์" [ref=e5867]
+                  - cell "THB" [ref=e5869]
+                  - cell "5,000.00 ฿5,000.00" [ref=e5870]:
+                    - text: 5,000.00
+                    - generic [ref=e5871]: ฿5,000.00
+                  - cell "0.00 ฿0.00" [ref=e5872]:
+                    - text: "0.00"
+                    - generic [ref=e5873]: ฿0.00
+                  - cell "+5,000.00 ฿5,000.00" [ref=e5874]:
+                    - text: +5,000.00
+                    - generic [ref=e5875]: ฿5,000.00
+                - row [ref=e5876]:
+                  - cell "1020" [ref=e5877]
+                  - cell "เงินสด - บัญชีโบรกเกอร์ต่างประเทศ" [ref=e5878]
+                  - cell "สินทรัพย์" [ref=e5879]
+                  - cell "USD" [ref=e5881]
+                  - cell "1,120.27 ฿35,387.61" [ref=e5882]:
+                    - text: 1,120.27
+                    - generic [ref=e5883]: ฿35,387.61
+                  - cell "0.00 ฿0.00" [ref=e5884]:
+                    - text: "0.00"
+                    - generic [ref=e5885]: ฿0.00
+                  - cell "+1,120.27 ฿35,387.61" [ref=e5886]:
+                    - text: +1,120.27
+                    - generic [ref=e5887]: ฿35,387.61
+                - row [ref=e5888]:
+                  - cell "1110" [ref=e5889]
+                  - cell "เงินลงทุน - หุ้นต่างประเทศ" [ref=e5890]
+                  - cell "สินทรัพย์" [ref=e5891]
+                  - cell "USD" [ref=e5893]
+                  - cell "1,750.04 ฿56,672.63" [ref=e5894]:
+                    - text: 1,750.04
+                    - generic [ref=e5895]: ฿56,672.63
+                  - cell "0.00 ฿0.00" [ref=e5896]:
+                    - text: "0.00"
+                    - generic [ref=e5897]: ฿0.00
+                  - cell "+1,750.04 ฿56,672.63" [ref=e5898]:
+                    - text: +1,750.04
+                    - generic [ref=e5899]: ฿56,672.63
+                - row [ref=e5900]:
+                  - cell "3020" [ref=e5901]
+                  - cell "ส่วนทุน - เงินลงทุนเริ่มต้น (THB)" [ref=e5902]
+                  - cell "ส่วนทุน" [ref=e5903]
+                  - cell "THB" [ref=e5905]
+                  - cell "0.00 ฿0.00" [ref=e5906]:
+                    - text: "0.00"
+                    - generic [ref=e5907]: ฿0.00
+                  - cell "97,000.00 ฿97,000.00" [ref=e5908]:
+                    - text: 97,000.00
+                    - generic [ref=e5909]: ฿97,000.00
+                  - cell "-97,000.00 -฿97,000.00" [ref=e5910]:
+                    - text: "-97,000.00"
+                    - generic [ref=e5911]: "-฿97,000.00"
+                - row [ref=e5912]:
+                  - cell "4030" [ref=e5913]
+                  - cell "รายได้ - ดอกเบี้ย" [ref=e5914]
+                  - cell "รายได้" [ref=e5915]
+                  - cell "USD" [ref=e5917]
+                  - cell "0.00 ฿0.00" [ref=e5918]:
+                    - text: "0.00"
+                    - generic [ref=e5919]: ฿0.00
+                  - cell "1.24 ฿40.61" [ref=e5920]:
+                    - text: "1.24"
+                    - generic [ref=e5921]: ฿40.61
+                  - cell "-1.24 -฿40.61" [ref=e5922]:
+                    - text: "-1.24"
+                    - generic [ref=e5923]: "-฿40.61"
+                - row [ref=e5924]:
+                  - cell "5020" [ref=e5925]
+                  - cell "รายได้/ค่าใช้จ่าย - จากอัตราแลกเปลี่ยน" [ref=e5926]
+                  - cell "ค่าใช้จ่าย" [ref=e5927]
+                  - cell "THB" [ref=e5929]
+                  - cell "0.00 ฿0.00" [ref=e5930]:
+                    - text: "0.00"
+                    - generic [ref=e5931]: ฿0.00
+                  - cell "21.59 ฿21.59" [ref=e5932]:
+                    - text: "21.59"
+                    - generic [ref=e5933]: ฿21.59
+                  - cell "-21.59 -฿21.59" [ref=e5934]:
+                    - text: "-21.59"
+                    - generic [ref=e5935]: "-฿21.59"
+                - row [ref=e5936]:
+                  - cell "5130" [ref=e5937]
+                  - cell "ค่าใช้จ่าย - ภาษีมูลค่าเพิ่ม (VAT)" [ref=e5938]
+                  - cell "ค่าใช้จ่าย" [ref=e5939]
+                  - cell "USD" [ref=e5941]
+                  - cell "0.06 ฿1.96" [ref=e5942]:
+                    - text: "0.06"
+                    - generic [ref=e5943]: ฿1.96
+                  - cell "0.00 ฿0.00" [ref=e5944]:
+                    - text: "0.00"
+                    - generic [ref=e5945]: ฿0.00
+                  - cell "+0.06 ฿1.96" [ref=e5946]:
+                    - text: "+0.06"
+                    - generic [ref=e5947]: ฿1.96
+              - rowgroup [ref=e5948]:
+                - row [ref=e5949]:
+                  - cell "ยอดรวมตามสกุล (ไม่บวกข้ามสกุล)" [ref=e5950]
+                  - cell "-" [ref=e5951]
+                  - cell "-" [ref=e5952]
+                  - cell [ref=e5953]
+                - row [ref=e5954]:
+                  - cell "ยอดรวมฐานบาท สมดุล THB 5,000.00 + USD 2,870.37" [ref=e5955]:
+                    - text: ยอดรวมฐานบาท
+                    - generic [ref=e5956]: สมดุล
+                    - generic [ref=e5957]: THB 5,000.00 + USD 2,870.37
+                  - cell "฿97,062.20" [ref=e5958]
+                  - cell "฿97,062.20" [ref=e5959]
+                  - cell [ref=e5960]
+        - generic [ref=e191]:
+          - paragraph [ref=e192]: © 2026 STAX Financial Management. All Rights Reserved.
+          - paragraph [ref=e193]:
+            - button "ความเป็นส่วนตัว" [ref=e194]
+            - text: ·
+            - button "เงื่อนไขการให้บริการ" [ref=e195]
+            - text: ·
+            - button "ติดต่อเรา" [ref=e196]
+  - generic [aria-hidden] [ref=e620]: TSLY
