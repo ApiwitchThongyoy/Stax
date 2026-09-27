@@ -47,6 +47,8 @@ import {
 } from "../../lib/server-api";
 import { formatBaht } from "../Ledger/shared";
 import PortfolioChart from "./PortfolioChart";
+import NativeDateInput from "./NativeDateInput";
+import { supportedStatementIdentity } from "../../lib/statement-identity";
 
 export type DashboardNav = "gl" | "upload" | "archive" | "cashflow";
 
@@ -74,6 +76,8 @@ export default function DashboardHomePage({
   onOpenSymbol,
 }: DashboardHomePageProps) {
   const { user } = useAuth();
+  const identity = supportedStatementIdentity(documents);
+  const [identityExpanded, setIdentityExpanded] = useState(true);
   const accessToken = user?.accessToken ?? null;
 
   const [summary, setSummary] = useState<GeneralLedgerSummary | null>(null);
@@ -116,17 +120,17 @@ export default function DashboardHomePage({
   );
 
   const loadCashView = useCallback(
-    async (view: CashView) => {
+    async (view: CashView, scope?: { month?: string; asOf?: string }) => {
       setCashView(view);
       if (view === "all") {
         await fetchCash("all");
       } else if (view === "month") {
         setCashDetailLoading(true);
-        await fetchCash("month", { month: cashMonth });
+        await fetchCash("month", { month: scope?.month ?? cashMonth });
         setCashDetailLoading(false);
       } else if (view === "asOf") {
         setCashDetailLoading(true);
-        await fetchCash("asOf", { asOf: cashAsOf });
+        await fetchCash("asOf", { asOf: scope?.asOf ?? cashAsOf });
         setCashDetailLoading(false);
       } else if (view === "exchange") {
         setCashDetailLoading(true);
@@ -263,7 +267,20 @@ export default function DashboardHomePage({
       {/* Banner */}
       <div className="bg-linear-to-br from-blue-900 to-blue-950 rounded-2xl px-6 py-5 text-white">
         <p className="text-xs text-blue-300 mb-1">หน้าหลัก</p>
-        <h1 className="text-xl font-semibold mb-1.5">Dashboard</h1>
+        <h1 className="text-xl font-semibold mb-1.5">
+          ยินดีต้อนรับ {identity ? (
+            <button type="button" aria-expanded={identityExpanded}
+              aria-controls="statement-account-details"
+              onClick={() => setIdentityExpanded(value => !value)}>
+              {identity.accountHolderName} <span aria-hidden="true">{identityExpanded ? "▾" : "▸"}</span>
+            </button>
+          ) : user?.email}
+        </h1>
+        {identity && identityExpanded && (
+          <p id="statement-account-details" className="text-sm text-blue-200 mb-1.5">
+            Account No. {identity.accountNumber}
+          </p>
+        )}
         <p className="text-sm text-blue-200">
           ภาพรวมพอร์ต เงินเข้า-ออก และงบการเงินของคุณ
         </p>
@@ -931,25 +948,25 @@ export default function DashboardHomePage({
                   </button>
                 ))}
                 {cashView === "month" && (
-                  <input
+                  <NativeDateInput
                     type="month"
                     value={cashMonth}
                     onChange={(e) => {
                       const v = e.target.value;
                       setCashMonth(v);
-                      if (cashView === "month" && v) void loadCashView("month");
+                      if (cashView === "month" && v) void loadCashView("month", { month: v });
                     }}
                     className="ml-auto text-[11px] border border-gray-200 rounded px-2 py-1.5 text-gray-700"
                   />
                 )}
                 {cashView === "asOf" && (
-                  <input
+                  <NativeDateInput
                     type="date"
                     value={cashAsOf}
                     onChange={(e) => {
                       const v = e.target.value;
                       setCashAsOf(v);
-                      if (cashView === "asOf" && v) void loadCashView("asOf");
+                      if (cashView === "asOf" && v) void loadCashView("asOf", { asOf: v });
                     }}
                     className="ml-auto text-[11px] border border-gray-200 rounded px-2 py-1.5 text-gray-700"
                   />

@@ -5599,6 +5599,8 @@ console.log("\n=== REG: TRADING JOURNAL SCOPE ===");
   console.log("\n=== REG: PROFESSOR JOURNAL, EDIT ATOMICITY & RECOMPUTE ===");
   const { runProfessorJournalDbTests } = await import("./professor-journal-db.mjs");
   await runProfessorJournalDbTests(client, ok);
+  const { runStatementIdentityDbTests } = await import("./statement-identity-db.mjs");
+  await runStatementIdentityDbTests(client, ok, makePdf);
 
   console.log("\n=== CLEANUP ===");
   const cleanIds: string[] = [];

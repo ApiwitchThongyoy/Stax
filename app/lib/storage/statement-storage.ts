@@ -1,7 +1,9 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { db } from "../drizzle-db";
-import { documents } from "../../db/schema";
+import { documents, users } from "../../db/schema";
+import { eq } from "drizzle-orm";
+import { StatementIdentityError, validateStatementIdentity, type StatementIdentity } from "../statement-identity";
 import { computeContentHash } from "../statement-hash";
 import {
   STATEMENTS_DIR,
@@ -23,6 +25,7 @@ const MAX_ORIGINAL_NAME_LENGTH = 200;
 export interface StatementSaveInput {
   userId: string;
   file: File;
+  statementIdentity?: StatementIdentity;
 }
 
 export interface StoredStatementMeta {
@@ -35,6 +38,7 @@ export interface StoredStatementMeta {
   fileSize: number;
   createdAt: string;
   bytes: Uint8Array;
+  identityWarnings: string[];
 }
 
 export type SaveStatementResult =
@@ -155,22 +159,39 @@ export async function saveStatementPdf(
 
     const now = new Date().toISOString();
     const originalName = sanitizeOriginalName(file.name);
+    let identityWarnings: string[] = [];
 
     try {
-      await db
-        .insert(documents)
-        .values({
-          id: documentId,
-          userId,
-          originalName,
-          contentHash,
-          filePath: objectKey,
-          mimeType: PDF_MIME_TYPE,
-          fileSize: file.size,
-          createdAt: now,
-          updatedAt: now,
-        })
-        .execute();
+      await db.transaction(async (tx) => {
+        // Serialize identity decisions even for simultaneous first uploads.
+        await tx.select({ id: users.id }).from(users).where(eq(users.id, userId)).for("update");
+        if (input.statementIdentity) {
+          const previous = await tx.select({
+            accountHolderName: documents.accountHolderName,
+            accountNumber: documents.accountNumber,
+            contentHash: documents.contentHash,
+          }).from(documents).where(eq(documents.userId, userId));
+          // Preserve the unique-index duplicate path for identical bytes.
+          if (!previous.some(d => d.contentHash === contentHash)) {
+            identityWarnings = validateStatementIdentity(input.statementIdentity, previous);
+          }
+        }
+        await tx
+          .insert(documents)
+          .values({
+            id: documentId,
+            userId,
+            originalName,
+            ...input.statementIdentity,
+            contentHash,
+            filePath: objectKey,
+            mimeType: PDF_MIME_TYPE,
+            fileSize: file.size,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .execute();
+      });
     } catch (error) {
       // The object was persisted but the DB insert failed — best-effort object
       // cleanup so no orphaned/unreferenced PDF is left behind. A concurrent
@@ -196,9 +217,13 @@ export async function saveStatementPdf(
         fileSize: file.size,
         createdAt: now,
         bytes: new Uint8Array(buffer),
+        identityWarnings,
       },
     };
   } catch (error) {
+    if (error instanceof StatementIdentityError) {
+      return { ok: false, status: 409, message: error.message };
+    }
     if ((error as { code?: unknown })?.code === "23505") {
       throw error;
     }

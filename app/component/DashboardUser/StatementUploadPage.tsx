@@ -56,6 +56,7 @@ interface UploadStats {
 }
 
 interface UploadResult {
+  identityWarnings?: string[];
   documentId: string;
   fileName: string;
   extracted: number;
@@ -598,6 +599,9 @@ export default function StatementUploadPage({
               </div>
             </div>
 
+            {result.identityWarnings?.map(warning => (
+              <p key={warning} role="status" className="text-sm text-amber-700 bg-amber-50 rounded-lg p-3">{warning}</p>
+            ))}
             {(result?.posting?.skippedRows ?? 0) > 0 && (
               <p className="text-xs text-gray-500">
                 รายการที่ข้ามการโพสต์ (สกุลเงินไม่ตรงกับบัญชี/รูปแบบไม่รองรับ):{" "}

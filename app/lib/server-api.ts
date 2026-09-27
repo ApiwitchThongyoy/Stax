@@ -46,6 +46,8 @@ export interface CapitalLedgerRow {
  * Shape of a single document returned by GET /api/v1/documents.
  */
 export interface ServerDocumentMeta {
+  accountHolderName?: string | null;
+  accountNumber?: string | null;
   id: string;
   originalName: string;
   mimeType: string;

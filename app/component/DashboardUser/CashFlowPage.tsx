@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowLeft, CircleHelp, Wallet } from "lucide-react";
 import { useAuth } from "../../lib/auth";
+import NativeDateInput from "./NativeDateInput";
 import {
   type CashSummary,
   type CashSummaryQuery,
@@ -142,7 +143,7 @@ export default function CashFlowPage({ onBack }: Props) {
         {/* Scope inputs */}
         <div className="flex items-center gap-2 mt-3">
           {view === "month" && (
-            <input
+            <NativeDateInput
               type="month"
               value={month}
               onChange={(e) => setMonth(e.target.value)}
@@ -150,7 +151,7 @@ export default function CashFlowPage({ onBack }: Props) {
             />
           )}
           {view === "asOf" && (
-            <input
+            <NativeDateInput
               type="date"
               value={asOf}
               onChange={(e) => setAsOf(e.target.value)}

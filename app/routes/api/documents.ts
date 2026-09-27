@@ -37,6 +37,8 @@ export async function loader({ request }: Route.LoaderArgs) {
       .select({
         id: documents.id,
         originalName: documents.originalName,
+        accountHolderName: documents.accountHolderName,
+        accountNumber: documents.accountNumber,
         mimeType: documents.mimeType,
         fileSize: documents.fileSize,
         createdAt: documents.createdAt,

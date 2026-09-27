@@ -1,5 +1,5 @@
 import type { Route } from "./+types/upload";
-import { eq, and } from "drizzle-orm";
+import { eq, and, ne } from "drizzle-orm";
 import { verifyAuth, authErrorResponse } from "~/lib/auth-middleware";
 import {
   saveStatementPdf,
@@ -9,7 +9,8 @@ import {
   hasPdfMagicBytes,
 } from "~/lib/storage/statement-storage";
 import { db } from "~/lib/drizzle-db";
-import { documents } from "~/db/schema";
+import { documents, users } from "~/db/schema";
+import { parseStatementIdentity, validateStatementIdentity, StatementIdentityError } from "~/lib/statement-identity";
 import { computeContentHash, buildDuplicatePayload } from "~/lib/statement-hash";
 import {
   extractTextFromPdfBytes,
@@ -299,6 +300,19 @@ async function rebuildStatementImport(input: {
     return duplicateResponse();
   }
 
+  // Rebuilds must obey the same document identity rule as fresh uploads.
+  const statementIdentity = parseStatementIdentity(extraction.text);
+  const identityWarnings = await db.transaction(async tx => {
+    await tx.select({ id: users.id }).from(users).where(eq(users.id, userId)).for("update");
+    const previous = await tx.select({ accountHolderName: documents.accountHolderName,
+      accountNumber: documents.accountNumber }).from(documents)
+      .where(and(eq(documents.userId, userId), ne(documents.id, documentId)));
+    const warnings = validateStatementIdentity(statementIdentity, previous);
+    await tx.update(documents).set(statementIdentity)
+      .where(and(eq(documents.userId, userId), eq(documents.id, documentId)));
+    return warnings;
+  });
+
   // External historical FX fallback (statement rate absent only); never throws,
   // never invents a rate. Rebuild path keeps the same idempotent document id.
   const fallbackRows = await applyFxRateFallback(built.rows, fxFallback);
@@ -365,6 +379,7 @@ async function rebuildStatementImport(input: {
       transactionIds: result.transactionIds,
       rejected: built.rejections,
       rebuilt: true,
+      identityWarnings,
       duplicateDecision: "rebuilt",
       stats,
       posting: {
@@ -488,6 +503,9 @@ export async function action({ request }: Route.ActionArgs) {
         contentHash,
       });
     } catch (rebuildError) {
+      if (rebuildError instanceof StatementIdentityError) {
+        return Response.json({ success: false, code: rebuildError.code, message: rebuildError.message }, { status: 409 });
+      }
       console.error("Statement upload: rebuild failed", {
         documentId: existingDocument.id,
         errorName:
@@ -542,7 +560,8 @@ export async function action({ request }: Route.ActionArgs) {
   //    full-file read. saveStatementPdf repeats validation defensively.
   let stored;
   try {
-    stored = await saveStatementPdf({ userId: auth.userId, file });
+    stored = await saveStatementPdf({ userId: auth.userId, file,
+      statementIdentity: parseStatementIdentity(extraction.text) });
   } catch (error) {
     // Concurrent duplicate guard: the partial unique index can reject a second
     // simultaneous upload of the same PDF (postgres unique violation 23505).
@@ -709,6 +728,7 @@ export async function action({ request }: Route.ActionArgs) {
         transactionIds: result.transactionIds,
         rejected: built.rejections,
         rebuilt: false,
+        identityWarnings: stored.document.identityWarnings,
         duplicateDecision: "fresh",
         stats: summarizeRows(fallbackRows),
         posting: {

@@ -668,10 +668,12 @@ ok(
   "Dashboard home renders overview + holdings widgets without the removed Statement documents section"
 );
 ok(
-  dashboardPage.includes(">Dashboard</h1>") &&
+  dashboardPage.includes("ยินดีต้อนรับ") &&
+    dashboardPage.includes("identity.accountHolderName") &&
+    dashboardPage.includes(": user?.email") &&
     dashboardPage.includes("ภาพรวมพอร์ต เงินเข้า-ออก และงบการเงินของคุณ") &&
     !dashboardPage.includes("ภาพรวมบัญชีของคุณ"),
-  "Dashboard banner uses the short Dashboard title + subtitle (no Statement mention)"
+  "Dashboard banner uses document holder or registered email, preserving the subtitle"
 );
 ok(
   (dashboardPage.match(/overflow-auto max-h-72/g) ?? []).length >= 6 &&

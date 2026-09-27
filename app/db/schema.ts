@@ -269,6 +269,9 @@ export const documents = pgTable(
       .notNull()
       .references(() => users.id),
     originalName: text("original_name").notNull(),
+    // Explicitly labelled identity from the source PDF; null for legacy/unknown documents.
+    accountHolderName: text("account_holder_name"),
+    accountNumber: text("account_number"),
     // SHA-256 of the uploaded file bytes, used for user-scoped duplicate
     // detection. Nullable so existing historical rows (created before this
     // column existed) migrate cleanly and never fail a UNIQUE/backfill step.

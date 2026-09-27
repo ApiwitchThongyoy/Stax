@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   BookOpenText,
   CalendarDays,
@@ -104,35 +104,38 @@ export default function TradingJournalPage({ onOpenSymbol }: Props) {
   const [symbol, setSymbol] = useState("");
   const [side, setSide] = useState<"" | TradingJournalSide>("");
   const [page, setPage] = useState(1);
+  const requestVersion = useRef(0);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
+  const [activeSuggestion, setActiveSuggestion] = useState(-1);
 
-  // Changing any filter re-queries the server — always start back at page 1.
+  // Stock search is local; changing any filter starts back at page 1.
   useEffect(() => {
     setPage(1);
   }, [from, to, symbol, side]);
 
   const load = useCallback(async () => {
     if (!accessToken) return;
+    const version = ++requestVersion.current;
     setLoading(true);
     setError(null);
     try {
-      setData(
-        await fetchTradingJournal(accessToken, {
+      const response = await fetchTradingJournal(accessToken, {
           from: from || undefined,
           to: to || undefined,
-          symbol: symbol || undefined,
           side: side || undefined,
-        })
-      );
+        });
+      if (version === requestVersion.current) setData(response);
     } catch (e) {
-      setData(null);
-      setError(e instanceof Error ? e.message : "ไม่สามารถโหลดข้อมูลได้");
+      if (version === requestVersion.current) setError(e instanceof Error ? e.message : "ไม่สามารถโหลดข้อมูลได้");
     } finally {
-      setLoading(false);
+      if (version === requestVersion.current) setLoading(false);
     }
-  }, [accessToken, from, to, symbol, side]);
+  }, [accessToken, from, to, side]);
 
   useEffect(() => {
     void load();
+    return () => { requestVersion.current++; };
   }, [load]);
 
   const handleNoteSaved = useCallback(
@@ -151,7 +154,7 @@ export default function TradingJournalPage({ onOpenSymbol }: Props) {
     []
   );
 
-  if (loading) {
+  if (loading && !data) {
     return (
       <div className="space-y-6">
         <div className="bg-linear-to-br from-blue-900 to-blue-950 rounded-2xl px-6 py-5 text-white animate-pulse">
@@ -165,7 +168,7 @@ export default function TradingJournalPage({ onOpenSymbol }: Props) {
     );
   }
 
-  if (error || !data) {
+  if (!data) {
     return (
       <div className="space-y-4">
         <div className="bg-white rounded-xl border border-gray-100 px-6 py-10 text-center">
@@ -186,7 +189,23 @@ export default function TradingJournalPage({ onOpenSymbol }: Props) {
     );
   }
 
-  const { entries, holdings, totals } = data;
+  const query = symbol.trim().toUpperCase();
+  const matchesSymbol = (value: string | null) => selectedSymbol ? value === selectedSymbol : !query || !!value?.toUpperCase().includes(query);
+  const entries = data.entries.filter(entry => matchesSymbol(entry.symbol));
+  const holdings = data.holdings.filter(holding => matchesSymbol(holding.symbol));
+  // Only count visible rows locally. All monetary values remain server-authoritative.
+  const totals = {
+    ...data.totals,
+    tradeCount: entries.length,
+    buyCount: entries.filter(entry => entry.side === "BUY").length,
+    sellCount: entries.filter(entry => entry.side === "SELL").length,
+    dividendCount: entries.filter(entry => entry.side === "DIVIDEND").length,
+  };
+  const suggestions = [...new Set([...data.entries.map(entry => entry.symbol), ...data.holdings.map(holding => holding.symbol)])]
+    .filter((value): value is string => !!value && value.toUpperCase().includes(query)).sort().slice(0, 12);
+  const selectSymbol = (value: string) => {
+    setSymbol(value); setSelectedSymbol(value); setShowSuggestions(false); setActiveSuggestion(-1); setPage(1);
+  };
 
   // Client-side paging over the server's full filtered list (20 rows/page).
   // safePage clamps after filters shrink the list while a later page was open.
@@ -210,6 +229,7 @@ export default function TradingJournalPage({ onOpenSymbol }: Props) {
       </div>
 
       {/* Filters */}
+      {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
       <section className="bg-white rounded-xl border border-gray-100 px-5 py-4">
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1">
@@ -230,16 +250,46 @@ export default function TradingJournalPage({ onOpenSymbol }: Props) {
               className="text-xs border border-gray-200 rounded-lg px-2.5 py-2 text-gray-800"
             />
           </label>
-          <label className="flex flex-col gap-1">
-            <span className="text-[11px] text-gray-500 font-medium">หุ้น</span>
+          <div className="relative flex flex-col gap-1">
+            <label htmlFor="trading-stock-search" className="text-[11px] text-gray-500 font-medium">หุ้น</label>
             <input
+              id="trading-stock-search"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-expanded={showSuggestions && suggestions.length > 0}
+              aria-controls="trading-stock-suggestions"
+              aria-activedescendant={showSuggestions && activeSuggestion >= 0 && suggestions[activeSuggestion] ? `stock-option-${activeSuggestion}` : undefined}
+              autoComplete="off"
               type="text"
               value={symbol}
-              onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+              onChange={(e) => { setSymbol(e.target.value.toUpperCase()); setSelectedSymbol(null); setShowSuggestions(true); setActiveSuggestion(-1); }}
+              onFocus={() => setShowSuggestions(true)}
+              onBlur={() => setShowSuggestions(false)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setShowSuggestions(false);
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault(); setShowSuggestions(true);
+                  setActiveSuggestion(index => Math.max(0, Math.min(suggestions.length - 1, index + (e.key === "ArrowDown" ? 1 : -1))));
+                }
+                if (e.key === "Enter" && showSuggestions && suggestions.length) {
+                  e.preventDefault(); selectSymbol(suggestions[activeSuggestion] ?? suggestions[0]);
+                }
+              }}
               placeholder="เช่น NVDA"
               className="text-xs border border-gray-200 rounded-lg px-2.5 py-2 text-gray-800 w-28"
             />
-          </label>
+            {showSuggestions && suggestions.length > 0 && (
+              <ul id="trading-stock-suggestions" role="listbox" className="absolute top-full left-0 z-10 min-w-36 bg-white border border-gray-200 rounded-lg shadow-md">
+                {suggestions.map((value, index) => (
+                  <li id={`stock-option-${index}`} key={value} role="option" aria-selected={activeSuggestion === index}>
+                    <button type="button" className="w-full text-left px-3 py-2 text-xs hover:bg-blue-50"
+                      onMouseDown={e => e.preventDefault()}
+                      onClick={() => selectSymbol(value)}>{value}</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
           <label className="flex flex-col gap-1">
             <span className="text-[11px] text-gray-500 font-medium">ประเภท</span>
             <select
@@ -261,6 +311,8 @@ export default function TradingJournalPage({ onOpenSymbol }: Props) {
                 setFrom("");
                 setTo("");
                 setSymbol("");
+                setSelectedSymbol(null);
+                setShowSuggestions(false);
                 setSide("");
               }}
               className="text-xs font-medium text-blue-900 hover:text-blue-700 transition px-2.5 py-2"

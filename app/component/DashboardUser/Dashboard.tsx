@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import {
   LayoutDashboard,
@@ -98,8 +98,11 @@ export default function Dashboard({ userEmail }: DashboardProps) {
   );
   const [ledgerError, setLedgerError] = useState<string | null>(null);
   const [dataRevision, setDataRevision] = useState(0);
+  const refreshVersion = useRef(0);
 
   const refreshServerData = useCallback(async () => {
+    const version = ++refreshVersion.current;
+    setServerDocuments([]); // Never retain an identity after deletion or a failed refresh.
     if (!user?.accessToken) return;
     setLedgerError(null);
     setDataRevision((prev) => prev + 1);
@@ -108,9 +111,11 @@ export default function Dashboard({ userEmail }: DashboardProps) {
         fetchCapitalLedger(user.accessToken),
         fetchUserDocuments(user.accessToken),
       ]);
+      if (version !== refreshVersion.current) return;
       setServerTransactions(capitalLedgerToTransactions(rows));
       setServerDocuments(docs);
     } catch (error) {
+      if (version !== refreshVersion.current) return;
       setLedgerError(
         error instanceof Error
           ? error.message
@@ -132,6 +137,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
 
   useEffect(() => {
     void refreshServerData();
+    return () => { refreshVersion.current++; };
   }, [refreshServerData]);
 
   // Identity must come from the authenticated user only. Never fabricate a
@@ -420,7 +426,7 @@ export default function Dashboard({ userEmail }: DashboardProps) {
                   className={activeNav === "archive" ? "block" : "hidden"}
                   hidden={activeNav !== "archive"}
                 >
-                  <StatementArchivePage />
+                  <StatementArchivePage onDocumentDeleted={refreshServerData} />
                 </div>
               )}
 
