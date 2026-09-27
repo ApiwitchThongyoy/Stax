@@ -104,12 +104,12 @@ export default function StaxLoginPage() {
               <label className="block text-sm font-medium text-gray-700">
                 รหัสผ่าน
               </label>
-              <button
-                type="button"
+              <Link
+                to="/forgot-password"
                 className="text-sm text-blue-800 hover:underline cursor-pointer"
               >
                 ลืมรหัสผ่าน?
-              </button>
+              </Link>
             </div>
             <div className="relative mb-4">
                 <Lock className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -163,15 +163,6 @@ export default function StaxLoginPage() {
               {isSubmitting ? "กำลังเข้าสู่ระบบ..." : "เข้าสู่ระบบ"}
               <span aria-hidden="true">›</span>
             </button>
-
-            <p className="text-center text-sm mt-3">
-              <Link
-                to="/forgot-password"
-                className="text-gray-500 hover:text-blue-800 hover:underline"
-              >
-                ลืมรหัสผ่าน?
-              </Link>
-            </p>
 
             <p className="text-center text-sm text-gray-500 mt-6">
               ยังไม่มีบัญชี?{" "}

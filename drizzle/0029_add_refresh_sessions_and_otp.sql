@@ -12,13 +12,15 @@
 --     row in the same family and revokes its predecessor, so presenting an
 --     already-rotated token is detectable and revokes the entire family.
 --   * A 6-digit OTP has only 1,000,000 possible values, so "code_hash" is a
---     PEPPERED sha256 bound to email + purpose (pepper = server-only JWT_SECRET).
+--     PEPPERED sha256 bound to email + purpose (pepper = server-only
+--     OTP_PEPPER, falling back to JWT_SECRET — see otpPepper() in
+--     app/lib/otp.ts).
 --     A dump alone therefore reveals no usable code. Plaintext codes are never
 --     persisted and never logged.
 
 CREATE TABLE IF NOT EXISTS "refresh_sessions" (
   "id"             text PRIMARY KEY,
-  "user_id"        text NOT NULL REFERENCES "users" ("id") ON DELETE CASCADE,
+  "user_id"        text NOT NULL REFERENCES "public"."User"("id") ON DELETE CASCADE,
   "token_hash"     text NOT NULL,
   "family_id"      text NOT NULL,
   "expires_at"     timestamptz NOT NULL,
@@ -66,7 +68,7 @@ ALTER TABLE "refresh_sessions"
 CREATE TABLE IF NOT EXISTS "email_otp" (
   "id"           text PRIMARY KEY,
   -- NULL while a registration is still pending (the account does not exist yet).
-  "user_id"      text REFERENCES "users" ("id") ON DELETE CASCADE,
+  "user_id"      text REFERENCES "public"."User"("id") ON DELETE CASCADE,
   "purpose"      text NOT NULL,
   "email"        text NOT NULL,
   "code_hash"    text NOT NULL,

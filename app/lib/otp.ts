@@ -8,7 +8,8 @@
 //
 //     sha256(pepper + ":" + email + ":" + purpose + ":" + code)
 //
-// where `pepper` is a server-only secret (JWT_SECRET). The dump alone now
+// where `pepper` is a server-only secret (OTP_PEPPER, falling back to
+// JWT_SECRET when it is not set — see otpPepper). The dump alone now
 // reveals nothing usable, because the pepper is never stored beside the rows.
 // Binding the email and purpose into the digest also means a code issued for
 // registration can never be replayed against password reset, and a code issued
@@ -115,18 +116,34 @@ export interface IssuedOtp {
 // ---------------------------------------------------------------------------
 
 /**
- * The server-side pepper.
+ * The server-side pepper for OTP digests.
  *
- * JWT_SECRET is the app's one mandatory server-only secret, so reusing it means
- * no new secret to provision and no risk of a second secret being left unset in
- * some deployment (a missing pepper must fail LOUDLY, never silently degrade to
- * an unpeppered hash).
+ * OTP_PEPPER is the intended, purpose-specific secret and is preferred whenever
+ * it is set. A dedicated value matters: the pepper is what stops a stolen
+ * database from being brute-forced over the 1,000,000-code space, and keeping it
+ * separate from JWT_SECRET means compromising the signing key does not also
+ * compromise every outstanding OTP digest.
+ *
+ * When OTP_PEPPER is absent we fall back to JWT_SECRET rather than failing, so
+ * an existing deployment that only ever had JWT_SECRET keeps working and there
+ * is no chance of a missing pepper silently degrading to an UNPEPPERED hash (the
+ * failure mode that would actually be dangerous). The fallback is safe here
+ * because the pepper is only ever used as a hash prefix and never as a signing
+ * key, and because the digest additionally binds the email and purpose.
+ *
+ * A pepper that is present but too weak is ignored in favour of JWT_SECRET, so a
+ * placeholder like "change-me" cannot quietly become the real pepper.
  */
 export function otpPepper(env: NodeJS.ProcessEnv = process.env): string {
+  const dedicated = env.OTP_PEPPER;
+  if (typeof dedicated === "string" && dedicated.trim().length >= 16) {
+    return dedicated;
+  }
+
   const secret = env.JWT_SECRET;
   if (typeof secret !== "string" || secret.length < 16) {
     throw new Error(
-      "JWT_SECRET must be configured (at least 16 characters) before OTPs can be issued or verified"
+      "OTP_PEPPER (preferred) or JWT_SECRET must be configured (at least 16 characters) before OTPs can be issued or verified"
     );
   }
   return secret;
@@ -198,11 +215,21 @@ export function safeCompareOtpHash(a: string, b: string): boolean {
  * production-looking host is actually safe. The single, auditable switch is
  * AUTH_DEV_SHOW_OTP=true, and it is a SERVER variable so the browser can never
  * influence it.
+ *
+ * The comparison is an EXACT match on the literal string "true" — no trimming,
+ * no case folding, no truthy aliases. This flag decides whether plaintext
+ * one-time passwords are handed back to the caller, so it must only ever open
+ * from a value someone typed deliberately and character-for-character. Being
+ * lenient here would create a real risk of a code-leaking dev switch being
+ * switched on in production by accident: "TRUE", "True", " true " and "1" are
+ * all things a human, a .env editor, a YAML parser or a shell may normalise or
+ * paraphrase, and a config value that is only *nearly* the documented value
+ * should fail CLOSED (no OTP exposure), never open. A developer who typos the
+ * flag simply does not see the code and can read the log; the reverse mistake
+ * leaks live credentials.
  */
 export function isDevOtpEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env[DEV_OTP_ENV_FLAG];
-  if (typeof raw !== "string") return false;
-  return raw.trim().toLowerCase() === "true";
+  return env[DEV_OTP_ENV_FLAG] === "true";
 }
 
 /** Absolute expiry for a code issued at `issuedAt`. */

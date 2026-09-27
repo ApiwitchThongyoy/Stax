@@ -255,9 +255,15 @@ async function main() {
   // Behavioural, not a grep: a comment explaining the rule would satisfy a
   // source scan while the code did the opposite.
   check(isDevOtpEnabled({ AUTH_DEV_SHOW_OTP: "true" } as NodeJS.ProcessEnv) === true, "the dev flag alone enables the code echo");
-  check(isDevOtpEnabled({ AUTH_DEV_SHOW_OTP: " TRUE " } as NodeJS.ProcessEnv) === true, "the flag tolerates surrounding whitespace and case");
+  // Strict by design: the flag controls whether plaintext one-time passwords are
+  // returned, so anything that is not character-for-character "true" must fail
+  // closed. Case folding and trimming were removed on purpose.
+  check(isDevOtpEnabled({ AUTH_DEV_SHOW_OTP: " TRUE " } as NodeJS.ProcessEnv) === false, "the flag is strict: ' TRUE ' (padded + uppercase) is REFUSED");
   check(isDevOtpEnabled({} as NodeJS.ProcessEnv) === false, "an unset flag keeps codes hidden");
   check(isDevOtpEnabled({ AUTH_DEV_SHOW_OTP: "false" } as NodeJS.ProcessEnv) === false, "an explicit false keeps codes hidden");
+  check(isDevOtpEnabled({ AUTH_DEV_SHOW_OTP: "" } as NodeJS.ProcessEnv) === false, "an empty string keeps codes hidden");
+  check(isDevOtpEnabled({ AUTH_DEV_SHOW_OTP: "TRUE" } as NodeJS.ProcessEnv) === false, "uppercase TRUE is refused (no case folding)");
+  check(isDevOtpEnabled({ AUTH_DEV_SHOW_OTP: "yes" } as NodeJS.ProcessEnv) === false, "a truthy alias 'yes' is refused");
   check(
     isDevOtpEnabled({ AUTH_DEV_SHOW_OTP: "1" } as NodeJS.ProcessEnv) === false,
     "only the literal 'true' enables the code echo (an ambiguous '1' is refused)"

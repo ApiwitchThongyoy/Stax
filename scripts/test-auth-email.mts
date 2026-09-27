@@ -36,8 +36,11 @@ async function main() {
     const requestOtpRoute = await import("../app/routes/api/auth/register/request-otp");
     // Registration is OTP-gated, so the real flow must request a code first.
     // AUTH_DEV_SHOW_OTP makes the server return it, which is the only supported
-    // way to obtain a code without a mail provider.
-    process.env.AUTH_DEV_SHOW_OTP = "1";
+    // way to obtain a code without a mail provider. The value must be the exact
+    // literal "true": the gate does not trim, fold case or accept aliases, so a
+    // sloppier value here would silently leave devOtp undefined and the mint
+    // below would fail for a misleading reason.
+    process.env.AUTH_DEV_SHOW_OTP = "true";
     const email = `auth-${randomUUID()}@test.local`;
     const password = "EmailCase!234";
     const request = (route: string, inputEmail: string, inputPassword = password, otp?: string) => new Request(
