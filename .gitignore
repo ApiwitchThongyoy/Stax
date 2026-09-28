@@ -4,6 +4,9 @@
 !.env.example
 
 /node_modules/
+/playwright-report/
+/test-results/
+/.playwright-mcp/
 
 # React Router
 /.react-router/

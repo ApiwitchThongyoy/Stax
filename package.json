@@ -13,6 +13,8 @@
     "db:studio": "drizzle-kit studio",
     "db:seed": "node scripts/seed.mjs",
     "db:seed:test": "node scripts/seed-test.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
     "test:w2": "tsx scripts/run-tests.mts && tsx scripts/test-auth-db.mts",
     "test": "tsx scripts/test-auth-email.mts && tsx scripts/test-gemini-parser.mts && tsx scripts/test-gemini-analysis-storage.mts && tsx scripts/test-statement-dedup.mts && tsx scripts/test-stock-prices.mts && tsx scripts/test-webull-trade-parser.mts && tsx scripts/test-server-api.mts && tsx scripts/test-statement-tax-recon.mts && tsx scripts/test-cash-summary.mts && tsx scripts/test-general-ledger.mts && tsx scripts/test-trading-journal.mts && tsx scripts/test-ui-placeholders.mts && tsx scripts/test-portal-access.mts && tsx scripts/test-document-download.mts && tsx scripts/test-pdf-extraction.mts && tsx scripts/test-document-delete.mts && tsx scripts/test-auth-polling-401.mts && tsx scripts/test-session-probe.mts && tsx scripts/test-session-refresh.mts && tsx scripts/test-rate-limit.mts && tsx scripts/test-audit-actions-sync.mts && tsx scripts/test-user-isolation.mts && tsx scripts/test-statement-identity.mts && tsx scripts/test-otp.mts && tsx scripts/test-session-model.mts",
     "test:statement-ui": "tsx scripts/serve-statement-ui-fixture.mts"
@@ -41,6 +43,8 @@
     "zod": "^4.5.4"
   },
   "devDependencies": {
+    "@playwright/mcp": "^0.0.82",
+    "@playwright/test": "^1.63.0",
     "@react-router/dev": "8.0.0",
     "@tailwindcss/vite": "^4.3.3",
     "@types/jsonwebtoken": "^9.0.10",
@@ -48,6 +52,7 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "drizzle-kit": "^0.31.10",
+    "playwright": "^1.63.0",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
     "vite": "^8.0.3"

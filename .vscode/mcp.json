@@ -1,0 +1,16 @@
+{
+  "servers": {
+    "playwright": {
+      "type": "http",
+      "url": "http://localhost:8931/mcp"
+    },
+    "playwright-test": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "playwright",
+        "run-test-mcp-server"
+      ]
+    }
+  }
+}
